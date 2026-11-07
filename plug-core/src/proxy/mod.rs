@@ -1155,11 +1155,13 @@ impl ToolRouter {
         let _ = self.protocol_notification_tx.send(notification);
     }
 
-    /// Take the settings a reload changes on a running router.
-    pub(crate) fn apply_config(&self, config: &crate::config::Config) {
+    /// Take the settings a reload changes on a running router. Returns
+    /// whether the tool catalog must be rebuilt, with `refresh_tools`, for
+    /// them to show.
+    pub(crate) fn apply_config(&self, config: &crate::config::Config) -> bool {
         self.set_modern_downstream_enabled(config.http.modern_downstream_enabled);
         self.set_client_access(&config.clients);
-        self.set_disabled_tools(&config.disabled_tools);
+        self.set_disabled_tools(&config.disabled_tools)
     }
 
     /// Take the owner's per-client blocks. Clients are told their tool list
@@ -1235,15 +1237,18 @@ impl ToolRouter {
         });
     }
 
-    /// Take the owner's `disabled_tools`. The catalog they filter changes at
-    /// the next `refresh_tools`.
-    fn set_disabled_tools(&self, patterns: &[String]) {
-        self.disabled_tools.store(Arc::new(
-            patterns
-                .iter()
-                .map(|pattern| pattern.to_ascii_lowercase())
-                .collect(),
-        ));
+    /// Take the owner's `disabled_tools`. Returns whether they changed; the
+    /// catalog they filter changes at the next `refresh_tools`.
+    fn set_disabled_tools(&self, patterns: &[String]) -> bool {
+        let next: Vec<String> = patterns
+            .iter()
+            .map(|pattern| pattern.to_ascii_lowercase())
+            .collect();
+        if **self.disabled_tools.load() == next {
+            return false;
+        }
+        self.disabled_tools.store(Arc::new(next));
+        true
     }
 
     /// Whether the client behind `client_key` is kept from any server, so the
@@ -1469,7 +1474,7 @@ impl ToolRouter {
                 .into_error(downstream.protocol_era));
         }
         self.ensure_client_may_use_tool(Some(downstream), tool_name)?;
-        if canonical_plug_meta_tool_name(tool_name).is_some() {
+        if PlugTool::named(tool_name).is_some() {
             if has_continuation {
                 return Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
                     .into_error(downstream.protocol_era));
@@ -1554,14 +1559,8 @@ impl ToolRouter {
         ))
     }
 
+    /// Publish `snapshot`, built [`RouterSnapshot::with_indexes`].
     fn publish_route_snapshot(&self, snapshot: Arc<RouterSnapshot>) {
-        let needs_indexes = (snapshot.routes_lower.is_empty() && !snapshot.routes.is_empty())
-            || (snapshot.tools_by_name.is_empty() && !snapshot.tools_all.is_empty());
-        let snapshot = if needs_indexes {
-            Arc::new((*snapshot).clone().with_indexes())
-        } else {
-            snapshot
-        };
         let material_routes = snapshot
             .routes
             .iter()
@@ -2123,7 +2122,9 @@ impl ToolRouter {
         }
     }
 
-    pub(crate) fn forward_cancel_from_downstream(
+    /// Cancel the active call `context` names, and pass the cancel on to the
+    /// server running it.
+    pub fn cancel_downstream_request(
         &self,
         context: &DownstreamCallContext,
         reason: Option<String>,
@@ -2198,19 +2199,6 @@ impl ToolRouter {
             return None;
         }
         Some(call_id)
-    }
-
-    /// Cancel an active request owned by the supplied downstream context.
-    ///
-    /// Transport adapters use this narrow entry point when their own request
-    /// lifecycle ends. The router keeps the upstream-call lookup and
-    /// cancellation forwarding details private.
-    pub fn cancel_downstream_request(
-        &self,
-        context: &DownstreamCallContext,
-        reason: Option<String>,
-    ) {
-        self.forward_cancel_from_downstream(context, reason);
     }
 
     pub(crate) fn route_upstream_progress(
@@ -2695,9 +2683,9 @@ impl ToolRouter {
 
         // Add search_tools meta-tool if tool count exceeds threshold
         if tools.len() >= self.config.tool_search_threshold
-            && !is_disabled_tool(&disabled_tools, "plug__search_tools")
+            && !is_disabled_tool(&disabled_tools, PlugTool::SearchTools.name())
         {
-            let meta_tool = build_search_tools_meta_tool();
+            let meta_tool = PlugTool::SearchTools.definition();
             routes.insert(
                 meta_tool.name.to_string(),
                 (
@@ -3063,11 +3051,10 @@ impl ToolRouter {
 
     /// Resolve the upstream handles/capabilities for a subscription rebind
     /// and execute it, awaiting completion and returning the transition's
-    /// outcome. Shared by `refresh_tools`' rebind arm and the
-    /// post-subscribe owner/route self-check in `subscribe_resource`
-    /// (subscriptions.rs): both resolve the old owner as a route-derived
-    /// fallback (the registry prefers the entry's recorded owner at drain
-    /// time) and gate the new owner on subscribe support.
+    /// outcome. Used by the post-subscribe owner/route self-check in
+    /// `subscribe_resource` (subscriptions.rs). The old owner is resolved as
+    /// a route-derived fallback (the registry prefers the entry's recorded
+    /// owner at drain time) and the new owner is gated on subscribe support.
     async fn rebind_subscription_route(
         &self,
         uri: &str,
@@ -3084,9 +3071,9 @@ impl ToolRouter {
         .await
     }
 
-    /// `rebind_subscription_route` without `&self`, for callers that only
-    /// hold the Arc'd fields: the detached post-publish sweep and the
-    /// registry's post-confirm heal hook (both wired in `new()`).
+    /// `rebind_subscription_route` without `&self`, for the registry's
+    /// post-confirm heal hook, which `build()` wires and which holds only
+    /// the Arc'd fields.
     async fn rebind_subscription_route_with(
         server_manager: &Arc<ServerManager>,
         registry: &Arc<subscriptions::SubscriptionRegistry>,
@@ -3152,7 +3139,9 @@ impl ToolRouter {
     /// Call a tool by its prefixed name, routing to the correct upstream server.
     ///
     /// Applies: health gate → circuit breaker → semaphore → timeout.
-    /// On session/transport errors, attempts one automatic reconnect + retry.
+    /// On a session or transport error the server is reconnected. The call
+    /// is sent again only when it cannot have reached the server, or when
+    /// the server declares the tool read-only or idempotent.
     pub async fn call_tool(
         &self,
         tool_name: &str,
@@ -3213,7 +3202,7 @@ impl ToolRouter {
         let context = downstream.clone().ok_or_else(|| {
             McpError::internal_error("modern tool round requires downstream context", None)
         })?;
-        if canonical_plug_meta_tool_name(params.name.as_ref()).is_some() {
+        if PlugTool::named(params.name.as_ref()).is_some() {
             if params.input_responses.is_some() || params.request_state.is_some() {
                 return Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
                     .into_error(context.protocol_era));
@@ -3429,35 +3418,27 @@ impl ToolRouter {
             // Every way to call a tool ends here, the invoke wrapper included,
             // so this is where a per-client block cannot be stepped around.
             self.ensure_client_may_use_tool(downstream.as_ref(), tool_name)?;
-            // Intercept plug meta-tools (case-insensitive for LLM casing drift).
-            if let Some(meta_tool_name) = canonical_plug_meta_tool_name(tool_name) {
-                if !self.meta_tool_visible_for_call(meta_tool_name, downstream.as_ref()) {
+            if let Some(plug_tool) = PlugTool::named(tool_name) {
+                if !self.meta_tool_visible_for_call(plug_tool, downstream.as_ref()) {
                     return Err(McpError::from(ProtocolError::ToolNotFound {
                         tool_name: tool_name.to_string(),
                     }));
                 }
-                match meta_tool_name {
-                    "plug__list_servers" => {
-                        return Ok(self.handle_list_servers(downstream.as_ref()).into());
+                return match plug_tool {
+                    PlugTool::ListServers => {
+                        Ok(self.handle_list_servers(downstream.as_ref()).into())
                     }
-                    "plug__list_tools" => {
-                        return self
-                            .handle_list_tools(round.arguments.clone(), downstream.as_ref())
-                            .map(Into::into);
-                    }
-                    "plug__search_tools" => {
-                        return self
-                            .handle_search_tools(round.arguments.clone(), downstream.as_ref())
-                            .map(Into::into);
-                    }
-                    "plug__invoke_tool" => {
-                        return self
-                            .handle_invoke_tool(round.arguments.clone(), progress_token, downstream)
-                            .await
-                            .map(Into::into);
-                    }
-                    _ => unreachable!("canonical plug meta-tool name is exhaustive"),
-                }
+                    PlugTool::ListTools => self
+                        .handle_list_tools(round.arguments.clone(), downstream.as_ref())
+                        .map(Into::into),
+                    PlugTool::SearchTools => self
+                        .handle_search_tools(round.arguments.clone(), downstream.as_ref())
+                        .map(Into::into),
+                    PlugTool::InvokeTool => self
+                        .handle_invoke_tool(round.arguments.clone(), progress_token, downstream)
+                        .await
+                        .map(Into::into),
+                };
             }
 
             let cache = self.cache.load_full();
@@ -4003,10 +3984,10 @@ impl ToolRouter {
 
     fn meta_tool_visible_for_call(
         &self,
-        meta_tool_name: &str,
+        plug_tool: PlugTool,
         downstream: Option<&DownstreamCallContext>,
     ) -> bool {
-        if is_disabled_tool(&self.disabled_tools.load(), meta_tool_name) {
+        if is_disabled_tool(&self.disabled_tools.load(), plug_tool.name()) {
             return false;
         }
 
@@ -4014,10 +3995,10 @@ impl ToolRouter {
             .map(|context| self.config.lazy_surface_for_client(context.client_type))
             .unwrap_or_else(|| self.config.lazy_surface_for_client(ClientType::Unknown));
         match surface {
-            LazyToolSurface::Bridge => meta_tool_name == "plug__search_tools",
-            LazyToolSurface::LegacyMeta => legacy_meta_tool_names().contains(&meta_tool_name),
+            LazyToolSurface::Bridge => plug_tool == PlugTool::SearchTools,
+            LazyToolSurface::LegacyMeta => true,
             LazyToolSurface::Standard | LazyToolSurface::Native => {
-                self.cache.load().resolve_route(meta_tool_name).is_some()
+                self.cache.load().resolve_route(plug_tool.name()).is_some()
             }
         }
     }
@@ -4290,7 +4271,7 @@ impl ToolRouter {
                         detail: "plug__invoke_tool requires a string tool_name".to_string(),
                     })
                 })?;
-            if canonical_plug_meta_tool_name(target).is_some() {
+            if PlugTool::named(target).is_some() {
                 return Err(McpError::from(ProtocolError::InvalidRequest {
                     detail: "plug__invoke_tool cannot invoke plug meta-tools".to_string(),
                 }));

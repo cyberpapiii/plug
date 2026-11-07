@@ -277,35 +277,56 @@ impl TaskStore {
         self.lifecycle.lock_states().contains_key(owner)
     }
 
-    pub fn create(&mut self, owner: TaskOwner, name: &str) -> Result<Task, McpError> {
-        self.create_inner(owner, name, None)
-    }
-
-    pub fn create_with_quota(
-        &mut self,
-        owner: TaskOwner,
-        name: &str,
-        quota_lease: QuotaLease,
-    ) -> Result<Task, McpError> {
-        self.create_inner(owner, name, Some(quota_lease))
-    }
-
-    fn create_inner(
+    /// A task Plug runs itself, for `owner`'s call of the tool listed as
+    /// `name`.
+    pub fn create(
         &mut self,
         owner: TaskOwner,
         name: &str,
         quota_lease: Option<QuotaLease>,
     ) -> Result<Task, McpError> {
+        self.admit(owner, name, None, quota_lease, |task_id| {
+            let now = rmcp::task_manager::current_timestamp();
+            Task::new(task_id, TaskStatus::Working, now.clone(), now)
+                .with_status_message(format!("Running {name}"))
+                .with_ttl(DEFAULT_TASK_TTL_MS)
+                .with_poll_interval(DEFAULT_TASK_POLL_INTERVAL_MS)
+        })
+    }
+
+    /// A task that stands for `upstream_task`, which a server runs.
+    pub fn create_passthrough(
+        &mut self,
+        owner: TaskOwner,
+        name: &str,
+        upstream_task: &Task,
+        upstream: TaskUpstreamRef,
+        quota_lease: Option<QuotaLease>,
+    ) -> Result<Task, McpError> {
+        self.admit(owner, name, Some(upstream), quota_lease, |task_id| {
+            let mut task = upstream_task.clone();
+            task.task_id = task_id;
+            if task.status_message.is_none() {
+                task.status_message = Some(format!("Running {name}"));
+            }
+            task
+        })
+    }
+
+    /// Every way a task is created comes through here.
+    fn admit(
+        &mut self,
+        owner: TaskOwner,
+        name: &str,
+        upstream: Option<TaskUpstreamRef>,
+        quota_lease: Option<QuotaLease>,
+        task_named: impl FnOnce(String) -> Task,
+    ) -> Result<Task, McpError> {
         self.ensure_owner_accepts_creates(&owner)?;
         self.prune_expired();
         let task_id = format!("task_{}", self.next_task_id);
         self.next_task_id += 1;
-
-        let now = rmcp::task_manager::current_timestamp();
-        let task = Task::new(task_id.clone(), TaskStatus::Working, now.clone(), now)
-            .with_status_message(format!("Running {name}"))
-            .with_ttl(DEFAULT_TASK_TTL_MS)
-            .with_poll_interval(DEFAULT_TASK_POLL_INTERVAL_MS);
+        let task = task_named(task_id.clone());
 
         self.tasks.insert(
             task_id,
@@ -318,7 +339,7 @@ impl TaskStore {
                 },
                 result: None,
                 abort_handle: None,
-                upstream: None,
+                upstream,
                 last_touched: Instant::now(),
                 pending_cancel_reason: None,
                 _quota_lease: quota_lease,
@@ -373,68 +394,6 @@ impl TaskStore {
     /// The tool a task is running, while the task is kept.
     pub fn source_of(&self, task_id: &str) -> Option<TaskSource> {
         self.tasks.get(task_id).map(|record| record.source.clone())
-    }
-
-    pub fn create_passthrough(
-        &mut self,
-        owner: TaskOwner,
-        name: &str,
-        upstream_task: &Task,
-        upstream: TaskUpstreamRef,
-    ) -> Result<Task, McpError> {
-        self.create_passthrough_inner(owner, name, upstream_task, upstream, None)
-    }
-
-    pub fn create_passthrough_with_quota(
-        &mut self,
-        owner: TaskOwner,
-        name: &str,
-        upstream_task: &Task,
-        upstream: TaskUpstreamRef,
-        quota_lease: QuotaLease,
-    ) -> Result<Task, McpError> {
-        self.create_passthrough_inner(owner, name, upstream_task, upstream, Some(quota_lease))
-    }
-
-    fn create_passthrough_inner(
-        &mut self,
-        owner: TaskOwner,
-        name: &str,
-        upstream_task: &Task,
-        upstream: TaskUpstreamRef,
-        quota_lease: Option<QuotaLease>,
-    ) -> Result<Task, McpError> {
-        self.ensure_owner_accepts_creates(&owner)?;
-        self.prune_expired();
-        let task_id = format!("task_{}", self.next_task_id);
-        self.next_task_id += 1;
-
-        let mut task = upstream_task.clone();
-        task.task_id = task_id.clone();
-        if task.status_message.is_none() {
-            task.status_message = Some(format!("Running {name}"));
-        }
-
-        self.tasks.insert(
-            task_id,
-            TaskRecord {
-                task: task.clone(),
-                owner,
-                source: TaskSource {
-                    listed: name.to_string(),
-                    behind: None,
-                },
-                result: None,
-                abort_handle: None,
-                upstream: Some(upstream),
-                last_touched: Instant::now(),
-                pending_cancel_reason: None,
-                _quota_lease: quota_lease,
-            },
-        );
-
-        self.enforce_owner_completed_retention();
-        Ok(task)
     }
 
     pub fn complete(&mut self, task_id: &str, result: Value) {
@@ -856,7 +815,9 @@ mod tests {
         let owner = TaskOwner::new(Arc::<str>::from("principal:a"));
         let other = TaskOwner::new(Arc::<str>::from("principal:b"));
 
-        let working = store.create(owner.clone(), "working").expect("working");
+        let working = store
+            .create(owner.clone(), "working", None)
+            .expect("working");
         assert_eq!(
             modern_status(
                 &store
@@ -866,7 +827,7 @@ mod tests {
             rmcp::model::TaskStatus::Working
         );
 
-        let input = store.create(owner.clone(), "input").expect("input");
+        let input = store.create(owner.clone(), "input", None).expect("input");
         let input_record = store.tasks.get_mut(&input.task_id).expect("input record");
         input_record.task.status = TaskStatus::InputRequired;
         let error = store
@@ -875,7 +836,9 @@ mod tests {
         assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
         assert!(error.message.contains("not bridged"));
 
-        let completed = store.create(owner.clone(), "completed").expect("completed");
+        let completed = store
+            .create(owner.clone(), "completed", None)
+            .expect("completed");
         store.complete(
             &completed.task_id,
             serde_json::json!({"content": [], "isError": false}),
@@ -888,7 +851,7 @@ mod tests {
             rmcp::model::TaskPayload::Completed { .. }
         ));
 
-        let failed = store.create(owner.clone(), "failed").expect("failed");
+        let failed = store.create(owner.clone(), "failed", None).expect("failed");
         store.fail(&failed.task_id, "boom".to_string());
         let failed = store
             .get_modern_for_owner(&owner, &failed.task_id)
@@ -898,7 +861,9 @@ mod tests {
             rmcp::model::TaskPayload::Failed { .. }
         ));
 
-        let cancelled = store.create(owner.clone(), "cancelled").expect("cancelled");
+        let cancelled = store
+            .create(owner.clone(), "cancelled", None)
+            .expect("cancelled");
         store
             .mark_cancelled(&owner, &cancelled.task_id)
             .expect("cancel");
@@ -923,7 +888,7 @@ mod tests {
     fn a_task_remembers_the_tool_it_runs() {
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("principal:a"));
-        let task = store.create(owner, "git__commit").expect("task");
+        let task = store.create(owner, "git__commit", None).expect("task");
         let listed = "git__commit".to_string();
         assert_eq!(
             store.source_of(&task.task_id),
@@ -948,7 +913,9 @@ mod tests {
     fn modern_completed_projection_fails_closed_without_object_result() {
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("principal:a"));
-        let task = store.create(owner.clone(), "completed").expect("task");
+        let task = store
+            .create(owner.clone(), "completed", None)
+            .expect("task");
         store.complete(&task.task_id, serde_json::json!("not-an-object"));
 
         let error = store
@@ -963,7 +930,7 @@ mod tests {
         let owner_a = TaskOwner::new(Arc::<str>::from("stdio:a"));
         let owner_b = TaskOwner::new(Arc::<str>::from("stdio:b"));
         let task = store
-            .create(owner_a.clone(), "Mock__echo")
+            .create(owner_a.clone(), "Mock__echo", None)
             .expect("create task");
         store.complete(&task.task_id, serde_json::json!({"ok": true}));
 
@@ -980,13 +947,13 @@ mod tests {
         let owner_b = TaskOwner::new(Arc::<str>::from("stdio:b"));
 
         store
-            .create(owner_a.clone(), "Mock__echo")
+            .create(owner_a.clone(), "Mock__echo", None)
             .expect("create task");
         store
-            .create(owner_a.clone(), "Mock__echo")
+            .create(owner_a.clone(), "Mock__echo", None)
             .expect("create task");
         store
-            .create(owner_b.clone(), "Mock__echo")
+            .create(owner_b.clone(), "Mock__echo", None)
             .expect("create task");
 
         let list_a = store.list_for_owner(&owner_a);
@@ -1000,7 +967,7 @@ mod tests {
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("stdio:a"));
         let task = store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("create task");
 
         store.complete(&task.task_id, serde_json::json!({"ok": true}));
@@ -1029,10 +996,10 @@ mod tests {
         let owner_b = TaskOwner::new(Arc::<str>::from("ipc:b"));
 
         let task_a = store
-            .create(owner_a.clone(), "Mock__echo")
+            .create(owner_a.clone(), "Mock__echo", None)
             .expect("create task");
         let task_b = store
-            .create(owner_b.clone(), "Mock__echo")
+            .create(owner_b.clone(), "Mock__echo", None)
             .expect("create task");
 
         store.cleanup_owner(&owner_a);
@@ -1051,7 +1018,7 @@ mod tests {
         let owner = TaskOwner::new(Arc::<str>::from("ipc:a"));
 
         let running = store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("create task");
         let handle = tokio::spawn(async {
             std::future::pending::<()>().await;
@@ -1072,7 +1039,7 @@ mod tests {
         );
 
         let completed = store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("create task");
         store.complete(&completed.task_id, serde_json::json!({"ok": true}));
 
@@ -1128,6 +1095,7 @@ mod tests {
                     server_id: "mock".to_string(),
                     task_id: "upstream-task-1".to_string(),
                 },
+                None,
             )
             .expect("create passthrough task");
 
@@ -1157,7 +1125,7 @@ mod tests {
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("ipc:a"));
         let task = store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("create task");
 
         // Cancel arrives first — no upstream ref has been set yet.
@@ -1212,7 +1180,9 @@ mod tests {
         // a pending-cancel reason.
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("ipc:a"));
-        let task = store.create(owner, "Mock__echo").expect("create task");
+        let task = store
+            .create(owner, "Mock__echo", None)
+            .expect("create task");
 
         let pending = store.set_upstream_request(
             &task.task_id,
@@ -1239,7 +1209,7 @@ mod tests {
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("http:gone"));
         let task = store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("create task");
 
         store.cleanup_owner(&owner);
@@ -1282,7 +1252,7 @@ mod tests {
 
         // The late create (either path) must be refused, not inserted.
         let create_err = store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect_err("local create after teardown must be refused");
         assert_eq!(create_err.code, ErrorCode::INVALID_REQUEST);
         let passthrough_err = store
@@ -1294,6 +1264,7 @@ mod tests {
                     server_id: "mock".to_string(),
                     task_id: "upstream-task-1".to_string(),
                 },
+                None,
             )
             .expect_err("passthrough create after teardown must be refused");
         assert_eq!(passthrough_err.code, ErrorCode::INVALID_REQUEST);
@@ -1304,7 +1275,7 @@ mod tests {
         // owner key succeeds.
         drop(guard);
         store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("fresh create after the in-flight enqueue resolved");
         assert_eq!(store.list_for_owner(&owner).len(), 1);
     }
@@ -1323,13 +1294,13 @@ mod tests {
 
         drop(guard_a);
         assert!(
-            store.create(owner.clone(), "Mock__echo").is_err(),
+            store.create(owner.clone(), "Mock__echo", None).is_err(),
             "tombstone must persist while another create is still in flight"
         );
 
         drop(guard_b);
         store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("tombstone cleared once the last in-flight create resolved");
     }
 
@@ -1342,12 +1313,12 @@ mod tests {
         let owner = TaskOwner::new(Arc::<str>::from("ipc:reused"));
 
         store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("create task");
         store.cleanup_owner(&owner);
 
         store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("create for the same owner key after a quiescent teardown");
     }
 
@@ -1362,7 +1333,9 @@ mod tests {
 
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("http:expired"));
-        let task = store.create(owner.clone(), "slow").expect("create task");
+        let task = store
+            .create(owner.clone(), "slow", None)
+            .expect("create task");
         store
             .tasks
             .get_mut(&task.task_id)

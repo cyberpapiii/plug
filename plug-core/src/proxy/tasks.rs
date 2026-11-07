@@ -289,7 +289,7 @@ impl super::ToolRouter {
             context.ensure_principal_lifecycle_active()?;
         }
 
-        if canonical_plug_meta_tool_name(tool_name).is_some() {
+        if PlugTool::named(tool_name).is_some() {
             return Err(McpError::from(ProtocolError::InvalidRequest {
                 detail:
                     "plug meta-tools do not support task-wrapped calls; call the meta-tool directly"
@@ -362,18 +362,13 @@ impl super::ToolRouter {
                 };
                 let recorded = router
                     .with_task_store(|store| {
-                        let recorded = match task_quota_lease {
-                            Some(lease) => store.create_passthrough_with_quota(
-                                owner,
-                                &tool_name,
-                                &task,
-                                upstream.clone(),
-                                lease,
-                            ),
-                            None => {
-                                store.create_passthrough(owner, &tool_name, &task, upstream.clone())
-                            }
-                        };
+                        let recorded = store.create_passthrough(
+                            owner,
+                            &tool_name,
+                            &task,
+                            upstream.clone(),
+                            task_quota_lease,
+                        );
                         if let Ok(record) = &recorded {
                             store.record_source(&record.task_id, &server_id, &original_name);
                         }
@@ -419,10 +414,7 @@ impl super::ToolRouter {
         let behind = self.tool_behind(tool_name);
         let task = self
             .with_task_store(|store| {
-                let task = match task_quota_lease {
-                    Some(lease) => store.create_with_quota(owner, tool_name, lease),
-                    None => store.create(owner, tool_name),
-                }?;
+                let task = store.create(owner, tool_name, task_quota_lease)?;
                 let task_id = task.task_id.clone();
                 if let Some((server, own_tool)) = &behind {
                     store.record_source(&task_id, server, own_tool);
@@ -723,7 +715,7 @@ impl super::ToolRouter {
     ) -> crate::legacy_tasks::Task {
         let mut store = self.task_store.lock().await;
         let task = store
-            .create(owner, name)
+            .create(owner, name, None)
             .expect("test task owner must not be tombstoned");
         store.attach_abort_handle(&task.task_id, handle);
         task
@@ -895,7 +887,7 @@ mod tests {
         {
             let mut store = router.task_store.lock().await;
             let task = store
-                .create(owner.clone(), "long_running_tool")
+                .create(owner.clone(), "long_running_tool", None)
                 .expect("create task");
             store.attach_abort_handle(&task.task_id, handle);
         }
@@ -949,7 +941,7 @@ mod tests {
         {
             let mut store = router.task_store.lock().await;
             let task = store
-                .create(owner_b.clone(), "long_running_tool")
+                .create(owner_b.clone(), "long_running_tool", None)
                 .expect("create task");
             store.attach_abort_handle(&task.task_id, handle);
         }
@@ -1350,10 +1342,11 @@ mod tests {
                         server_id: "hung".to_string(),
                         task_id: "upstream-task-hung".to_string(),
                     },
+                    None,
                 )
                 .expect("create passthrough record");
             let local = store
-                .create(owner.clone(), "long_running_tool")
+                .create(owner.clone(), "long_running_tool", None)
                 .expect("create local record");
             store.attach_abort_handle(&local.task_id, handle);
         }
@@ -1416,6 +1409,7 @@ mod tests {
                         server_id: "expiry-upstream".to_string(),
                         task_id: "upstream-expired-1".to_string(),
                     },
+                    None,
                 )
                 .expect("create stale passthrough task");
         }
@@ -1462,6 +1456,7 @@ mod tests {
                     server_id: "hung".to_string(),
                     task_id: "upstream-task-hung".to_string(),
                 },
+                None,
             )
             .expect("create passthrough record");
 
@@ -1506,6 +1501,7 @@ mod tests {
                     server_id: "hung".to_string(),
                     task_id: "upstream-task-hung".to_string(),
                 },
+                None,
             )
             .expect("create passthrough record");
 
@@ -1598,7 +1594,7 @@ mod tests {
             .task_store
             .lock()
             .await
-            .create(owner.clone(), "fresh_tool")
+            .create(owner.clone(), "fresh_tool", None)
             .expect("fresh create after the tombstone cleared");
         assert_eq!(router.task_count_for_owner(&owner).await, 1);
     }
@@ -1768,6 +1764,7 @@ mod tests {
                     server_id: "mock".to_string(),
                     task_id: "upstream-task-1".to_string(),
                 },
+                None,
             )
             .expect("legacy passthrough record");
 
@@ -1921,7 +1918,7 @@ mod tests {
         // No tombstone residue either: a later create for the same owner
         // key (e.g. an IPC client id that reconnected) succeeds.
         store
-            .create(owner.clone(), "fresh_tool")
+            .create(owner.clone(), "fresh_tool", None)
             .expect("fresh create after a probe refusal");
     }
 
@@ -1992,11 +1989,11 @@ mod tests {
             "the create guard must be released after the timeout"
         );
         store
-            .create(owner.clone(), "fresh_tool")
+            .create(owner.clone(), "fresh_tool", None)
             .expect("fresh create after the timed-out enqueue resolved");
     }
 
-    /// T2 companion (Part 2): the reaper arm for a `CreateTaskResult` that
+    /// The reaper arm for a `CreateTaskResult` that
     /// lands after the create already timed out — driven directly through
     /// the response oneshot, because through the full stack rmcp resolves
     /// the responder with `Cancelled` once our request-level cancel is
@@ -2315,7 +2312,7 @@ mod tests {
             .await
             .expect("enqueue local wrapper task");
 
-        // Same deterministic parking as T4: the executor has sent the
+        // The executor has sent the
         // request (call_tool entered), armed its guard, and is parked on
         // the store lock we hold — still pre-record.
         let mut store = router.task_store.lock().await;
@@ -2548,7 +2545,7 @@ mod tests {
             .task_store
             .lock()
             .await
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("task");
         let page = |cursor: &str| {
             let mut request = PaginatedRequestParams::default();

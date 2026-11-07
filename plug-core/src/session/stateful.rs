@@ -594,12 +594,16 @@ impl SessionStore {
         self.with_live_session_mut(session_id, |entry| entry.sse_sender.is_some())
     }
 
+    /// Give `session_id` the stream `sender` feeds, and send it what the
+    /// client has not seen. Returns the id of the last event the client is
+    /// taken to have, which the stream opens with: a client that comes back
+    /// with it is sent only what followed.
     pub fn set_sse_sender(
         &self,
         session_id: &str,
         sender: mpsc::Sender<SseEvent>,
         last_event_id: Option<u64>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<u64, SessionError> {
         let mut entry = self
             .sessions
             .get_mut(session_id)
@@ -615,8 +619,17 @@ impl SessionStore {
         } else {
             last_event_id.filter(|id| *id < entry.next_event_id)
         };
+        // Without an id the client is sent what was queued for it; it has
+        // everything before that.
+        let seen_through = last_event_id.unwrap_or_else(|| {
+            entry
+                .pending_notifications
+                .front()
+                .map_or(entry.next_event_id, |event| event.id)
+                - 1
+        });
         Self::send_replay_events(&mut entry, &active_sender, last_event_id);
-        Ok(())
+        Ok(seen_through)
     }
 
     pub fn set_client_type(
@@ -893,6 +906,36 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         store.set_sse_sender(&id, tx, Some(500)).unwrap();
         assert_eq!(rx.try_recv().unwrap().id, 1);
+    }
+
+    /// A stream opens with the id of the last event its client has, so a
+    /// client whose stream drops before anything new comes back for nothing
+    /// it already had.
+    #[test]
+    fn a_stream_opens_with_the_last_event_its_client_has() {
+        let store = SessionStore::new(1800, 10);
+        let id = store.create_session().unwrap();
+        let message = || SseMessage::from_json_value(serde_json::json!({"n": 1})).unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        assert_eq!(store.set_sse_sender(&id, tx, None).unwrap(), 0);
+        store.send_to_live_session(&id, message());
+        store.send_to_live_session(&id, message());
+
+        // It had both on the stream that dropped.
+        let (tx, mut rx) = mpsc::channel(8);
+        assert_eq!(store.set_sse_sender(&id, tx, None).unwrap(), 2);
+        assert!(rx.try_recv().is_err());
+        // It says it had the first: the second is sent again.
+        let (tx, mut rx) = mpsc::channel(8);
+        assert_eq!(store.set_sse_sender(&id, tx, Some(1)).unwrap(), 1);
+        assert_eq!(rx.try_recv().unwrap().id, 2);
+
+        // Queued while no stream was open: it has what came before.
+        drop(rx);
+        store.send_to_live_session(&id, message());
+        let (tx, mut rx) = mpsc::channel(8);
+        assert_eq!(store.set_sse_sender(&id, tx, None).unwrap(), 2);
+        assert_eq!(rx.try_recv().unwrap().id, 3);
     }
 
     #[test]

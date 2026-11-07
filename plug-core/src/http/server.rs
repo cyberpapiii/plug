@@ -562,13 +562,13 @@ pub(super) async fn get_mcp(
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok());
-    state
+    let seen_through = state
         .sessions
         .set_sse_sender(&session_id, tx, last_event_id)?;
 
     let session_store = Arc::clone(&state.sessions);
     let keepalive_session_id = session_id.clone();
-    let sse = sse_stream_with_heartbeat(rx, state.cancel.clone(), move || {
+    let sse = sse_stream_with_heartbeat(rx, seen_through, state.cancel.clone(), move || {
         let _ = session_store.validate(&keepalive_session_id);
     });
     let mut response = sse.into_response();
@@ -1502,40 +1502,63 @@ mod tests {
 
     #[tokio::test]
     async fn modern_capability_projection_is_permission_filtered_and_bridge_free() {
-        let state = test_state();
-        state.router.set_modern_downstream_enabled(true);
-        let context = DownstreamCallContext::http(
-            "scoped-client",
-            RequestId::Number(1),
-            crate::types::ClientType::Unknown,
-        )
-        .with_protocol(
-            crate::protocol::ProtocolEra::Modern,
-            crate::protocol::MODERN_PROTOCOL_VERSION,
-        )
-        .with_modern_direction_enabled(true)
-        .with_authorization(
-            crate::types::PrincipalId::configured_credential("test", 1),
-            ["tools:read".to_string()],
+        let context = |scopes: &[&str]| {
+            DownstreamCallContext::http(
+                "scoped-client",
+                RequestId::Number(1),
+                crate::types::ClientType::Unknown,
+            )
+            .with_protocol(
+                crate::protocol::ProtocolEra::Modern,
+                crate::protocol::MODERN_PROTOCOL_VERSION,
+            )
+            .with_modern_direction_enabled(true)
+            .with_authorization(
+                crate::types::PrincipalId::configured_credential("test", 1),
+                scopes.iter().map(ToString::to_string),
+            )
+        };
+        let mut everything = every_legacy_capability();
+        everything.extensions = Some(
+            [("example.test/extension".to_string(), serde_json::Map::new())]
+                .into_iter()
+                .collect(),
         );
-        let capabilities = crate::dispatch::project_capabilities(
-            state
-                .router
-                .synthesized_capabilities_for_client(context.client_type),
-            &context,
-            state.router.supports_tasks_for_client(context.client_type),
+
+        let tools_only = crate::dispatch::project_capabilities(
+            everything.clone(),
+            &context(&["tools:read"]),
+            true,
         );
+        assert!(tools_only.tools.is_some());
+        assert!(tools_only.resources.is_none());
+        assert!(tools_only.prompts.is_none());
+        assert!(tools_only.completions.is_none());
         assert!(
-            context
-                .policy_decision(crate::protocol::MethodFamily::ToolsList)
-                .is_allowed()
+            tools_only.extensions.is_none(),
+            "no tasks without tasks:use"
         );
-        assert!(capabilities.resources.is_none());
-        assert!(capabilities.prompts.is_none());
-        assert!(capabilities.completions.is_none());
-        assert!(capabilities.extensions.is_none());
-        assert!(capabilities.experimental.is_none());
-        assert!(capabilities.logging.is_none());
+        assert!(tools_only.experimental.is_none());
+        assert!(tools_only.logging.is_none());
+
+        // With every scope the families come through, still without logging,
+        // legacy extras, subscriptions or extensions Plug cannot serve.
+        let all_scopes = crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES;
+        let full = crate::dispatch::project_capabilities(everything, &context(&all_scopes), true);
+        assert!(full.tools.is_some() && full.prompts.is_some() && full.completions.is_some());
+        assert!(
+            full.resources
+                .as_ref()
+                .is_some_and(|resources| resources.subscribe.is_none())
+        );
+        assert!(full.logging.is_none());
+        assert!(full.experimental.is_none());
+        assert_eq!(
+            full.extensions
+                .as_ref()
+                .map(|extensions| extensions.keys().cloned().collect::<Vec<_>>()),
+            Some(vec![rmcp::model::TASKS_EXTENSION_ID.to_string()])
+        );
     }
 
     #[tokio::test]

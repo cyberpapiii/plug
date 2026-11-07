@@ -119,13 +119,10 @@ pub(crate) fn inspect_owner_enrollment_in_dir(
         }
         Err(_) => return OwnerEnrollmentStatus::StateUnavailable,
     };
-    {
-        let Ok(metadata) = file.metadata() else {
-            return OwnerEnrollmentStatus::StateUnavailable;
-        };
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return OwnerEnrollmentStatus::UnsafePermissions;
-        }
+    match state_file_is_private(&file) {
+        Ok(true) => {}
+        Ok(false) => return OwnerEnrollmentStatus::UnsafePermissions,
+        Err(_) => return OwnerEnrollmentStatus::StateUnavailable,
     }
     let mut bytes = Vec::new();
     if file.read_to_end(&mut bytes).is_err() {
@@ -192,19 +189,13 @@ pub struct RegisteredClientSummary {
     pub last_used_at: Option<u64>,
     pub expires_at: u64,
     /// False when the client holds no token that still works: its sign-in
-    /// ran out or was revoked, and only the client can start another. A
-    /// reader older than this field sees every client as signed in.
-    #[serde(default = "signed_in_when_unsaid")]
+    /// ran out or was revoked, and only the client can start another.
     pub signed_in: bool,
     /// What this client's settings are stored under.
     pub client_key: String,
     /// The client Plug takes this one for by the name it registered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
-}
-
-fn signed_in_when_unsaid() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,7 +299,7 @@ pub struct PrincipalLifecycleLease {
     generation: u64,
     /// The sign-in this token descends from, which can end while the client
     /// itself stays registered.
-    family_ended: Option<Arc<SignIn>>,
+    family_ended: Arc<SignIn>,
 }
 
 /// One sign-in, shared by everything opened under it.
@@ -335,18 +326,17 @@ impl PrincipalLifecycleLease {
     pub fn is_active(&self) -> bool {
         self.state.active.load(Ordering::SeqCst)
             && self.state.generation.load(Ordering::SeqCst) == self.generation
-            && !self
-                .family_ended
-                .as_ref()
-                .is_some_and(|sign_in| sign_in.is_over())
+            && !self.family_ended.is_over()
     }
 
     #[cfg(test)]
     pub(crate) fn active_for_tests() -> Self {
+        let sign_in = SignIn::default();
+        sign_in.lasts_until(u64::MAX);
         Self {
             state: Arc::new(PrincipalLifecycleState::active()),
             generation: 1,
-            family_ended: None,
+            family_ended: Arc::new(sign_in),
         }
     }
 
@@ -479,7 +469,6 @@ struct PendingConsent {
     code_challenge: String,
     scopes: Vec<String>,
     resource: String,
-    #[serde(default)]
     csrf_token: String,
     expires_at: u64,
 }
@@ -489,30 +478,7 @@ struct CompletedConsent {
     client_id: String,
     redirect: AuthorizationRedirect,
     expires_at: u64,
-    #[serde(
-        default,
-        alias = "approval_ceremony_id",
-        deserialize_with = "deserialize_approval_ceremony_ids"
-    )]
     approval_ceremony_ids: Vec<String>,
-}
-
-fn deserialize_approval_ceremony_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum OneOrMany {
-        One(String),
-        Many(Vec<String>),
-    }
-
-    Ok(match Option::<OneOrMany>::deserialize(deserializer)? {
-        Some(OneOrMany::One(id)) => vec![id],
-        Some(OneOrMany::Many(ids)) => ids,
-        None => Vec::new(),
-    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -534,8 +500,8 @@ struct IssuedAccessToken {
     expires_at: u64,
     /// Rotation lineage. Every pair minted from the same authorization code
     /// shares one id, so a replayed refresh token can revoke the whole chain.
-    /// Empty only on records written before families existed; an empty id
-    /// never matches in [`revoke_token_family`].
+    /// A record written before families existed has none, and is dropped on
+    /// load: all such tokens have expired.
     #[serde(default)]
     family_id: String,
 }
@@ -1437,11 +1403,10 @@ impl DownstreamOauthManager {
                 .principal_lifecycles
                 .get(grant.client_id)
                 .is_some_and(|lifecycle| lifecycle.active.load(Ordering::SeqCst))
-            && !(!grant.family_id.is_empty()
-                && self
-                    .family_ended
-                    .get(grant.family_id)
-                    .is_some_and(|sign_in| sign_in.is_over()))
+            && !self
+                .family_ended
+                .get(grant.family_id)
+                .is_some_and(|sign_in| sign_in.is_over())
     }
 
     /// Revoke `client_id`'s grant. `Ok(false)` when there is no such client.
@@ -1619,8 +1584,7 @@ impl DownstreamOauthManager {
                     .refresh_tokens
                     .values()
                     .find(|live| {
-                        !consumed.family_id.is_empty()
-                            && live.family_id == consumed.family_id
+                        live.family_id == consumed.family_id
                             && live.client_id == client_id
                             && live.resource == resource
                     })
@@ -1726,8 +1690,7 @@ impl DownstreamOauthManager {
                 let lease = PrincipalLifecycleLease {
                     state: Arc::clone(lifecycle.value()),
                     generation,
-                    // A record from before sign-ins were tracked has none.
-                    family_ended: (!record.family_id.is_empty()).then(|| {
+                    family_ended: {
                         let sign_in = Arc::clone(
                             self.family_ended
                                 .entry(record.family_id.clone())
@@ -1745,7 +1708,7 @@ impl DownstreamOauthManager {
                                 .fold(record.expires_at, u64::max),
                         );
                         sign_in
-                    }),
+                    },
                 };
                 if !lease.is_active() {
                     return None;
@@ -2317,11 +2280,6 @@ pub(crate) fn redirect_with_params(base: &str, pairs: &[(&str, &str)]) -> String
 /// alive would let a stolen chain keep working for up to their remaining
 /// lifetime, which is the window the revocation exists to close.
 fn revoke_token_family(state: &mut DownstreamOauthState, family_id: &str) -> usize {
-    if family_id.is_empty() {
-        // A record predating families carries no lineage, and an empty id is
-        // not a family — treating it as one would revoke every legacy grant.
-        return 0;
-    }
     let before = state.access_tokens.len()
         + state.refresh_tokens.len()
         + state.consumed_refresh_tokens.len();
@@ -2392,16 +2350,33 @@ pub(crate) fn owner_enrollment_state_path_in_dir(
     state_file_path_in_dir(config, state_dir, STATE_VERSION)
 }
 
+/// Whether only its owner can read or write the state file. Anyone else
+/// who could write it could have enrolled an owner credential of their own.
+fn state_file_is_private(file: &std::fs::File) -> std::io::Result<bool> {
+    Ok(file.metadata()?.permissions().mode() & 0o077 == 0)
+}
+
 fn load_persisted_state(
     path: &std::path::Path,
 ) -> Result<DownstreamOauthState, DownstreamOauthError> {
-    let data = match std::fs::read_to_string(path) {
-        Ok(data) => data,
+    use std::io::Read as _;
+
+    let persistence = |error: std::io::Error| DownstreamOauthError::Persistence(error.to_string());
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(DownstreamOauthState::default());
         }
-        Err(error) => return Err(DownstreamOauthError::Persistence(error.to_string())),
+        Err(error) => return Err(persistence(error)),
     };
+    if !state_file_is_private(&file).map_err(persistence)? {
+        return Err(DownstreamOauthError::Persistence(format!(
+            "{} is visible to other local users; run chmod 600 on it",
+            path.display()
+        )));
+    }
+    let mut data = String::new();
+    file.read_to_string(&mut data).map_err(persistence)?;
     let mut state: DownstreamOauthState = serde_json::from_str(&data)
         .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
     if state.version != STATE_VERSION {
@@ -2410,6 +2385,12 @@ fn load_persisted_state(
         ));
     }
     let _ = state.evict_expired(epoch_secs());
+    state
+        .access_tokens
+        .retain(|_, token| !token.family_id.is_empty());
+    state
+        .refresh_tokens
+        .retain(|_, token| !token.family_id.is_empty());
     Ok(state)
 }
 
@@ -2443,6 +2424,14 @@ fn run_blocking_io<T>(write: impl FnOnce() -> T) -> T {
 }
 
 fn acquire_state_lock(path: &std::path::Path) -> Result<std::fs::File, DownstreamOauthError> {
+    acquire_state_lock_waiting(path, || {})
+}
+
+/// [`acquire_state_lock`], calling `on_wait` each time the lock is found held.
+fn acquire_state_lock_waiting(
+    path: &std::path::Path,
+    mut on_wait: impl FnMut(),
+) -> Result<std::fs::File, DownstreamOauthError> {
     let dir = path
         .parent()
         .ok_or_else(|| DownstreamOauthError::Persistence("invalid state path".to_string()))?;
@@ -2473,7 +2462,10 @@ fn acquire_state_lock(path: &std::path::Path) -> Result<std::fs::File, Downstrea
             Err(error @ fs4::TryLockError::WouldBlock) if attempt == STATE_LOCK_ATTEMPTS => {
                 return Err(lock_held_error(path, &error));
             }
-            Err(fs4::TryLockError::WouldBlock) => attempt += 1,
+            Err(fs4::TryLockError::WouldBlock) => {
+                attempt += 1;
+                on_wait();
+            }
         }
         std::thread::sleep(STATE_LOCK_RETRY_INTERVAL);
     }
@@ -2585,9 +2577,9 @@ mod tests {
 
     fn write_state_fixture(fixture: serde_json::Value) -> PathBuf {
         let path = temp_state_path();
-        std::fs::write(
+        crate::fs_perm::write_private_atomic(
             &path,
-            serde_json::to_vec_pretty(&fixture).expect("serialize fixture"),
+            &serde_json::to_vec_pretty(&fixture).expect("serialize fixture"),
         )
         .expect("write state fixture");
         path
@@ -3870,6 +3862,11 @@ mod tests {
             inspect_owner_enrollment_in_dir(&config, &state_dir),
             OwnerEnrollmentStatus::UnsafePermissions
         );
+        // The daemon holds the state to the rule doctor reports.
+        assert!(matches!(
+            DownstreamOauthManager::try_new_with_state_dir(config, &state_dir),
+            Err(DownstreamOauthError::Persistence(message)) if message.contains("chmod 600")
+        ));
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
@@ -4146,7 +4143,7 @@ mod tests {
                 .await
         );
 
-        let sign_in = open.principal_lifecycle.family_ended.as_ref().unwrap();
+        let sign_in = &open.principal_lifecycle.family_ended;
         sign_in.ended.store(true, Ordering::SeqCst);
 
         assert!(!signed_in(manager.list_clients().await));
@@ -4177,7 +4174,7 @@ mod tests {
         };
         // It lasts as long as the refresh token, not only the hour the
         // access token has.
-        let sign_in = Arc::clone(open.principal_lifecycle.family_ended.as_ref().unwrap());
+        let sign_in = Arc::clone(&open.principal_lifecycle.family_ended);
         assert!(
             sign_in.until.load(Ordering::SeqCst) >= epoch_secs() + REFRESH_TOKEN_LIFETIME_SECS - 5
         );
@@ -4430,27 +4427,26 @@ mod tests {
         );
     }
 
+    /// A token from before sign-ins had families has run out by now. Its
+    /// record still loads, and is dropped.
     #[test]
-    fn an_empty_family_id_revokes_nothing() {
-        let mut state = DownstreamOauthState::default();
-        state.access_tokens.insert(
-            "token".to_string(),
-            IssuedAccessToken {
-                client_id: "client".to_string(),
-                scopes: Vec::new(),
-                resource: "https://plug.example.com/mcp".to_string(),
-                issued_at: 0,
-                expires_at: u64::MAX,
-                family_id: String::new(),
-            },
-        );
+    fn a_token_from_before_families_is_dropped_on_load() {
+        let token = serde_json::json!({
+            "client_id": "client",
+            "scopes": [],
+            "resource": "https://plug.example.com/mcp",
+            "issued_at": 0,
+            "expires_at": u64::MAX,
+        });
+        let path = write_state_fixture(serde_json::json!({
+            "version": STATE_VERSION,
+            "access_tokens": { "access-old": token.clone() },
+            "refresh_tokens": { "refresh-old": token },
+        }));
 
-        assert_eq!(revoke_token_family(&mut state, ""), 0);
-        assert_eq!(
-            state.access_tokens.len(),
-            1,
-            "an empty lineage is not a family to revoke"
-        );
+        let state = load_persisted_state(&path).expect("old records load");
+        assert!(state.access_tokens.is_empty());
+        assert!(state.refresh_tokens.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4671,13 +4667,24 @@ mod tests {
         let outgoing = DownstreamOauthManager::new_with_state_path(test_config(), path.clone())
             .expect("first writer acquires issuer lock");
 
+        let (waiting, wait_seen) = std::sync::mpsc::channel();
+        let (released, release_done) = std::sync::mpsc::channel();
         let release = std::thread::spawn(move || {
-            std::thread::sleep(STATE_LOCK_RETRY_INTERVAL * 2);
+            wait_seen.recv().expect("the restart finds the lock held");
             drop(outgoing);
+            released.send(()).expect("the restart is waiting");
         });
 
-        DownstreamOauthManager::new_with_state_path(test_config(), path)
-            .expect("a restart waits out the previous writer's close");
+        let mut waits = 0;
+        acquire_state_lock_waiting(&path, || {
+            waits += 1;
+            if waits == 1 {
+                waiting.send(()).expect("the writer is still running");
+                release_done.recv().expect("the writer let go");
+            }
+        })
+        .expect("a restart waits out the previous writer's close");
+        assert_eq!(waits, 1, "the restart found the lock held once");
         release.join().expect("the outgoing writer thread finishes");
     }
 
@@ -4744,7 +4751,8 @@ mod tests {
                 "expired-completed": {
                     "client_id": "plug_expired",
                     "redirect": { "location": "https://client.example/callback" },
-                    "expires_at": now
+                    "expires_at": now,
+                    "approval_ceremony_ids": []
                 }
             },
             "pending_codes": {

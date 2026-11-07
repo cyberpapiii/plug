@@ -47,7 +47,7 @@ pub mod tool_naming;
 pub mod tool_patterns;
 pub mod transport;
 pub mod types;
-pub(crate) mod upstream_http;
+pub mod upstream_http;
 pub mod watcher;
 
 // The Keychain on macOS. CI also runs on Linux, where the kernel keyring

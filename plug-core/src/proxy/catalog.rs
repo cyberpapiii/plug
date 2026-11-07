@@ -250,20 +250,49 @@ pub(crate) fn fingerprint_tool_definition(tool: &Tool) -> u64 {
     hasher.finish()
 }
 
-pub(crate) fn canonical_plug_meta_tool_name(tool_name: &str) -> Option<&'static str> {
-    legacy_meta_tool_names()
-        .iter()
-        .copied()
-        .find(|name| name.eq_ignore_ascii_case(tool_name))
+/// A tool Plug serves itself rather than routing to a server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlugTool {
+    ListServers,
+    ListTools,
+    SearchTools,
+    InvokeTool,
 }
 
-pub(crate) fn legacy_meta_tool_names() -> &'static [&'static str] {
-    &[
-        "plug__list_servers",
-        "plug__list_tools",
-        "plug__search_tools",
-        "plug__invoke_tool",
-    ]
+impl PlugTool {
+    /// Every Plug tool, which is also the legacy meta-tool surface.
+    pub(crate) const ALL: [Self; 4] = [
+        Self::ListServers,
+        Self::ListTools,
+        Self::SearchTools,
+        Self::InvokeTool,
+    ];
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::ListServers => "plug__list_servers",
+            Self::ListTools => "plug__list_tools",
+            Self::SearchTools => "plug__search_tools",
+            Self::InvokeTool => "plug__invoke_tool",
+        }
+    }
+
+    /// The Plug tool `tool_name` names, in any case: models drift in how
+    /// they case a tool's name.
+    pub(crate) fn named(tool_name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|tool| tool.name().eq_ignore_ascii_case(tool_name))
+    }
+
+    pub(crate) fn definition(self) -> Tool {
+        match self {
+            Self::ListServers => build_list_servers_meta_tool(),
+            Self::ListTools => build_list_tools_meta_tool(),
+            Self::SearchTools => build_search_tools_meta_tool(),
+            Self::InvokeTool => build_invoke_tool_meta_tool(),
+        }
+    }
 }
 
 pub(crate) fn tokenize_search_query(query: &str) -> Vec<String> {
@@ -421,29 +450,24 @@ pub(crate) fn score_normalized_match(
 }
 
 pub(crate) fn build_meta_tools() -> Vec<Tool> {
-    vec![build_search_tools_meta_tool()]
+    vec![PlugTool::SearchTools.definition()]
 }
 
 pub(crate) fn build_legacy_meta_tools() -> Vec<Tool> {
-    vec![
-        build_list_servers_meta_tool(),
-        build_list_tools_meta_tool(),
-        build_search_tools_meta_tool(),
-        build_invoke_tool_meta_tool(),
-    ]
+    PlugTool::ALL.map(PlugTool::definition).to_vec()
 }
 
-pub(crate) fn build_list_servers_meta_tool() -> Tool {
+fn build_list_servers_meta_tool() -> Tool {
     Tool::new(
-        Cow::Borrowed("plug__list_servers"),
+        Cow::Borrowed(PlugTool::ListServers.name()),
         Cow::Borrowed("List upstream server IDs, health, and current routed tool counts."),
         Arc::new(serde_json::Map::new()),
     )
 }
 
-pub(crate) fn build_list_tools_meta_tool() -> Tool {
+fn build_list_tools_meta_tool() -> Tool {
     Tool::new(
-        Cow::Borrowed("plug__list_tools"),
+        Cow::Borrowed(PlugTool::ListTools.name()),
         Cow::Borrowed(
             "List routed tools hidden behind legacy meta-tool mode, optionally filtered by server or query.",
         ),
@@ -474,10 +498,9 @@ pub(crate) fn build_list_tools_meta_tool() -> Tool {
     )
 }
 
-/// Build the search_tools meta-tool definition.
-pub(crate) fn build_search_tools_meta_tool() -> Tool {
+fn build_search_tools_meta_tool() -> Tool {
     Tool::new(
-        Cow::Borrowed("plug__search_tools"),
+        Cow::Borrowed(PlugTool::SearchTools.name()),
         Cow::Borrowed(
             "Search hidden routed tools by name or description, load the matches into this session, then call the chosen real tool directly.",
         ),
@@ -505,9 +528,9 @@ pub(crate) fn build_search_tools_meta_tool() -> Tool {
     )
 }
 
-pub(crate) fn build_invoke_tool_meta_tool() -> Tool {
+fn build_invoke_tool_meta_tool() -> Tool {
     Tool::new(
-        Cow::Borrowed("plug__invoke_tool"),
+        Cow::Borrowed(PlugTool::InvokeTool.name()),
         Cow::Borrowed(
             "Invoke a specific routed tool by prefixed name and return the raw upstream result. Legacy meta-tool mode only.",
         ),
@@ -534,24 +557,6 @@ pub(crate) fn build_invoke_tool_meta_tool() -> Tool {
 }
 
 impl super::ToolRouter {
-    /// The tools a client of unknown type sees.
-    pub fn list_tools(&self) -> Arc<Vec<Tool>> {
-        let snapshot = self.cache.load();
-        match self.config.lazy_surface_for_client(ClientType::Unknown) {
-            LazyToolSurface::Bridge => Arc::clone(&snapshot.meta_tools_all),
-            LazyToolSurface::LegacyMeta => Arc::clone(&snapshot.legacy_meta_tools),
-            LazyToolSurface::Standard | LazyToolSurface::Native => Arc::clone(&snapshot.tools_all),
-        }
-    }
-
-    pub fn list_tools_page_for_client(
-        &self,
-        client_type: ClientType,
-        request: Option<PaginatedRequestParams>,
-    ) -> Result<ListToolsResult, McpError> {
-        self.list_tools_page_for_client_session(client_type, None, None, request)
-    }
-
     pub fn list_tools_page_for_client_session(
         &self,
         client_type: ClientType,
@@ -606,26 +611,11 @@ impl super::ToolRouter {
     }
 
     /// Total number of tools in the unfiltered cache.
-    pub fn tool_count(&self) -> usize {
-        self.cache.load().tools_all.len()
-    }
-
-    pub fn get_tool_definition(&self, name: &str, client_key: Option<&str>) -> Option<Tool> {
-        if !self.client_may_use_tool(client_key, name) {
-            return None;
-        }
-        self.cache.load().tool_by_name(name).cloned()
-    }
-
     pub fn supports_tasks_for_client(&self, client_type: ClientType) -> bool {
         matches!(
             self.config.lazy_surface_for_client(client_type),
             LazyToolSurface::Standard | LazyToolSurface::Native
         ) && !self.cache.load().tools_all.is_empty()
-    }
-
-    pub fn synthesized_capabilities(&self) -> ServerCapabilities {
-        self.synthesized_capabilities_for_client(ClientType::Unknown)
     }
 
     pub fn synthesized_capabilities_for_client(
@@ -729,9 +719,6 @@ impl super::ToolRouter {
             return Arc::clone(&self.cache.load().legacy_meta_tools);
         }
         let snapshot = self.cache.load();
-        // This client's own surface is Standard or Native here, so with
-        // filtering disabled it gets the whole catalog. `list_tools()` would
-        // resolve the Unknown client's lazy policy instead.
         if !self.config.tool_filter_enabled {
             return Arc::clone(&snapshot.tools_all);
         }
@@ -761,10 +748,6 @@ impl super::ToolRouter {
             }
         }
         Arc::new(tools)
-    }
-
-    pub fn list_resources(&self) -> Arc<Vec<Resource>> {
-        Arc::clone(&self.cache.load().resources_all)
     }
 
     /// Number of resource URIs with at least one active downstream subscriber.
@@ -822,10 +805,6 @@ impl super::ToolRouter {
         )
     }
 
-    pub fn list_resource_templates(&self) -> Arc<Vec<ResourceTemplate>> {
-        Arc::clone(&self.cache.load().resource_templates_all)
-    }
-
     pub fn list_resource_templates_for_client(
         &self,
         client_key: Option<&str>,
@@ -870,10 +849,6 @@ impl super::ToolRouter {
                 ..Default::default()
             },
         )
-    }
-
-    pub fn list_prompts(&self) -> Arc<Vec<Prompt>> {
-        Arc::clone(&self.cache.load().prompts_all)
     }
 
     pub fn list_prompts_for_client(&self, client_key: Option<&str>) -> Arc<Vec<Prompt>> {

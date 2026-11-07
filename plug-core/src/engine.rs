@@ -262,9 +262,12 @@ impl Engine {
         }
     }
 
-    pub fn store_config(&self, config: Config) {
-        apply_live_settings(&self.tool_router, &self.server_manager, &config);
+    /// Take `config` as the running one. Returns whether the tool catalog
+    /// must be rebuilt for its settings to show.
+    pub fn store_config(&self, config: Config) -> bool {
+        let catalog_stale = apply_live_settings(&self.tool_router, &self.server_manager, &config);
         self.config.store(Arc::new(config));
+        catalog_stale
     }
 
     /// Install a freshly connected upstream, unless the server was removed or
@@ -793,15 +796,14 @@ impl Engine {
             }
         }
 
-        let catalog_dirty = old_config.disabled_tools != new_config.disabled_tools
-            || !diff.added.is_empty()
+        let servers_changed = !diff.added.is_empty()
             || !diff.changed.is_empty()
             || !diff.removed.is_empty()
             || !diff.updated.is_empty();
 
         // Swapped before the background tasks start, so they see the new
         // server set.
-        self.store_config(new_config);
+        let catalog_dirty = self.store_config(new_config) || servers_changed;
 
         // A server that could not start gets its health task too, so it is
         // retried.
@@ -1076,11 +1078,12 @@ async fn run_refresh_loop(engine: &Arc<Engine>, server_name: &str, generation: u
 
 /// Hand the settings that apply without a restart to the router, the
 /// servers and the secret stores. The engine's first config and every reload
-/// both come through here.
-fn apply_live_settings(router: &ToolRouter, servers: &ServerManager, config: &Config) {
+/// both come through here. Returns whether the tool catalog must be rebuilt
+/// for them to show.
+fn apply_live_settings(router: &ToolRouter, servers: &ServerManager, config: &Config) -> bool {
     crate::secrets::Stores::configure(&config.secrets);
-    router.apply_config(config);
     servers.set_modern_upstream_enabled(config.modern_upstream_enabled);
+    router.apply_config(config)
 }
 
 fn publish_token_refresh_exchanged(engine: &Engine, server_name: &str) {

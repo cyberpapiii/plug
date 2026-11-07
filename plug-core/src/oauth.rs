@@ -331,7 +331,7 @@ pub async fn bind_discovered_authority(
     resource_url: &str,
     budget: Duration,
 ) -> Result<(), AuthError> {
-    let manager = crate::tls::authorization_manager(resource_url).await?;
+    let manager = crate::upstream_http::authorization_manager(resource_url).await?;
     let resolution = bounded_discovery(resource_url, budget, manager.resolve_metadata()).await?;
     let authority = VerifiedOAuthAuthority::verify(resource_url, &resolution.metadata)?;
     store.bind_verified_authority(&authority)
@@ -1570,7 +1570,7 @@ pub async fn refresh_access_token(
     // 1. Perform token-silent discovery and bind authority before any stored
     // credential is loaded, refreshed, or eligible for attachment.
     let store = get_or_create_store(server_name);
-    let mut auth_manager = match crate::tls::authorization_manager(server_url).await {
+    let mut auth_manager = match crate::upstream_http::authorization_manager(server_url).await {
         Ok(manager) => manager,
         Err(error) => {
             return RefreshResult::TransientError(format!("failed to init auth manager: {error}"));
@@ -2220,7 +2220,7 @@ mod tests {
     async fn verified_runtime_lookup_returns_matching_bound_credential_pair() {
         let name = format!("bound-runtime-{}", uuid::Uuid::new_v4());
         let (resource_url, authority_task) = spawn_empty_oauth_authority().await;
-        let manager = crate::tls::authorization_manager(&resource_url)
+        let manager = crate::upstream_http::authorization_manager(&resource_url)
             .await
             .unwrap();
         let resolution = manager.resolve_metadata().await.unwrap();
@@ -2383,7 +2383,7 @@ mod tests {
         resource_url: &str,
         credentials: Option<StoredCredentials>,
     ) -> Arc<CompositeCredentialStore> {
-        let manager = crate::tls::authorization_manager(resource_url)
+        let manager = crate::upstream_http::authorization_manager(resource_url)
             .await
             .unwrap();
         let resolution = manager.resolve_metadata().await.unwrap();

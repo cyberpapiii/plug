@@ -4213,7 +4213,7 @@ mod tests {
 
         server_manager.replace_server("upstream", upstream).await;
         router.refresh_tools().await;
-        assert_eq!(router.tool_count(), 1);
+        assert_eq!(router.list_all_tools_with_risk().len(), 1);
 
         let (signal, notifications) = watch_tool_list_changed(&router);
 
@@ -4226,10 +4226,10 @@ mod tests {
             .expect("downstream should be told tools/list_changed");
 
         assert_eq!(notifications.load(Ordering::SeqCst), 1);
-        assert_eq!(router.tool_count(), 2);
+        assert_eq!(router.list_all_tools_with_risk().len(), 2);
 
         let exposed_tool_name = router
-            .list_tools()
+            .list_tools_for_client_session(crate::types::ClientType::Unknown, None, None)
             .first()
             .expect("tool exists")
             .name
@@ -4259,7 +4259,7 @@ mod tests {
 
         server_manager.replace_server("upstream", upstream).await;
         router.refresh_tools().await;
-        assert_eq!(router.tool_count(), 1);
+        assert_eq!(router.list_all_tools_with_risk().len(), 1);
 
         let (signal, notifications) = watch_tool_list_changed(&router);
 
@@ -4277,7 +4277,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         assert_eq!(notifications.load(Ordering::SeqCst), 1);
-        assert_eq!(router.tool_count(), 2);
+        assert_eq!(router.list_all_tools_with_risk().len(), 2);
     }
 
     #[tokio::test]
@@ -4297,7 +4297,7 @@ mod tests {
             .expect("refresh routed tools");
 
         let tool_name = router
-            .list_tools()
+            .list_tools_for_client_session(crate::types::ClientType::Unknown, None, None)
             .first()
             .expect("task-native tool should be exposed")
             .name
@@ -4432,7 +4432,7 @@ mod tests {
             .expect("refresh routed tools");
 
         let tool_name = router
-            .list_tools()
+            .list_tools_for_client_session(crate::types::ClientType::Unknown, None, None)
             .first()
             .expect("task-native tool should be exposed")
             .name
@@ -4607,7 +4607,7 @@ mod tests {
         router.refresh_tools().await;
 
         let prefixed_tool_name = router
-            .list_tools()
+            .list_tools_for_client_session(crate::types::ClientType::Unknown, None, None)
             .first()
             .expect("tool exists")
             .name
@@ -4631,7 +4631,7 @@ mod tests {
         .await
         .expect("the call reaches the upstream");
 
-        router.forward_cancel_from_downstream(
+        router.cancel_downstream_request(
             &crate::proxy::DownstreamCallContext::ipc(
                 "downstream",
                 RequestId::Number(41),
@@ -4698,7 +4698,7 @@ mod tests {
 
         // A skill carries its server's name; any other resource is as sent.
         let mut listed: Vec<String> = router
-            .list_resources()
+            .list_resources_for_client(None)
             .iter()
             .map(|resource| resource.uri.clone())
             .collect();
@@ -4735,10 +4735,11 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(router.list_resource_templates().len(), 1);
-        assert_eq!(router.list_prompts().len(), 1);
+        assert_eq!(router.list_resource_templates_for_client(None).len(), 1);
+        assert_eq!(router.list_prompts_for_client(None).len(), 1);
 
-        let capabilities = router.synthesized_capabilities();
+        let capabilities =
+            router.synthesized_capabilities_for_client(crate::types::ClientType::Unknown);
         assert!(capabilities.resources.is_some());
         assert!(capabilities.prompts.is_some());
 
@@ -4748,7 +4749,7 @@ mod tests {
             .expect("read resource");
         assert_eq!(read.contents.len(), 1);
 
-        let prompt_name = router.list_prompts()[0].name.clone();
+        let prompt_name = router.list_prompts_for_client(None)[0].name.clone();
         let prompt = router
             .get_prompt(prompt_name.as_str(), None, None)
             .await
@@ -4872,7 +4873,7 @@ mod tests {
         router.refresh_tools().await;
 
         let tool_name = router
-            .list_tools()
+            .list_tools_for_client_session(crate::types::ClientType::Unknown, None, None)
             .iter()
             .find(|tool| tool.name.ends_with("__echo"))
             .map(|tool| tool.name.to_string())
@@ -4999,7 +5000,7 @@ mod tests {
         router.refresh_tools().await;
 
         let tool_name = router
-            .list_tools()
+            .list_tools_for_client_session(crate::types::ClientType::Unknown, None, None)
             .iter()
             .find(|tool| tool.name.ends_with("__echo"))
             .map(|tool| tool.name.to_string())
@@ -5040,7 +5041,7 @@ mod tests {
             .expect("downstream should be told tools/list_changed");
 
         assert_eq!(notifications.load(Ordering::SeqCst), 1);
-        assert_eq!(router.tool_count(), 2);
+        assert_eq!(router.list_all_tools_with_risk().len(), 2);
     }
 
     /// A server that failed at boot has no semaphore and no breaker. When it

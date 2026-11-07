@@ -745,14 +745,14 @@ async fn upstream_lifecycle_modes_negotiate_independently_with_live_truth() {
     );
     let routed_tool = modern_engine
         .tool_router()
-        .list_tools()
+        .list_tools_for_client_session(plug_core::types::ClientType::Unknown, None, None)
         .iter()
         .find(|tool| tool.name.ends_with("__echo"))
         .expect("modern tool routed")
         .clone();
     let projected_page = modern_engine
         .tool_router()
-        .list_tools_page_for_client(plug_core::types::ClientType::Unknown, None)
+        .list_tools_page_for_client_session(plug_core::types::ClientType::Unknown, None, None, None)
         .expect("first page");
     assert_eq!(projected_page.ttl_ms, Some(0));
     assert_eq!(
@@ -834,7 +834,7 @@ async fn legacy_task_child_process_stdio_preserves_full_lifecycle_under_rmcp3() 
     engine.start().await;
     let router = engine.tool_router();
     let tool_name = router
-        .list_tools()
+        .list_tools_for_client_session(plug_core::types::ClientType::Unknown, None, None)
         .iter()
         .find(|tool| tool.name.ends_with("__echo"))
         .expect("legacy task child tool routed")
@@ -1018,7 +1018,10 @@ async fn degraded_listing_carries_last_known_good_and_keeps_subscription() {
     // ── Healthy: live listing succeeds, resource enters catalog, cache primed ──
     router.refresh_tools().await;
     assert!(
-        router.list_resources().iter().any(|r| r.uri == uri),
+        router
+            .list_resources_for_client(None)
+            .iter()
+            .any(|r| r.uri == uri),
         "resource should be present after a healthy listing"
     );
     let target = NotificationTarget::Ipc {
@@ -1059,7 +1062,10 @@ async fn degraded_listing_carries_last_known_good_and_keeps_subscription() {
     std::fs::write(&fail_flag, b"1").expect("set fail flag");
     router.refresh_tools().await;
     assert!(
-        router.list_resources().iter().any(|r| r.uri == uri),
+        router
+            .list_resources_for_client(None)
+            .iter()
+            .any(|r| r.uri == uri),
         "degraded listing must carry the last-known-good resource forward"
     );
     assert_eq!(
@@ -1079,7 +1085,10 @@ async fn degraded_listing_carries_last_known_good_and_keeps_subscription() {
     std::fs::write(&empty_flag, b"1").expect("set empty flag");
     router.refresh_tools().await;
     assert!(
-        !router.list_resources().iter().any(|r| r.uri == uri),
+        !router
+            .list_resources_for_client(None)
+            .iter()
+            .any(|r| r.uri == uri),
         "a genuine fresh-empty listing must drop the resource"
     );
     assert_eq!(
@@ -2558,9 +2567,10 @@ async fn test_oauth_auth_code_exchange_persists_credentials() {
     let result = AssertUnwindSafe(async {
         use rmcp::transport::auth::OAuthClientConfig;
 
-        let mut auth_manager = plug_core::tls::authorization_manager(provider.mcp_url().as_str())
-            .await
-            .expect("create auth manager");
+        let mut auth_manager =
+            plug_core::upstream_http::authorization_manager(provider.mcp_url().as_str())
+                .await
+                .expect("create auth manager");
         auth_manager.set_credential_store(plug_core::oauth::CompositeCredentialStore::new(
             server_name.clone(),
         ));
@@ -4008,7 +4018,7 @@ async fn test_oauth_refresh_under_load_no_auth_errors() {
 
         let tool_name = started_engine
             .tool_router()
-            .list_tools()
+            .list_tools_for_client_session(plug_core::types::ClientType::Unknown, None, None)
             .iter()
             .find(|tool| tool.name.ends_with("__echo"))
             .expect("upstream tool routed")

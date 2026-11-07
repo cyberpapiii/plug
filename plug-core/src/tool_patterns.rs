@@ -5,7 +5,7 @@ pub fn is_disabled_tool(patterns: &[String], tool_name: &str) -> bool {
     if patterns.is_empty() {
         return false;
     }
-    // Prefer pre-lowercased patterns (`RouterConfig::from`); still tolerate mixed case.
+    // The router keeps its patterns lowercased; other callers may not.
     let tool_name = tool_name.to_ascii_lowercase();
     patterns.iter().any(|pattern| {
         if pattern.bytes().all(|b| !b.is_ascii_uppercase()) {

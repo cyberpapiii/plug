@@ -60,6 +60,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A remote client whose event stream drops before anything new arrives no longer gets the notices it already had sent again, up to 128 of them, when it reconnects.
+- The sign-in page says what `events:subscribe` lets a client do. It used to say only "Use the requested Plug capability".
+- Remote sign-in is refused when its state file can be read or written by other users on this Mac, as `plug doctor` already reported. Plug used to go on trusting the owner approvals in it. Run `chmod 600` on the file to bring sign-in back.
 - With the 2026-07-28 protocol turned on, a client is offered tasks according to its own lazy-tool mode. Plug used to decide from the mode of a client of unknown type, so a client behind the search bridge could be offered tasks and one that lists tools as they are could be refused them.
 - A large tool result that carries a file is kept whatever the file is called and whatever is in it. A file named `result.json` used to replace the result itself, and a file that could not be decoded or written, or an empty name or `..`, failed the whole call.
 - A client that signs in through a loopback callback on a port of its own, as Claude Code and Codex do, is sent back to its app with the reason when Plug turns the sign-in down, such as a scope it cannot grant. It used to be shown an error page in the browser instead.
