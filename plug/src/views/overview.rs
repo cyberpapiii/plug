@@ -432,21 +432,16 @@ pub(crate) fn print_live_status(status: &LiveStatus, verbose: bool) {
         let config_by_server = config.as_ref().map(|cfg| &cfg.servers);
         let auth_required_servers = servers
             .iter()
-            .filter(|s| s.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID)
             .filter(|s| matches!(s.health, plug_core::types::ServerHealth::AuthRequired))
             .map(|s| s.server_id.clone())
             .collect::<Vec<_>>();
         let failed_servers = servers
             .iter()
-            .filter(|s| s.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID)
             .filter(|s| matches!(s.health, plug_core::types::ServerHealth::Failed))
             .map(|s| s.server_id.clone())
             .collect::<Vec<_>>();
         print_heading("Servers");
         for s in servers {
-            if s.server_id == plug_core::tool_naming::INTERNAL_SERVER_ID {
-                continue;
-            }
             let server_cfg = config_by_server.and_then(|servers| servers.get(&s.server_id));
             if verbose {
                 println!(
@@ -773,7 +768,6 @@ mod tests {
         assert_eq!(m["last_latency_ms"], 42);
         assert_eq!(m["degraded_since_epoch_secs"], 1_700_000_000_u64);
         assert_eq!(m["circuit_state"], "open");
-        // Supervision (item 2b) restart metrics ride the same per-upstream contract.
         assert_eq!(m["restart_count"], 3);
         assert_eq!(m["last_restart_epoch_secs"], 1_700_000_500_u64);
         // Availability rides the same per-server JSON contract.

@@ -3,7 +3,7 @@
 use plug_core::clients::LinkTransport;
 
 use crate::OutputFormat;
-use crate::commands::clients::{link_transport, linked_clients, own_http};
+use crate::commands::clients::{link_transport, linked_clients};
 use crate::ipc_client;
 use crate::views::live;
 use crate::views::overview::{
@@ -14,7 +14,8 @@ use crate::views::overview::{
 
 /// Each linked client's slug and the transport its link uses.
 fn linked_topology(config: Option<&plug_core::config::Config>) -> Vec<(String, LinkTransport)> {
-    linked_clients(&own_http(config))
+    let plug = config.map(|config| config.http.clone()).unwrap_or_default();
+    linked_clients(&plug)
         .into_iter()
         .map(|(target, entry)| (target.slug().to_string(), link_transport(&entry)))
         .collect()

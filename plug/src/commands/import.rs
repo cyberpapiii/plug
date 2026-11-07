@@ -52,10 +52,9 @@ pub(crate) async fn add_servers(
 pub(crate) fn scan(
     config_path: Option<&std::path::PathBuf>,
     sources: &[ClientTarget],
-) -> ImportReport {
-    // A config that does not load still lets the scan say what is out there.
-    let config = plug_core::config::load_config(config_path).unwrap_or_default();
-    plug_core::import::import(&config, sources)
+) -> anyhow::Result<ImportReport> {
+    let config = plug_core::config::load_config(config_path)?;
+    Ok(plug_core::import::import(&config, sources))
 }
 
 pub(crate) fn print_discovered(servers: &[DiscoveredServer]) {
@@ -90,7 +89,7 @@ pub(crate) async fn cmd_import(
     if matches!(output, OutputFormat::Json) {
         println!(
             "{}",
-            serde_json::to_string_pretty(&scan(config_path, &sources))?
+            serde_json::to_string_pretty(&scan(config_path, &sources)?)?
         );
         return Ok(());
     }
@@ -101,7 +100,7 @@ pub(crate) async fn cmd_import(
         "Scan existing AI client configs for MCP servers",
     );
     print_info_line(style("Scanning for MCP servers...").bold());
-    let report = scan(config_path, &sources);
+    let report = scan(config_path, &sources)?;
     for res in &report.scanned {
         if let Some(ref e) = res.error {
             eprintln!(
