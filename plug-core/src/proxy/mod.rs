@@ -970,7 +970,8 @@ impl ToolRouter {
     }
 
     /// Changes whenever the merged tool catalog could look different to a
-    /// reader.
+    /// reader. It starts at a random number, so a reader still holding a
+    /// revision from an earlier daemon never takes this one for it.
     pub fn catalog_revision(&self) -> u64 {
         self.catalog_revision.load(Ordering::Relaxed)
     }
@@ -1079,7 +1080,7 @@ impl ToolRouter {
             activity_store: crate::activity::ActivityStore::default(),
             cache,
             published_tool_routes: std::sync::Mutex::new(HashMap::new()),
-            catalog_revision: AtomicU64::new(0),
+            catalog_revision: AtomicU64::new(rand::random()),
             search_index: std::sync::Mutex::new(None),
             config,
             protocol_notification_tx,

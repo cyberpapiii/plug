@@ -611,6 +611,21 @@ fn store_plain_tools_snapshot(router: &ToolRouter, tools: Vec<Tool>) {
     ));
 }
 
+/// The app keeps its tool list while the revision matches the one it read,
+/// so a daemon that publishes as often as the one before it must not land
+/// on that one's number.
+#[tokio::test]
+async fn catalog_revisions_of_two_daemons_never_meet() {
+    let revisions = || async {
+        let router = ToolRouter::new(Arc::new(ServerManager::new()), RouterConfig::default());
+        let before = router.catalog_revision();
+        router.refresh_tools().await;
+        assert_ne!(router.catalog_revision(), before);
+        router.catalog_revision()
+    };
+    assert_ne!(revisions().await, revisions().await);
+}
+
 #[test]
 fn standard_client_sees_full_catalog_when_filtering_disabled_and_unknown_is_lazy() {
     // A client whose own lazy policy is Standard must get the full catalog
