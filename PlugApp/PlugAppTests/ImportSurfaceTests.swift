@@ -64,27 +64,6 @@ final class ImportScanTests: XCTestCase {
         XCTAssertEqual(events.config.timeoutSecs, 90)
     }
 
-    /// Every linked app has a Plug entry of its own. Importing it would point
-    /// Plug at itself.
-    func testSkipsPlugsOwnEntry() throws {
-        let result = try scan("""
-        {
-          "scanned": [],
-          "new_servers": [
-            {
-              "name": "Plug",
-              "source": "Cursor", "source_target": "cursor", "source_name": "Cursor",
-              "config": {
-                "command": "/Users/someone/.local/bin/plug",
-                "args": ["connect"], "env": {}, "transport": "stdio", "url": null
-              }
-            }
-          ]
-        }
-        """)
-        XCTAssertTrue(result.isEmpty)
-    }
-
     func testSkipsEntriesWithNothingToRun() throws {
         let result = try scan("""
         { "scanned": [], "new_servers": [

@@ -58,6 +58,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- `plug import` and `plug setup` skip a link to Plug saved under another name, such as `plug-local`, by what it runs (`plug connect` or `plug serve`). They used to import it, which pointed Plug at itself. The app's import sheet takes its list from `plug import`, and pasting such an entry into Add Server says it is Plug's own.
 - Saving a server in the app keeps every setting the daemon sent for it, including one the app has no field for. A setting the app did not know was erased by the first edit.
 - When Plug cannot start, stop or check its service, the app says why in a sentence. The reconcile panel used to show a Swift case name such as `verificationFailed(expectedVersion: "0.9.1", actualVersion: nil)`, and a failed restart or switch showed only an error number.
 - The mark beside Plug in the menu bar panel takes the same colour as in the window and Settings. With one server down it was red in the panel and orange everywhere else.
