@@ -25,6 +25,8 @@ public enum PlugPaths {
     public static let bundledBinary = "Contents/Resources/plug"
     /// What launchd runs the bundled binary with.
     public static let daemonArguments = ["serve", "--daemon"]
+    /// Under the home folder: the `plug` command Plug.app links to its binary.
+    public static let commandLink = ".local/bin/plug"
 
     public static var directoryURL: URL { PlugHome.standard.directory }
 

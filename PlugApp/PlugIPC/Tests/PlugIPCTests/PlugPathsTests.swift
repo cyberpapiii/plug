@@ -17,6 +17,7 @@ final class PlugPathsTests: XCTestCase {
         let teamId: String
         let bundledBinary: String
         let daemonArgs: [String]
+        let commandLink: String
     }
 
     func testTheAppUsesTheDaemonsNames() throws {
@@ -44,6 +45,7 @@ final class PlugPathsTests: XCTestCase {
         XCTAssertEqual(fixture.teamId, PlugPaths.teamID)
         XCTAssertEqual(fixture.bundledBinary, PlugPaths.bundledBinary)
         XCTAssertEqual(fixture.daemonArgs, PlugPaths.daemonArguments)
+        XCTAssertEqual(fixture.commandLink, PlugPaths.commandLink)
     }
 
     /// The plist the app registers names the job and runs the binary the way
