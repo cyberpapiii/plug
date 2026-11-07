@@ -1,6 +1,7 @@
 //! Notification delivery to IPC clients — control-channel fanout.
 
 use plug_core::ipc::{self, IpcResponse};
+use plug_core::notifications::{ListsChanged, NotificationTarget, ProtocolNotification};
 
 /// Send a protocol (control) notification to the IPC client, handling
 /// broadcast errors. A failed write is returned, so a dead connection ends at
@@ -11,80 +12,87 @@ use plug_core::ipc::{self, IpcResponse};
 /// updated, a client's own tool list) only to the session they name.
 pub(super) async fn send_ipc_control_notification(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
-    recv: Result<
-        plug_core::notifications::ProtocolNotification,
-        tokio::sync::broadcast::error::RecvError,
-    >,
+    recv: Result<ProtocolNotification, tokio::sync::broadcast::error::RecvError>,
     session_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    use plug_core::notifications::{NotificationTarget, ProtocolNotification};
     use tokio::sync::broadcast::error::RecvError;
 
-    let message = match recv {
-        Ok(notification) => {
-            let identity = session_id.map(|sid| NotificationTarget::Ipc {
-                client_id: sid.into(),
-            });
-            let deliver = identity.as_ref().is_some_and(|id| notification.is_for(id));
-            match notification {
-                ProtocolNotification::ToolListChanged => {
-                    Some(IpcResponse::ToolListChangedNotification)
-                }
-                ProtocolNotification::ToolListChangedFor { .. } => {
-                    deliver.then_some(IpcResponse::ToolListChangedNotification)
-                }
-                ProtocolNotification::ResourceListChanged => {
-                    Some(IpcResponse::ResourceListChangedNotification)
-                }
-                ProtocolNotification::ResourceUpdated { params, .. } => {
-                    deliver.then(|| IpcResponse::ResourceUpdatedNotification {
-                        params: serde_json::to_value(params).unwrap_or_default(),
-                    })
-                }
-                ProtocolNotification::PromptListChanged => {
-                    Some(IpcResponse::PromptListChangedNotification)
-                }
-                ProtocolNotification::Progress { params, .. } => {
-                    deliver.then(|| IpcResponse::ProgressNotification {
-                        params: serde_json::to_value(params).unwrap_or_default(),
-                    })
-                }
-                ProtocolNotification::Cancelled { params, .. } => {
-                    deliver.then(|| IpcResponse::CancelledNotification {
-                        params: serde_json::to_value(params).unwrap_or_default(),
-                    })
-                }
-                ProtocolNotification::AuthStateChanged {
-                    server_id,
-                    new_state,
-                } => Some(IpcResponse::AuthStateChanged {
-                    server_id: server_id.to_string(),
-                    state: new_state,
-                }),
-                notification @ ProtocolNotification::TokenRefreshExchanged { .. } => notification
-                    .as_logging_message_params()
-                    .map(|params| IpcResponse::LoggingNotification {
-                        params: serde_json::to_value(params).unwrap_or_default(),
-                    }),
-                // Logging has its own channel.
-                ProtocolNotification::LoggingMessage { .. } => None,
-            }
-        }
+    let messages: Vec<IpcResponse> = match recv {
+        Ok(notification) => ipc_message(notification, session_id).into_iter().collect(),
         Err(RecvError::Lagged(skipped)) => {
             tracing::warn!(skipped, "IPC control notification lagged");
-            Some(IpcResponse::LoggingNotification {
+            let lagged = IpcResponse::LoggingNotification {
                 params: serde_json::to_value(ProtocolNotification::control_lagged_logging_params(
                     skipped, "ipc",
                 ))
                 .unwrap_or_default(),
-            })
+            };
+            // What was skipped may have said a list changed.
+            std::iter::once(lagged)
+                .chain(
+                    ListsChanged::ALL
+                        .notifications()
+                        .filter_map(|notification| ipc_message(notification, session_id)),
+                )
+                .collect()
         }
-        Err(RecvError::Closed) => None,
+        Err(RecvError::Closed) => Vec::new(),
     };
-    if let Some(message) = message {
-        ipc::send_response(writer, &message).await?;
+    for message in &messages {
+        ipc::send_response(writer, message).await?;
     }
     Ok(())
+}
+
+/// What the IPC client of `session_id` is sent for `notification`, if
+/// anything.
+fn ipc_message(
+    notification: ProtocolNotification,
+    session_id: Option<&str>,
+) -> Option<IpcResponse> {
+    let identity = session_id.map(|sid| NotificationTarget::Ipc {
+        client_id: sid.into(),
+    });
+    let deliver = identity.as_ref().is_some_and(|id| notification.is_for(id));
+    match notification {
+        ProtocolNotification::ToolListChanged => Some(IpcResponse::ToolListChangedNotification),
+        ProtocolNotification::ToolListChangedFor { .. } => {
+            deliver.then_some(IpcResponse::ToolListChangedNotification)
+        }
+        ProtocolNotification::ResourceListChanged => {
+            Some(IpcResponse::ResourceListChangedNotification)
+        }
+        ProtocolNotification::ResourceUpdated { params, .. } => {
+            deliver.then(|| IpcResponse::ResourceUpdatedNotification {
+                params: serde_json::to_value(params).unwrap_or_default(),
+            })
+        }
+        ProtocolNotification::PromptListChanged => Some(IpcResponse::PromptListChangedNotification),
+        ProtocolNotification::Progress { params, .. } => {
+            deliver.then(|| IpcResponse::ProgressNotification {
+                params: serde_json::to_value(params).unwrap_or_default(),
+            })
+        }
+        ProtocolNotification::Cancelled { params, .. } => {
+            deliver.then(|| IpcResponse::CancelledNotification {
+                params: serde_json::to_value(params).unwrap_or_default(),
+            })
+        }
+        ProtocolNotification::AuthStateChanged {
+            server_id,
+            new_state,
+        } => Some(IpcResponse::AuthStateChanged {
+            server_id: server_id.to_string(),
+            state: new_state,
+        }),
+        notification @ ProtocolNotification::TokenRefreshExchanged { .. } => notification
+            .as_logging_message_params()
+            .map(|params| IpcResponse::LoggingNotification {
+                params: serde_json::to_value(params).unwrap_or_default(),
+            }),
+        // Logging has its own channel.
+        ProtocolNotification::LoggingMessage { .. } => None,
+    }
 }
 
 #[cfg(test)]
@@ -117,6 +125,41 @@ mod tests {
             Ok(None) => None,
             Err(e) => panic!("unexpected read error: {e}"),
         }
+    }
+
+    /// What the client fell too far behind to read may have said a list
+    /// changed, so it is told all three may have.
+    #[tokio::test]
+    async fn a_lagged_client_hears_every_list_may_have_changed() {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (mut r_client, _w_client) = client.into_split();
+        let (_r_server, mut w_server) = server.into_split();
+
+        send_ipc_control_notification(
+            &mut w_server,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(7)),
+            Some("sess-1"),
+        )
+        .await
+        .expect("send should not fail");
+        drop(w_server);
+
+        let mut sent = Vec::new();
+        while let Some(frame) = ipc::read_frame(&mut r_client).await.unwrap() {
+            sent.push(serde_json::from_slice::<IpcResponse>(&frame).unwrap());
+        }
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [
+                    IpcResponse::LoggingNotification { .. },
+                    IpcResponse::ToolListChangedNotification,
+                    IpcResponse::ResourceListChangedNotification,
+                    IpcResponse::PromptListChangedNotification,
+                ]
+            ),
+            "{sent:?}"
+        );
     }
 
     #[tokio::test]

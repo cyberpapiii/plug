@@ -195,10 +195,6 @@ pub(crate) fn test_state() -> Arc<HttpState> {
 
 pub(crate) fn enable_test_task_surface(router: &ToolRouter) {
     router.replace_snapshot(RouterSnapshot {
-        routes_lower: HashMap::new(),
-        tools_by_name: HashMap::new(),
-        tools_by_name_lower: HashMap::new(),
-
         routes: HashMap::from([(
             "Mock__echo".to_string(),
             ("mock".to_string(), "echo".to_string()),
@@ -208,14 +204,7 @@ pub(crate) fn enable_test_task_surface(router: &ToolRouter) {
             std::borrow::Cow::Borrowed("Echo"),
             Arc::new(serde_json::Map::new()),
         )]),
-        meta_tools_all: Arc::new(Vec::new()),
-        resources_all: Arc::new(Vec::new()),
-        resource_templates_all: Arc::new(Vec::new()),
-        prompts_all: Arc::new(Vec::new()),
-        resource_routes: HashMap::new(),
-        prompt_routes: HashMap::new(),
-        tool_definition_fingerprints: HashMap::new(),
-        tool_risk_inventory: HashMap::new(),
+        ..Default::default()
     });
 }
 

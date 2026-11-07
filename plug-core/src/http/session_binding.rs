@@ -3,7 +3,7 @@ use super::fanout::notification_to_sse_message;
 use super::identity::{AuthStatus, apply_http_auth};
 use super::reverse::{HttpBridge, maybe_request_http_roots};
 use super::server::{HttpState, SESSION_ID_HEADER};
-use crate::notifications::{NotificationTarget, ProtocolNotification};
+use crate::notifications::{ListsChanged, NotificationTarget};
 use crate::session::{BroadcastAudience, GrantBinding, SessionBinding, SessionError, SessionStore};
 use axum::http::HeaderMap;
 use std::sync::Arc;
@@ -144,11 +144,7 @@ pub(super) async fn reopen_lost_session(
             .insert(session_id.clone(), capabilities);
     }
     wire_session(state, &session_id);
-    for notification in [
-        ProtocolNotification::ToolListChanged,
-        ProtocolNotification::ResourceListChanged,
-        ProtocolNotification::PromptListChanged,
-    ] {
+    for notification in ListsChanged::ALL.notifications() {
         if let Some(message) = notification_to_sse_message(&notification) {
             state.sessions.send_to_live_session(&session_id, message);
         }
