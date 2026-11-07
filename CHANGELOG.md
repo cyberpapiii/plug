@@ -5,6 +5,12 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Plug stops up to two seconds sooner when it is stopped or swapped within ten seconds of starting a server. Each server's first health check waits a few random seconds, and that wait no longer holds up shutdown.
+
 ## [0.12.0] - 2026-11-07
 
 ### Changed

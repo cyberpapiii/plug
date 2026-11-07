@@ -1133,6 +1133,30 @@ mod tests {
         config
     }
 
+    /// Each healthy server's health task first waits a random 0-10 s so
+    /// checks do not fire together. Three servers make it near-certain one of
+    /// those waits outlasts the budget, so a wait that ignores shutdown shows.
+    #[tokio::test]
+    async fn shutdown_right_after_start_does_not_wait_for_health_checks() {
+        let mut config = Config::default();
+        for name in ["a", "b", "c"] {
+            config
+                .servers
+                .insert(name.into(), mock_stdio_server_config("echo", 1));
+        }
+        let engine = Engine::new(config);
+        engine.start().await;
+        assert!(engine.server_manager().get_upstream("a").is_some());
+
+        let started = Instant::now();
+        engine.shutdown().await;
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "shutdown took {:?}",
+            started.elapsed()
+        );
+    }
+
     #[tokio::test]
     async fn a_reload_starts_only_the_servers_that_are_on() {
         let engine = Engine::new(Config::default());

@@ -130,7 +130,11 @@ impl Monitor {
             let started_healthy = monitor.servers.get_upstream(&name).is_some();
             if started_healthy {
                 let stagger = Duration::from_millis(rand::random_range(0..10_000));
-                tokio::time::sleep(stagger).await;
+                tokio::select! {
+                    biased;
+                    _ = monitor.cancel.cancelled() => return,
+                    _ = tokio::time::sleep(stagger) => {}
+                }
             }
 
             let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
