@@ -16,8 +16,8 @@ struct CallFacts: Equatable, Sendable {
     let grantName: String?
     /// Where the owner says this client runs.
     let place: String?
-    /// What joins the server half of a tool name to the tool half. Empty
-    /// leaves the name whole, for a reader that only asks how a call went.
+    /// What joins a server's prefix to a tool's own name. Empty leaves the
+    /// name whole, for a reader that only asks how a call went.
     let delimiter: String
 
     init(
@@ -54,18 +54,23 @@ struct CallFacts: Equatable, Sendable {
         }
     }
 
-    /// Tool names arrive as `Server__tool`. The server half is shown once, as
-    /// a word; the tool half stands alone.
-    private var parts: (server: String?, tool: String) {
-        guard let tool = event.tool, !tool.isEmpty else { return (event.server, event.method) }
-        guard !delimiter.isEmpty, let range = tool.range(of: delimiter), range.lowerBound > tool.startIndex,
-              range.upperBound < tool.endIndex
-        else { return (event.server, tool) }
-        return (String(tool[..<range.lowerBound]), String(tool[range.upperBound...]))
+    /// The tool as the tool list names it. A tool a group rule files under
+    /// another name, such as `Gmail__send` on `workspace`, keeps that name.
+    var tool: String {
+        guard let tool = event.tool, !tool.isEmpty else { return event.method }
+        guard let server = event.server else { return tool }
+        return ToolFacts.shortName(of: tool, server: server, delimiter: delimiter)
     }
 
-    var tool: String { parts.tool }
-    var server: String? { parts.server }
+    /// The server that answered, as the daemon routed the call.
+    var server: String? { event.server }
+
+    /// A search finds a call by the names its row shows, and by the ones
+    /// the call arrived with.
+    func matches(_ query: String) -> Bool {
+        [caller, place, tool, server, event.tool, event.method, event.clientLabel]
+            .contains { $0?.localizedCaseInsensitiveContains(query) ?? false }
+    }
 
     /// The client whose icon the caller shows.
     var callerTarget: String {

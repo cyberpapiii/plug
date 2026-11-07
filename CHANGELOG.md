@@ -56,6 +56,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A client on another Mac that signs in over the network no longer shows as connected in the row of the same app on this Mac, and the Clients page counts connected clients the way the menu bar panel does.
+- Activity shows a call under the server that answered it. A tool a group rule files under another name, such as `Gmail__send_message` on Google Workspace, used to show "Gmail" as its server and Gmail's icon, while Show Server opened Workspace. Activity's search also finds a call by the client name its row shows.
 - Pasting a server block whose `command` is an empty list no longer quits the app; the paste says it has nothing to run, as `plug import` does. A list holding anything but text is refused the same way, and a pasted address entry with `"enabled": false` is added turned off.
 - `plug doctor` reports an older Plug installed under `/opt/homebrew/opt/plug` or `/usr/local/opt/plug`, or as a binary at `~/.local/bin/plug`, as it already did for the other places Homebrew and Cargo put one, and lists a Homebrew copy reached by two paths once.
 - Stopping the daemon removes its socket, PID file and token every time. When launchd stopped it with SIGTERM, the daemon could exit before that cleanup ran and before HTTP finished shutting down.

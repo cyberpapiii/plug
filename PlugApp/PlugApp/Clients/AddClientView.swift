@@ -75,7 +75,7 @@ enum AddClient {
                 // Plug will not write settings for a client it cannot find.
                 return way == .onThisMac ? .command : .address
             }
-            let linkedWay: Way? = app.linked ? (app.transport?.lowercased() == "http" ? .network : .onThisMac) : nil
+            let linkedWay: Way? = app.linked ? (app.overNetwork ? .network : .onThisMac) : nil
             return linkedWay == way ? .done(target: target) : .write(target: target)
         case .hosted:
             return address.map(reachesBeyondThisMac) == true ? .address : .unreachable

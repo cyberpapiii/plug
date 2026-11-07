@@ -42,12 +42,16 @@ struct ToolFacts: Identifiable, Equatable, Sendable {
         self.lockedByPattern = lockedByPattern
         self.ownName = ownName
         self.isReadOnly = isReadOnly
+        shortName = Self.shortName(of: name, server: server, delimiter: delimiter)
+    }
+
+    /// A merged tool name without its server's own prefix. Any other prefix,
+    /// such as a group's, stays.
+    static func shortName(of name: String, server: String, delimiter: String) -> String {
         let prefix = "\(server)\(delimiter)"
-        if !delimiter.isEmpty, name.count > prefix.count, name.lowercased().hasPrefix(prefix.lowercased()) {
-            shortName = String(name.dropFirst(prefix.count))
-        } else {
-            shortName = name
-        }
+        guard !delimiter.isEmpty, name.count > prefix.count, name.lowercased().hasPrefix(prefix.lowercased())
+        else { return name }
+        return String(name.dropFirst(prefix.count))
     }
 }
 

@@ -15,6 +15,9 @@ struct LinkableApp: Identifiable, Equatable, Sendable {
     /// How a linked app reaches Plug: on this Mac, or over the network.
     let transport: String?
 
+    /// The app is linked to reach Plug over the network.
+    var overNetwork: Bool { transport?.lowercased() == "http" }
+
     private enum CodingKeys: String, CodingKey {
         case target, name, linked, detected, live
         case sessions = "live_sessions"

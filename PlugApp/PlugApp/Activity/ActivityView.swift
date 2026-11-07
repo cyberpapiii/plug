@@ -109,14 +109,7 @@ struct ActivityView: View {
         let query = search.trimmingCharacters(in: .whitespaces)
         return model.activities
             .filter { scope == .everything || CallFacts($0).failed }
-            .filter { event in
-                guard !query.isEmpty else { return true }
-                return event.method.localizedCaseInsensitiveContains(query)
-                    || (event.tool ?? "").localizedCaseInsensitiveContains(query)
-                    || (event.server ?? "").localizedCaseInsensitiveContains(query)
-                    || (event.clientLabel ?? "").localizedCaseInsensitiveContains(query)
-                    || (event.clientType ?? "").localizedCaseInsensitiveContains(query)
-            }
+            .filter { query.isEmpty || model.call($0).matches(query) }
             .sorted { $0.sequence > $1.sequence }
     }
 
@@ -249,8 +242,8 @@ private struct CallDetail: View {
                         HStack(spacing: Metric.tight) {
                             ServerGlyph(name: server, size: 16)
                             Text(server).textSelection(.enabled)
-                            if canShowServer, let name = call.event.server {
-                                Button { run(.reveal(server: name)) } label: {
+                            if canShowServer {
+                                Button { run(.reveal(server: server)) } label: {
                                     PlugIcon(.show)
                                 }
                                 .buttonStyle(.borderless)

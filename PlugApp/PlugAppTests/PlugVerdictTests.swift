@@ -298,15 +298,36 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertEqual(starting.settledServers.map(\.name), ["a", "b"])
     }
 
-    /// A face that never came to rest would redraw for ever, and one that
-    /// moved a part out of sight would not be the character.
-    func testEveryFaceHoldsStillAsAWholeCharacter() {
+    /// A face that moved a part out of sight would not be the character.
+    func testEveryStillFaceIsAWholeCharacter() {
         for mood in PlugMood.allCases {
             let pose = PlugPose.pose(for: mood, at: 0, moving: false)
-            XCTAssertEqual(pose, PlugPose.pose(for: mood, at: 3.7, moving: false), "\(mood)")
             for part in [PlugPose.Part.bodyWidth, .bodyHeight, .leftProngHeight, .rightProngHeight] {
                 XCTAssertGreaterThan(pose[part], 0, "\(mood) \(part)")
             }
+        }
+    }
+
+    /// The character stops drawing until the next change `nextChange` names,
+    /// so a face that moved before then would freeze mid-move. Faces that
+    /// never stop moving are looked at again every quarter of a second.
+    func testAMovingFaceHoldsStillUntilItsNextChange() {
+        let restless: Set<PlugMood> = [.happy, .thinking, .loading, .dizzy, .asleep, .tucked]
+        for mood in PlugMood.allCases where !restless.contains(mood) {
+            for step in 0..<150 {
+                let time = Double(step) * 0.137
+                let next = PlugPose.nextChange(for: mood, after: time)
+                XCTAssertGreaterThan(next, time, "\(mood) at \(time)")
+                let until = next.isFinite ? next : time + 30
+                let pose = PlugPose.pose(for: mood, at: time, moving: true)
+                for fraction in [0.1, 0.5, 0.9] {
+                    let later = time + (until - time) * fraction
+                    XCTAssertEqual(PlugPose.pose(for: mood, at: later, moving: true), pose, "\(mood) at \(later)")
+                }
+            }
+        }
+        for mood in restless {
+            XCTAssertEqual(PlugPose.nextChange(for: mood, after: 3), 3.25, "\(mood)")
         }
     }
 
@@ -395,7 +416,6 @@ final class PlugVerdictTests: XCTestCase {
     func testThePanelNamesWhoIsConnected() {
         func connected(_ names: [String]) -> String {
             PlugSituation(
-                connectedApps: names.count,
                 connectedClients: names.map { ConnectedClient(target: $0, name: $0) }
             ).connectedSummary
         }
@@ -409,7 +429,6 @@ final class PlugVerdictTests: XCTestCase {
         // Shorter ways to say it, for a panel too narrow for two names.
         XCTAssertEqual(
             PlugSituation(
-                connectedApps: 4,
                 connectedClients: ["Codex CLI", "GrokBot", "Zed", "Pi"].map { ConnectedClient(target: $0, name: $0) }
             ).connectedSummaries,
             ["Codex CLI, GrokBot and 2 others connected", "Codex CLI and 3 others connected", "4 clients connected"]

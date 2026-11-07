@@ -194,7 +194,6 @@ final class AppModel {
             setup: gate.setup,
             runtime: runtime,
             servers: serverFacts,
-            connectedApps: connectedClients.count,
             connectedClients: connectedClients,
             version: snapshot.runtimeVersion
         )
@@ -203,18 +202,7 @@ final class AppModel {
     /// A call in the words every surface uses, under the name its owner gave
     /// the client that made it.
     func call(_ event: ActivityEvent) -> CallFacts {
-        let name = event.clientKey.flatMap { key in
-            snapshot.clientNames?.first { $0.key == key }?.name
-        }
-        let grant = event.clientKey.flatMap { key in
-            snapshot.downstreamClients.first { $0.clientKey == key }?.clientName
-        }
-        let place = event.clientKey.flatMap { key in
-            snapshot.clientPlaces?.first { $0.key == key }?.place
-        }
-        return CallFacts(
-            event, delimiter: snapshot.prefixDelimiter, ownerName: name, grantName: grant, place: place
-        )
+        clientNames.call(event, delimiter: snapshot.prefixDelimiter)
     }
 
     /// The names and places the owner gave clients. The Clients page asks

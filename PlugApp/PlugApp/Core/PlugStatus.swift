@@ -198,9 +198,8 @@ struct PlugSituation: Equatable, Sendable {
     let setup: Setup
     let runtime: Runtime
     let servers: [ServerFacts]
-    let connectedApps: Int
-    /// The same clients with the name and picture the Clients list gives
-    /// each, so the panel shows them the same way.
+    /// The connected clients, with the name and picture the Clients list
+    /// gives each, so the panel shows them the same way.
     let connectedClients: [ConnectedClient]
     let version: String
 
@@ -208,18 +207,17 @@ struct PlugSituation: Equatable, Sendable {
         setup: Setup = .ready,
         runtime: Runtime = .stopped,
         servers: [ServerFacts] = [],
-        connectedApps: Int = 0,
         connectedClients: [ConnectedClient] = [],
         version: String = ""
     ) {
         self.setup = setup
         self.runtime = runtime
         self.servers = servers
-        self.connectedApps = connectedApps
         self.connectedClients = connectedClients
         self.version = version
     }
 
+    var connectedApps: Int { connectedClients.count }
     var activeServers: [ServerFacts] { servers.filter(\.enabled) }
     var troubledServers: [ServerFacts] { activeServers.filter(\.health.needsAttention) }
     var workingServers: [ServerFacts] { activeServers.filter { $0.health == .working } }
