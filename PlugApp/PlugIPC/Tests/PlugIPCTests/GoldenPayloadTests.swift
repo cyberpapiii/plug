@@ -318,10 +318,12 @@ final class GoldenPayloadTests: XCTestCase {
 
     func testSmallReplies() throws {
         guard case .validated = try response("server_validated") else { return XCTFail() }
-        guard case let .mutation(none) = try response("mutation") else { return XCTFail() }
+        guard case let .mutation(server, none) = try response("mutation") else { return XCTFail() }
+        XCTAssertEqual(server, "workspace")
         XCTAssertEqual(none, [])
         // An import says the name each server went in under.
-        guard case let .mutation(imported) = try response("imported") else { return XCTFail() }
+        guard case let .mutation(single, imported) = try response("imported") else { return XCTFail() }
+        XCTAssertNil(single)
         XCTAssertEqual(imported, ["github-cursor"])
         guard case let .revoked(id) = try response("revoked") else { return XCTFail() }
         XCTAssertEqual(id, "abc")

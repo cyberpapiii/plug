@@ -77,7 +77,7 @@ final class PlugActions {
             let imported = servers.map {
                 ImportedServer(name: $0.name, sourceTarget: $0.source, server: $0.config)
             }
-            guard case let .mutation(settled) = try await daemon.send(.mutate(.importServers(imported))) else {
+            guard case let .mutation(_, settled) = try await daemon.send(.mutate(.importServers(imported))) else {
                 throw PlugIPCError.unexpectedResponse("OperatorMutation")
             }
             names = settled
@@ -85,8 +85,16 @@ final class PlugActions {
         return names
     }
 
-    func addAccount(server: String, label: String) async throws {
-        try await change { _ = try await $0.send(.mutate(.addAccount(server: server, account: label))) }
+    /// Returns the name the daemon gave the new server.
+    func addAccount(server: String, label: String) async throws -> String {
+        var name = ""
+        try await change { daemon in
+            guard case let .mutation(added?, _) = try await daemon.send(.mutate(.addAccount(server: server, account: label))) else {
+                throw PlugIPCError.unexpectedResponse("OperatorMutation")
+            }
+            name = added
+        }
+        return name
     }
 
     func addWatch(_ watch: WatchConfig) async throws {

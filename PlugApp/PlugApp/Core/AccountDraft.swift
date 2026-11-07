@@ -1,5 +1,6 @@
 /// A second account is the same server under `<server>-<account>`. The daemon
-/// has the last word on the name; this says the same thing before the trip.
+/// has the last word on the name; this says the same thing before the trip,
+/// and `testdata/draft_rules.json` holds the two to one rule.
 enum AccountDraft {
     static let longest = 24
 

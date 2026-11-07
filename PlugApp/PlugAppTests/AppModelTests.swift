@@ -404,6 +404,27 @@ final class AppModelTests: XCTestCase {
         )
     }
 
+    /// The sheet shows the new account under the name the daemon gave it,
+    /// which the fixture's reply makes different from the app's own guess.
+    @MainActor
+    func testAnAddedAccountIsKnownByTheDaemonsName() async throws {
+        let coordinator = RecordingInstallationCoordinator(
+            state: .healthy(makeInstallationSnapshot()),
+            events: LockedEvents()
+        )
+        let server = try OperatorFixtureServer(events: coordinator.events)
+        defer { server.stop() }
+
+        let model = AppModel(
+            home: makeTestHome(),
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: coordinator
+        )
+        await model.start()
+        let added = try await model.actions.addAccount(server: "demo", label: "work")
+        XCTAssertEqual(added, "workspace")
+    }
+
     @MainActor
     func testUsePlugIsExplicitCoordinatorAction() async {
         let coordinator = RecordingInstallationCoordinator(

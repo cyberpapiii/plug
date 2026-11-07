@@ -619,7 +619,8 @@ public struct StdioSandboxConfig: Codable, Equatable, Sendable {
 
 /// What an API offers, read from its OpenAPI document.
 public struct APISummary: Decodable, Equatable, Sendable {
-    /// The most operations one API server may expose.
+    /// The most operations one API server may expose. `testdata/draft_rules.json`
+    /// holds it to the daemon's.
     public static let operationLimit = 50
 
     public var title: String
@@ -837,8 +838,9 @@ public enum IPCResponse: Decodable, Sendable {
     case tools([ToolInfo])
     case validated
     case apiDescribed(APISummary)
-    /// The names the servers of an import went in under; empty for any other change.
-    case mutation(imported: [String])
+    /// The server the change made or touched, by the name the daemon gave
+    /// it, and the names the servers of an import went in under.
+    case mutation(server: String?, imported: [String])
     case revoked(String)
     case reloaded
     case ok
@@ -866,11 +868,12 @@ public enum IPCResponse: Decodable, Sendable {
         case "ApiDescribed": self = .apiDescribed(try c.decode(APISummary.self, forKey: .api))
         case "OperatorMutation":
             struct Result: Decodable {
-                struct Imported: Decodable { let name: String }
-                let imported: [Imported]?
+                struct Server: Decodable { let name: String }
+                let server: Server?
+                let imported: [Server]?
             }
             let result = try c.decodeIfPresent(Result.self, forKey: .result)
-            self = .mutation(imported: result?.imported?.map(\.name) ?? [])
+            self = .mutation(server: result?.server?.name, imported: result?.imported?.map(\.name) ?? [])
         case "DownstreamClientRevoked": self = .revoked(try c.decode(String.self, forKey: .clientId))
         case "Reloaded": self = .reloaded
         case "Ok": self = .ok

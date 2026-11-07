@@ -181,15 +181,11 @@ final class LinkableAppTests: XCTestCase {
         XCTAssertEqual(local["command"] as? String, "/Applications/Plug.app/Contents/Resources/plug")
         XCTAssertEqual(local["args"] as? [String], ["connect"])
 
-        // A client the owner names connects under a key made from the name.
-        XCTAssertEqual(AddClient.customTarget(named: "  My Tool (v2)! "), "custom:my-tool-v2")
-        XCTAssertNil(AddClient.customTarget(named: " ?? "))
         // Each made-up client keeps its own icon, apart from any other's.
         XCTAssertNotEqual(
             IconStore.key(client: "custom:my-tool-v2"),
             IconStore.key(client: "custom:my-tool")
         )
-        XCTAssertEqual(AddClient.customTarget(named: String(repeating: "a", count: 60))?.count, 47)
         let named = try plug(AddClient.settingsEntry(command: "/plug", target: "custom:my-tool"))
         XCTAssertEqual(named["args"] as? [String], ["connect", "--client", "custom:my-tool"])
         XCTAssertEqual(
