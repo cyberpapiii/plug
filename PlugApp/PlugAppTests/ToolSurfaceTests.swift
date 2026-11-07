@@ -944,6 +944,18 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertEqual(Explain.advice(forReason: "zzz"), Explain.fallback)
     }
 
+    /// A taken name is told apart by the daemon's code, whatever its message says.
+    func testATakenNameIsKnownByItsCode() {
+        XCTAssertEqual(
+            Explain.advice(for: PlugIPCError.daemon("SERVER_NAME_TAKEN", "nope")),
+            "Choose another name."
+        )
+        XCTAssertNotEqual(
+            Explain.advice(for: PlugIPCError.daemon("MUTATION_FAILED", "github already exists")),
+            "Choose another name."
+        )
+    }
+
     /// The app's own errors carry their advice. Their words are the app's,
     /// so "deadline" or "unexpected" in one is not read as a slow server or
     /// a bad entry; text from outside the app inside one still is.

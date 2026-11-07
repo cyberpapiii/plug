@@ -56,9 +56,6 @@ enum Explain {
         if has("timed out", "timeout", "deadline") {
             return "The server took too long to answer. Try again, or restart the server."
         }
-        if has("already exists", "already a server", "name is taken") {
-            return "Choose another name."
-        }
         if has("no such file", "command not found", "not found in path", "failed to spawn", "os error 2") {
             return "Check that the command is installed on this Mac and spelled correctly."
         }
@@ -89,6 +86,7 @@ enum Explain {
 extension PlugIPCError: AdvisedError {
     var advice: String {
         switch self {
+        case let .daemon(code, _) where code == "SERVER_NAME_TAKEN": "Choose another name."
         case let .daemon(_, message): Explain.advice(forOutside: message)
         case .disconnected: Explain.starting
         default: Explain.fallback

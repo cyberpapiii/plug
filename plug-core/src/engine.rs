@@ -705,9 +705,7 @@ impl Engine {
         server: &crate::config::ServerConfig,
     ) -> anyhow::Result<crate::operator::OperatorServerSummary> {
         let mut config = (**self.config.load()).clone();
-        if config.servers.contains_key(name) {
-            anyhow::bail!("server `{name}` already exists");
-        }
+        crate::operator::NameTaken::check(&config, name)?;
         config.servers.insert(name.to_string(), server.clone());
         let errors = crate::config::validate_config(&config);
         if !errors.is_empty() {
