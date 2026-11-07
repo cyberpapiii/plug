@@ -88,25 +88,18 @@ fn is_plug(name: &str) -> bool {
     name.eq_ignore_ascii_case("plug")
 }
 
-/// Whether an entry is Plug itself, which importing would point Plug at:
-/// one named as Plug's entry is, or one under any name that runs
-/// `plug connect` or `plug serve`, or names Plug's own address. The app's
-/// paste reader holds to the same rule but for the address, which it does
-/// not know; `testdata/server_entries.json` pins both.
+/// Whether an entry is Plug itself: one named as Plug's entry is, or one
+/// under any name that [`HttpConfig::is_plug_itself`] says is Plug. Link,
+/// unlink, import and doctor all go by this rule. The app's paste
+/// reader holds to the same rule but for the address, which it does not
+/// know; `testdata/server_entries.json` pins both.
 fn is_plug_itself(name: &str, entry: &ServerEntry, plug: &HttpConfig) -> bool {
-    let runs_plug = entry.command.as_deref().is_some_and(|command| {
-        std::path::Path::new(command).file_name() == Some("plug".as_ref())
-            && entry
-                .args
-                .iter()
-                .flatten()
-                .any(|arg| arg == "connect" || arg == "serve")
-    });
-    let reaches_plug = entry
-        .url
-        .as_deref()
-        .is_some_and(|url| plug.is_own_mcp_url(url));
-    is_plug(name) || runs_plug || reaches_plug
+    is_plug(name)
+        || plug.is_plug_itself(
+            entry.command.as_deref(),
+            entry.args.as_deref().unwrap_or_default(),
+            entry.url.as_deref(),
+        )
 }
 
 impl Layout {
