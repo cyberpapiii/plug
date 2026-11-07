@@ -286,9 +286,6 @@ pub enum IpcRequest {
         link_target: Option<String>,
     },
 
-    /// Deregister a proxy client session (clean disconnect).
-    Deregister { session_id: String },
-
     /// Update a session's client info (sent after MCP initialize handshake).
     UpdateSession {
         session_id: String,
@@ -407,8 +404,7 @@ impl IpcRequest {
     /// capability instead.
     pub fn connection_session_id(&self) -> Option<&str> {
         match self {
-            Self::Deregister { session_id }
-            | Self::UpdateSession { session_id, .. }
+            Self::UpdateSession { session_id, .. }
             | Self::Ping { session_id }
             | Self::Capabilities { session_id }
             | Self::ModernDownstreamGate { session_id }
@@ -894,7 +890,6 @@ impl IpcRequest {
         matches!(
             self,
             IpcRequest::Register { .. }
-                | IpcRequest::Deregister { .. }
                 | IpcRequest::Operator {
                     request: OperatorRequest::Shutdown,
                     ..

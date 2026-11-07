@@ -1032,14 +1032,13 @@ arguments = {
     /// than after the full cold-start budget.
     #[tokio::test]
     async fn wait_reports_a_daemon_that_died_during_startup() {
-        let _guard = plug_core::paths::test::lock().lock().await;
         let root = std::env::temp_dir().join(format!(
             "plug-service-startup-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&root).expect("create runtime root");
-        let _paths = plug_core::paths::test::set(root.clone(), root.clone());
+        let _paths = plug_core::paths::test::isolate(&root).await;
 
         let started = std::time::Instant::now();
         let error = wait_for_daemon_socket(false, true)
@@ -1061,7 +1060,6 @@ arguments = {
     /// cold start eventually produces.
     #[tokio::test]
     async fn wait_succeeds_once_the_socket_appears() {
-        let _guard = plug_core::paths::test::lock().lock().await;
         // Short and directly under /tmp: a Unix socket path has to fit in
         // SUN_LEN, and the macOS per-user temp directory alone nearly fills it.
         let root = std::path::PathBuf::from(format!(
@@ -1069,7 +1067,7 @@ arguments = {
             std::process::id(),
             uuid::Uuid::new_v4().as_fields().0
         ));
-        let _paths = plug_core::paths::test::set(root.clone(), root.clone());
+        let _paths = plug_core::paths::test::isolate(&root).await;
         let socket = plug_core::paths::socket_path();
         std::fs::create_dir_all(socket.parent().expect("socket has a parent"))
             .expect("create runtime dir");
@@ -1096,10 +1094,9 @@ arguments = {
 
     #[tokio::test]
     async fn redirected_test_runtime_never_mutates_launchd() {
-        let _guard = plug_core::paths::test::lock().lock().await;
         let temp =
             std::env::temp_dir().join(format!("plug-service-launchd-guard-{}", std::process::id()));
-        let _paths = plug_core::paths::test::set(temp.join("runtime"), temp.join("state"));
+        let _paths = plug_core::paths::test::isolate(&temp).await;
 
         let result = ensure_started(None).await;
         let error = result.expect_err("test startup must fail closed");

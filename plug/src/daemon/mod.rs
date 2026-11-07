@@ -26,10 +26,6 @@ use plug_core::proxy::{DownstreamBridge, ReverseRequest, ToolRouter};
 mod framing;
 use framing::FrameReader;
 
-#[cfg(test)]
-pub(crate) use plug_core::paths::test::{
-    lock as runtime_paths_test_lock, set as set_test_runtime_paths,
-};
 use plug_core::paths::{log_dir, pid_path, socket_path, token_path};
 
 /// Create a directory, and any missing parents, readable by this user only.
@@ -864,9 +860,8 @@ async fn handle_ipc_loop(
         };
 
         // The receiver belongs to the session it was taken out with. A
-        // Register made a new one, already in `ctx`; a Deregister ended the
-        // session and its bridge, so the old one is dropped.
-        if ctx.reverse_request_rx.is_none() && ctx.session_id == dispatch_session_id {
+        // Register made a new one, already in `ctx`, so the old one is dropped.
+        if ctx.reverse_request_rx.is_none() {
             ctx.reverse_request_rx = reverse_rx;
         }
 
@@ -1534,12 +1529,6 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     .try_into()
                     .unwrap_or(u64::MAX),
             }
-        }
-
-        IpcRequest::Deregister { session_id } => {
-            end_ipc_session(ctx, session_id).await;
-            ctx.session_id = None;
-            IpcResponse::Ok
         }
 
         IpcRequest::UpdateSession {
@@ -2618,20 +2607,15 @@ allowed_servers = ["slack"]
 
     #[tokio::test]
     async fn losing_daemon_start_does_not_boot_upstream_servers() {
-        let _guard = runtime_paths_test_lock().lock().await;
-        let runtime_root = std::env::temp_dir().join(format!(
-            "plug-daemon-early-lock-runtime-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
+        let temp = std::env::temp_dir().join(format!(
+            "plug-d-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
         ));
-        let state_root = std::env::temp_dir().join(format!(
-            "plug-daemon-early-lock-state-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = plug_core::paths::test::isolate(&temp).await;
 
         std::fs::create_dir_all(plug_core::paths::dir()).expect("create daemon runtime dir");
         let winning_lock = acquire_pid_lock(&pid_path()).expect("winning daemon lock");
@@ -2672,8 +2656,7 @@ allowed_servers = ["slack"]
         );
 
         drop(winning_lock);
-        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
-        std::fs::remove_dir_all(state_root).expect("cleanup state root");
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
     /// `run_daemon` must bind and serve without a started engine, which is what
@@ -2683,15 +2666,17 @@ allowed_servers = ["slack"]
     /// upstream takes.
     #[tokio::test]
     async fn ipc_socket_is_bound_while_upstream_startup_is_still_running() {
-        let _guard = runtime_paths_test_lock().lock().await;
         // The bound socket lives under this root, and a Unix socket path has to
         // fit in SUN_LEN, so keep the directory names short.
-        let suffix = uuid::Uuid::new_v4().simple().to_string();
-        let runtime_root = std::env::temp_dir().join(format!("plug-eb-{}", &suffix[..8]));
-        let state_root = std::env::temp_dir().join(format!("plug-ebs-{}", &suffix[..8]));
+        let temp = std::env::temp_dir().join(format!(
+            "plug-d-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = plug_core::paths::test::isolate(&temp).await;
 
         // `/bin/sleep` never completes an MCP handshake, so this start stays in
         // flight until the upstream timeout expires.
@@ -2738,28 +2723,20 @@ allowed_servers = ["slack"]
         engine.cancel_token().cancel();
         startup.abort();
         daemon.abort();
-        std::fs::remove_dir_all(runtime_root).ok();
-        std::fs::remove_dir_all(state_root).ok();
+        std::fs::remove_dir_all(temp).ok();
     }
 
     #[tokio::test]
     async fn run_daemon_losing_start_does_not_rotate_existing_token() {
-        // Hold the shared lock for the whole window the global paths are set, so
-        // this test is safe to run alongside other global-paths tests in parallel.
-        let _guard = runtime_paths_test_lock().lock().await;
-        let runtime_root = std::env::temp_dir().join(format!(
-            "plug-daemon-runtime-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
+        let temp = std::env::temp_dir().join(format!(
+            "plug-d-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
         ));
-        let state_root = std::env::temp_dir().join(format!(
-            "plug-daemon-state-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = plug_core::paths::test::isolate(&temp).await;
 
         let rt_dir = plug_core::paths::dir();
         std::fs::create_dir_all(&rt_dir).expect("create daemon runtime dir");
@@ -2780,26 +2757,20 @@ allowed_servers = ["slack"]
         assert_eq!(token_after, "stable-token");
 
         drop(winning_lock);
-        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
-        std::fs::remove_dir_all(state_root).expect("cleanup state root");
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
     #[tokio::test]
     async fn run_daemon_restores_existing_token_when_startup_fails_after_token_write() {
-        let _guard = runtime_paths_test_lock().lock().await;
-        let runtime_root = std::env::temp_dir().join(format!(
-            "plug-daemon-runtime-post-token-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
+        let temp = std::env::temp_dir().join(format!(
+            "plug-d-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
         ));
-        let state_root = std::env::temp_dir().join(format!(
-            "plug-daemon-state-post-token-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = plug_core::paths::test::isolate(&temp).await;
 
         let rt_dir = plug_core::paths::dir();
         std::fs::create_dir_all(&rt_dir).expect("create daemon runtime dir");
@@ -2821,8 +2792,7 @@ allowed_servers = ["slack"]
         let token_after =
             std::fs::read_to_string(&token_file).expect("read token after failed startup");
         assert_eq!(token_after, "stable-token");
-        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
-        std::fs::remove_dir_all(state_root).expect("cleanup state root");
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
     #[test]
@@ -3441,138 +3411,6 @@ allowed_servers = ["slack"]
         .await
         .expect("registered connection is pushed the change");
         assert!(matches!(push, Push::ModernGate));
-    }
-
-    /// A Deregister that FAILS validation (here: SESSION_MISMATCH) must not
-    /// kill the connection's live reverse-request channel. The Deregister
-    /// handler only clears `ctx.reverse_request_rx` and drops the bridge's
-    /// sender on its SUCCESS path — the validation early-returns leave the
-    /// channel untouched. If the dispatch loop's restore-skip predicate keyed
-    /// on the request TYPE alone (rather than request type AND `Ok` response),
-    /// the still-live receiver taken out for the dispatch would be dropped at
-    /// end of iteration, closing the bridge sender and permanently breaking
-    /// elicitation/sampling for a session that is still active.
-    #[tokio::test]
-    async fn failed_deregister_does_not_kill_reverse_channel() {
-        let config = plug_core::config::Config::default();
-        let engine = Engine::new(config);
-        engine.start().await;
-
-        let socket_path = std::path::PathBuf::from(format!(
-            "/tmp/plug-ipc-failed-dereg-{}.sock",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
-        let _ = std::fs::remove_file(&socket_path);
-        let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
-        let cancel = CancellationToken::new();
-
-        let client_registry = ClientRegistry::new();
-        let session_id = "failed-dereg-session".to_string();
-
-        // Same hand-built harness as
-        // `idle_registered_connection_services_reverse_request_without_new_client_frame`:
-        // pre-seed `session_id` and a hand-built reverse-request channel.
-        let (reverse_tx, reverse_rx) = tokio::sync::mpsc::channel(8);
-        let mut ctx = test_connection_context(
-            &engine,
-            cancel.clone(),
-            client_registry,
-            "/tmp/plug-ipc-failed-dereg-config.toml",
-        );
-        ctx.session_id = Some(session_id.clone());
-        ctx.reverse_request_rx = Some(reverse_rx);
-
-        let server_task = tokio::spawn(async move {
-            if let Ok((stream, _addr)) = listener.accept().await {
-                let _ = handle_ipc_connection(stream, ctx).await;
-            }
-        });
-
-        let mut stream = tokio::net::UnixStream::connect(&socket_path)
-            .await
-            .expect("client connect");
-
-        // Enter the registered-idle loop (subscribes log/ctrl channels).
-        write_ipc(&mut stream, &IpcRequest::Status).await;
-        let status = read_ipc_response(&mut stream).await;
-        assert!(
-            matches!(status, IpcResponse::Status { .. }),
-            "expected Status, got {status:?}"
-        );
-
-        // Deregister with the WRONG session id — the handler must reject it
-        // with SESSION_MISMATCH and leave the connection fully registered.
-        write_ipc(
-            &mut stream,
-            &IpcRequest::Deregister {
-                session_id: "not-the-session".to_string(),
-            },
-        )
-        .await;
-        let deregister_resp = read_ipc_response(&mut stream).await;
-        match &deregister_resp {
-            IpcResponse::Error { code, .. } => {
-                assert_eq!(code, "SESSION_MISMATCH", "unexpected error code");
-            }
-            other => panic!("expected SESSION_MISMATCH error, got {other:?}"),
-        }
-
-        // The reverse channel must still be alive and serviced: inject a
-        // reverse request with no further client frame and expect it pushed.
-        let (resp_tx, _resp_rx) = tokio::sync::oneshot::channel();
-        let request = plug_core::ipc::IpcClientRequest::CreateElicitation {
-            params: serde_json::from_value(serde_json::json!({
-                "message": "post-failed-deregister test",
-                "requestedSchema": { "type": "object", "properties": {} }
-            }))
-            .unwrap(),
-        };
-        reverse_tx
-            .send((request, resp_tx))
-            .await
-            .expect("reverse channel receiver was dropped — failed Deregister killed it");
-
-        let frame = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            plug_core::ipc::read_frame(&mut stream),
-        )
-        .await
-        .expect("timed out waiting for the reverse request after failed Deregister")
-        .expect("read frame")
-        .expect("unexpected EOF waiting for reverse request");
-
-        let msg: plug_core::ipc::DaemonToProxyMessage =
-            serde_json::from_slice(&frame).expect("decode DaemonToProxyMessage");
-        let reverse_id = match msg {
-            plug_core::ipc::DaemonToProxyMessage::ReverseRequest { id, request } => {
-                assert!(
-                    matches!(
-                        *request,
-                        plug_core::ipc::IpcClientRequest::CreateElicitation { .. }
-                    ),
-                    "expected CreateElicitation, got {request:?}"
-                );
-                id
-            }
-            other => panic!("expected ReverseRequest envelope, got {other:?}"),
-        };
-
-        // Answer the reverse request so everything winds down cleanly.
-        let reply = IpcClientResponse::Error {
-            message: "test reply".to_string(),
-        };
-        plug_core::ipc::write_frame(
-            &mut stream,
-            &plug_core::ipc::encode_reverse_response(reverse_id, &reply).unwrap(),
-        )
-        .await
-        .expect("write reverse-request reply");
-
-        cancel.cancel();
-        drop(stream);
-        let _ = server_task.await;
-        engine.shutdown().await;
-        let _ = std::fs::remove_file(&socket_path);
     }
 
     /// Regression test for the frame-reader cancellation-safety fix.
