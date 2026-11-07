@@ -2444,14 +2444,11 @@ impl ToolRouter {
                 let settings = self.server_manager.settings(&server_name);
                 let metadata = self.server_manager.get_upstream_metadata(&server_name);
                 let tool_group_rules = settings.as_ref().and_then(|settings| {
-                    if !settings.tool_groups.is_empty() {
-                        Some(settings.tool_groups.clone())
-                    } else {
-                        crate::tool_naming::builtin_group_rules(
-                            &server_name,
-                            metadata.as_ref().map(|metadata| metadata.name.as_str()),
-                        )
-                    }
+                    crate::tool_naming::group_rules(
+                        &server_name,
+                        settings,
+                        metadata.as_ref().map(|metadata| metadata.name.as_str()),
+                    )
                 });
                 let icons = metadata.and_then(|metadata| metadata.icons);
                 ServerRefreshCtx {
