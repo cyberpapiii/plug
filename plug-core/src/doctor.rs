@@ -1748,7 +1748,7 @@ auth_token = "keychain:b.token"
             oauth_http_server("https://example.com/mcp"),
         );
 
-        let token_file = crate::paths::tokens_dir().join(format!("{server_name}.json"));
+        let token_file = crate::oauth::token_file_path(&server_name).unwrap();
         let _ = std::fs::remove_file(&token_file);
 
         let result = check_oauth_tokens(&config).await;
@@ -1771,7 +1771,7 @@ auth_token = "keychain:b.token"
             oauth_http_server("https://example.com/mcp"),
         );
 
-        let token_file = crate::paths::tokens_dir().join(format!("{server_name}.json"));
+        let token_file = crate::oauth::token_file_path(&server_name).unwrap();
         if let Some(parent) = token_file.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -1801,7 +1801,7 @@ auth_token = "keychain:b.token"
             oauth_http_server("https://example.com/mcp"),
         );
 
-        let token_file = crate::paths::tokens_dir().join(format!("{server_name}.json"));
+        let token_file = crate::oauth::token_file_path(&server_name).unwrap();
         if let Some(parent) = token_file.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }

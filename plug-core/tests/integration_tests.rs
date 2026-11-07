@@ -96,19 +96,7 @@ async fn save_bound_oauth_test_credentials(
 }
 
 fn oauth_state_file_path(server_name: &str, state: &str) -> std::path::PathBuf {
-    let safe_server =
-        plug_core::config::sanitize_server_name_for_path(server_name).expect("valid server name");
-    let safe_state: String = state
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    plug_core::paths::tokens_dir().join(format!("{safe_server}_state_{safe_state}.json"))
+    plug_core::oauth::state_file_path(server_name, state).expect("valid server name")
 }
 
 #[derive(Clone)]

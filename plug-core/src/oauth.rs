@@ -186,7 +186,7 @@ pub fn get_or_create_store(server_name: &str) -> Arc<CompositeCredentialStore> {
 }
 
 /// The file a server's sign-in is mirrored to.
-pub(crate) fn token_file_path(server_name: &str) -> Result<PathBuf, String> {
+pub fn token_file_path(server_name: &str) -> Result<PathBuf, String> {
     let safe = config::sanitize_server_name_for_path(server_name)?;
     Ok(crate::paths::tokens_dir().join(format!("{safe}.json")))
 }
@@ -1371,22 +1371,26 @@ impl CompositeStateStore {
     }
 
     fn state_file_path(&self, csrf_token: &str) -> Result<PathBuf, AuthError> {
-        let safe_server =
-            config::sanitize_server_name_for_path(&self.server_name).map_err(|e| {
-                AuthError::InternalError(format!("invalid server name for state path: {e}"))
-            })?;
-        let safe_csrf: String = csrf_token
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        Ok(crate::paths::tokens_dir().join(format!("{safe_server}_state_{safe_csrf}.json")))
+        state_file_path(&self.server_name, csrf_token).map_err(|e| {
+            AuthError::InternalError(format!("invalid server name for state path: {e}"))
+        })
     }
+}
+
+/// The file a sign-in in progress keeps its state in, named by its CSRF token.
+pub fn state_file_path(server_name: &str, csrf_token: &str) -> Result<PathBuf, String> {
+    let safe_server = config::sanitize_server_name_for_path(server_name)?;
+    let safe_csrf: String = csrf_token
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Ok(crate::paths::tokens_dir().join(format!("{safe_server}_state_{safe_csrf}.json")))
 }
 
 #[async_trait]
@@ -2318,11 +2322,16 @@ mod tests {
     fn concurrent_bound_writers_publish_one_complete_generation() {
         let name = format!("bound-concurrent-{}", uuid::Uuid::new_v4());
         let authority = test_authority();
+        // Each thread has its own root, so the writers must share this one
+        // to contend for the same file and lock.
+        let shared = crate::paths::test::scratch("bound-concurrent");
         let mut threads = Vec::new();
         for access in ["writer-a", "writer-b"] {
             let name = name.clone();
             let authority = authority.clone();
+            let shared = shared.clone();
             threads.push(std::thread::spawn(move || {
+                let _root = crate::paths::test::isolate(&shared);
                 let store = CompositeCredentialStore::new(name);
                 store.bind_verified_authority(&authority).unwrap();
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2341,6 +2350,11 @@ mod tests {
             thread.join().unwrap();
         }
 
+        let _root = crate::paths::test::isolate(&shared);
+        assert!(
+            token_file_path(&name).unwrap().exists(),
+            "the writers saved to the shared root"
+        );
         let reloaded = CompositeCredentialStore::new(name);
         reloaded.bind_verified_authority(&authority).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
