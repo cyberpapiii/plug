@@ -484,8 +484,11 @@ impl Engine {
         secret_store: Option<&str>,
     ) -> anyhow::Result<(crate::operator::OperatorMutationResult, ReloadReport)> {
         let store = secret_store.unwrap_or(crate::secrets::KEYCHAIN);
-        if ![crate::secrets::KEYCHAIN, crate::secrets::FILE].contains(&store) {
-            anyhow::bail!("Plug cannot write keys to `{store}`; choose `keychain` or `file`");
+        if !crate::secrets::WRITABLE.contains(&store) {
+            anyhow::bail!(
+                "Plug cannot write keys to `{store}`; choose `{}`",
+                crate::secrets::WRITABLE.join("` or `")
+            );
         }
         // One change at a time, from the first key stored to the last one
         // removed: two changes side by side could undo each other's keys.

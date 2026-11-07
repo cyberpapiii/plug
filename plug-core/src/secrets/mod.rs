@@ -26,6 +26,10 @@ use crate::types::SecretString;
 
 pub use crate::config::{CommandStoreConfig, FILE, KEYCHAIN, OP, SecretsConfig};
 
+/// The stores Plug can put a value in. A command store only reads: its own
+/// tool is where a value is put.
+pub const WRITABLE: [&str; 2] = [KEYCHAIN, FILE];
+
 /// How long one read may take unless the store says otherwise. A store that
 /// asks a person for approval can wait forever; a server start cannot.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -52,7 +56,9 @@ fn remember(reference: &str, value: Option<&SecretString>) {
 fn set_hint(store: &str, name: &str) -> String {
     match store {
         KEYCHAIN => format!("; run `plug secret set {name}`"),
-        FILE => format!("; run `plug secret set --store file {name}`"),
+        store if WRITABLE.contains(&store) => {
+            format!("; run `plug secret set --store {store} {name}`")
+        }
         _ => String::new(),
     }
 }
@@ -507,7 +513,7 @@ impl Stores {
                 continue;
             }
             if let Some((id, name)) = self.parse(value)
-                && (id == KEYCHAIN || id == FILE)
+                && WRITABLE.contains(&id)
                 && owners
                     .iter()
                     .flatten()
