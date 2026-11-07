@@ -133,7 +133,6 @@ pub enum MethodFamily {
     PromptsGet,
     Completion,
     Tasks,
-    Listeners,
     Logging,
     /// Receiving `notifications/message`, as opposed to `Logging`, which is
     /// setting the level. No method string maps here: log delivery is a
@@ -147,7 +146,7 @@ pub enum MethodFamily {
 /// Default downstream OAuth grant: the method families a normal MCP client
 /// exercises, each with what the consent page says granting it allows. Every
 /// scope must be a `MethodFamily::required_scope` string.
-pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPE_GRANTS: [(&str, &str); 9] = [
+pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPE_GRANTS: [(&str, &str); 8] = [
     ("tools:read", "Use Plug tools"),
     ("resources:read", "Read resources available through Plug"),
     ("prompts:read", "Use prompts available through Plug"),
@@ -155,10 +154,6 @@ pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPE_GRANTS: [(&str, &str); 9] = [
     (
         "tasks:use",
         "Run and manage long-running tasks through Plug",
-    ),
-    (
-        "subscriptions:listen",
-        "Receive change notifications from Plug",
     ),
     (
         "logging:configure",
@@ -174,9 +169,15 @@ pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPE_GRANTS: [(&str, &str); 9] = [
     ),
 ];
 
+/// Scopes Plug once offered and no longer does. `subscriptions:listen` never
+/// gated anything: resource subscriptions need `resources:read`. A token
+/// that carries one stays good, and a client that still asks for one is
+/// given the rest of what it asked for.
+pub const RETIRED_DOWNSTREAM_OAUTH_SCOPES: [&str; 1] = ["subscriptions:listen"];
+
 /// The scopes of [`DEFAULT_DOWNSTREAM_OAUTH_SCOPE_GRANTS`].
-pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPES: [&str; 9] = {
-    let mut scopes = [""; 9];
+pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPES: [&str; 8] = {
+    let mut scopes = [""; 8];
     let mut index = 0;
     while index < scopes.len() {
         scopes[index] = DEFAULT_DOWNSTREAM_OAUTH_SCOPE_GRANTS[index].0;
@@ -195,7 +196,6 @@ impl MethodFamily {
             Self::PromptsList | Self::PromptsGet => "prompts:read",
             Self::Completion => "completion:use",
             Self::Tasks => "tasks:use",
-            Self::Listeners => "subscriptions:listen",
             Self::Logging => "logging:configure",
             Self::LoggingRead => "logging:read",
             Self::Continuations => "continuations:complete",
@@ -203,7 +203,7 @@ impl MethodFamily {
     }
 
     fn durable(self) -> bool {
-        matches!(self, Self::Tasks | Self::Listeners | Self::Continuations)
+        matches!(self, Self::Tasks | Self::Continuations)
     }
 }
 
@@ -322,8 +322,6 @@ impl ProtocolOutcome {
 pub enum QuotaResource {
     Tasks,
     QueuedTaskCreations,
-    Listeners,
-    UpstreamSubscriptions,
     Continuations,
     ContinuationBytes,
     ConcurrentModernRequests,
@@ -333,8 +331,6 @@ pub enum QuotaResource {
 pub struct AdmissionQuotaConfig {
     pub tasks: usize,
     pub queued_task_creations: usize,
-    pub listeners: usize,
-    pub upstream_subscriptions: usize,
     pub continuations: usize,
     pub continuation_bytes: usize,
     pub concurrent_modern_requests: usize,
@@ -346,8 +342,6 @@ impl Default for AdmissionQuotaConfig {
         Self {
             tasks: 1_024,
             queued_task_creations: 128,
-            listeners: 2_048,
-            upstream_subscriptions: 1_024,
             continuations: 512,
             continuation_bytes: 16 * 1024 * 1024,
             concurrent_modern_requests: 512,
@@ -361,8 +355,6 @@ impl AdmissionQuotaConfig {
         match resource {
             QuotaResource::Tasks => self.tasks,
             QuotaResource::QueuedTaskCreations => self.queued_task_creations,
-            QuotaResource::Listeners => self.listeners,
-            QuotaResource::UpstreamSubscriptions => self.upstream_subscriptions,
             QuotaResource::Continuations => self.continuations,
             QuotaResource::ContinuationBytes => self.continuation_bytes,
             QuotaResource::ConcurrentModernRequests => self.concurrent_modern_requests,
@@ -667,7 +659,6 @@ mod tests {
             MethodFamily::PromptsGet,
             MethodFamily::Completion,
             MethodFamily::Tasks,
-            MethodFamily::Listeners,
             MethodFamily::Logging,
             MethodFamily::LoggingRead,
             MethodFamily::Continuations,

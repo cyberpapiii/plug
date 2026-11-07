@@ -1779,8 +1779,18 @@ impl DownstreamOauthManager {
         &self,
         requested: Option<&str>,
     ) -> Result<Vec<String>, DownstreamOauthError> {
-        let scopes = requested
-            .map(|value| value.split_whitespace().map(ToString::to_string).collect())
+        let offered = |scope: &str| self.config.oauth_scopes.iter().any(|s| s == scope);
+        let scopes: Vec<String> = requested
+            .map(|value| {
+                value
+                    .split_whitespace()
+                    .filter(|scope| {
+                        offered(scope)
+                            || !crate::protocol::RETIRED_DOWNSTREAM_OAUTH_SCOPES.contains(scope)
+                    })
+                    .map(ToString::to_string)
+                    .collect()
+            })
             .unwrap_or_else(|| self.config.oauth_scopes.clone());
         if scopes.is_empty()
             || scopes
@@ -4839,8 +4849,30 @@ mod tests {
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-            "absent http.oauth_scopes must inherit the six-family default grant"
+            "absent http.oauth_scopes must inherit the default grant"
         );
+    }
+
+    /// A client that still asks for a scope Plug retired signs in with the
+    /// rest of what it asked for.
+    #[tokio::test]
+    async fn a_retired_scope_in_a_request_is_left_out() {
+        let (manager, _path) = test_manager();
+        let client = register(&manager, "Old client", "https://client.example/callback").await;
+        let consent = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "retired-scope-state",
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                code_challenge_method: "S256",
+                scope: Some("tools:read subscriptions:listen"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin authorization");
+        assert_eq!(consent.scopes, vec!["tools:read".to_string()]);
     }
 
     #[tokio::test]

@@ -918,7 +918,6 @@ mod tests {
             crate::protocol::MethodFamily::PromptsGet,
             crate::protocol::MethodFamily::Completion,
             crate::protocol::MethodFamily::Tasks,
-            crate::protocol::MethodFamily::Listeners,
         ] {
             assert_eq!(
                 context.policy_decision(family),

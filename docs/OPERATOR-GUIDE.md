@@ -111,7 +111,7 @@ oauth_scopes = ["tools:read"]
 
 `oauth_scopes` is the set a client may be granted. Leave it out to offer the
 default set (`tools:read`, `resources:read`, `prompts:read`, `completion:use`,
-`tasks:use`, `subscriptions:listen`, `logging:configure`, `logging:read`,
+`tasks:use`, `logging:configure`, `logging:read`,
 `continuations:complete`). `events:subscribe` is never in the default set; add
 it explicitly for [Slack event delivery](slack-mcp-events.md).
 

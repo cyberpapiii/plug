@@ -9,6 +9,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Remote sign-in no longer offers `subscriptions:listen`, and the consent page no longer says it lets a client receive change notifications. It never controlled anything: subscribing to a resource needs `resources:read`, and events need `events:subscribe`. A token that carries it keeps working, and a client that still asks for it signs in with the rest of what it asked for.
 - `plug auth status --output json` drops `status_scope`, which repeated `status_source`. `plug servers` and `plug` call an OpenAPI server a "Web API", as the app does.
 - `plug`, `plug status` and `plug clients` with `--output json` drop `inventory_partial`, `inventory_unavailable_sources`, `http_sessions_included`, the SSE count in `live_session_transports` (a legacy SSE stream counts as HTTP) and, from `plug`, `live_client_count`, which repeated `live_session_count`. The text output says in one line whether the live list is complete.
 - `plug clients --output json` no longer has `live_session_transports.sse`. No session ever counted there: a legacy SSE stream belongs to its HTTP session.
