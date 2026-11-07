@@ -780,6 +780,92 @@ fn the_daemon_reads_every_request_golden() {
     }
 }
 
+/// Requests the app never sends: `plug connect` and the command line send
+/// these, so `requests.json` has no golden for them.
+const NOT_SENT_BY_THE_APP: &[&str] = &[
+    "AuthStatus",
+    "CancelMcpRequest",
+    "Capabilities",
+    "Deregister",
+    "ListLiveSessions",
+    "McpRequest",
+    "ModernDownstreamGate",
+    "Ping",
+    "Register",
+    "RestoreResourceSubscriptions",
+    "UpdateCapabilities",
+    "UpdateRoots",
+    "UpdateSession",
+];
+
+/// Every variant of `T` by its wire name, as serde lists them when it meets
+/// one it does not know: "unknown variant `x`, expected one of `A`, `B`".
+fn wire_names<T: serde::de::DeserializeOwned>(unknown: serde_json::Value) -> Vec<String> {
+    let error = serde_json::from_value::<T>(unknown)
+        .err()
+        .expect("an unknown variant is refused")
+        .to_string();
+    let (_, expected) = error
+        .split_once("expected")
+        .unwrap_or_else(|| panic!("serde names the variants it expected: {error}"));
+    expected
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+/// A request, operator request, change or block kind added to the wire
+/// without a golden fails here, and so the app's golden test cannot miss it.
+#[test]
+fn every_request_the_app_can_send_has_a_golden() {
+    let golden: BTreeMap<String, serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(dir().join("requests.json")).unwrap())
+            .unwrap();
+    let shown = |pointer: &str| -> std::collections::BTreeSet<String> {
+        golden
+            .values()
+            .filter_map(|request| request.pointer(pointer)?.as_str().map(str::to_string))
+            .collect()
+    };
+    let unknown_tag = serde_json::json!({"type": "\u{0}"});
+
+    let requests = wire_names::<IpcRequest>(unknown_tag.clone());
+    for name in NOT_SENT_BY_THE_APP {
+        assert!(
+            requests.iter().any(|request| request == name),
+            "{name} is not a request"
+        );
+    }
+    let sent: std::collections::BTreeSet<String> = requests
+        .into_iter()
+        .filter(|request| !NOT_SENT_BY_THE_APP.contains(&request.as_str()))
+        .collect();
+    assert_eq!(shown("/type"), sent, "IpcRequest");
+    assert_eq!(
+        shown("/request/type"),
+        wire_names::<OperatorRequest>(unknown_tag.clone())
+            .into_iter()
+            .collect(),
+        "OperatorRequest"
+    );
+    assert_eq!(
+        shown("/request/mutation/type"),
+        wire_names::<OperatorMutation>(unknown_tag)
+            .into_iter()
+            .collect(),
+        "OperatorMutation"
+    );
+    assert_eq!(
+        shown("/request/mutation/kind"),
+        wire_names::<ClientBlockKind>(serde_json::json!("\u{0}"))
+            .into_iter()
+            .collect(),
+        "ClientBlockKind"
+    );
+}
+
 /// What a client reads off the frames, reassembled, is the reply.
 #[test]
 fn the_chunked_golden_reassembles_into_the_reply() {
