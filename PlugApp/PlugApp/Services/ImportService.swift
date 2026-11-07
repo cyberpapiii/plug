@@ -24,7 +24,7 @@ struct ImportScan: Equatable, Sendable {
     var isEmpty: Bool { servers.isEmpty }
 }
 
-enum ImportError: Error, LocalizedError, Equatable {
+enum ImportError: Error, LocalizedError, AdvisedError, Equatable {
     case missingExecutable
     case failed(String)
 
@@ -33,6 +33,11 @@ enum ImportError: Error, LocalizedError, Equatable {
         case .missingExecutable: "Plug is damaged. Download it again and replace this copy."
         case let .failed(message): message
         }
+    }
+
+    var advice: String {
+        if case let .failed(message) = self { return Explain.advice(forOutside: message) }
+        return Explain.fallback
     }
 }
 

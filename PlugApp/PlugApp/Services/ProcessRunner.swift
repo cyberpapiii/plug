@@ -14,7 +14,7 @@ struct ProcessResult: Sendable {
     }
 }
 
-enum ProcessRunnerError: Error, Equatable, LocalizedError {
+enum ProcessRunnerError: Error, Equatable, LocalizedError, AdvisedError {
     case timedOut
 
     /// Every caller surfaces `localizedDescription` straight into the UI, and

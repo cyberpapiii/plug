@@ -1,4 +1,17 @@
 import Foundation
+import PlugIPC
+
+/// An error of the app's own. Its message is the app's, so its advice is
+/// chosen with it, not guessed from its words: a message that says
+/// "permission" or "expired" about Plug itself is not about a server.
+/// Text from outside the app that one carries is still read for its words.
+protocol AdvisedError: Error {
+    var advice: String { get }
+}
+
+extension AdvisedError {
+    var advice: String { Explain.fallback }
+}
 
 /// What to do about a failure, in plain words.
 ///
@@ -10,8 +23,17 @@ enum Explain {
     /// The fallback when Plug cannot tell what went wrong.
     static let fallback = "Try again. If it keeps happening, run a checkup in Settings."
 
+    static let starting = "Plug is starting. Wait a moment, then try again."
+
     static func advice(for error: any Error) -> String {
-        advice(forReason: error.localizedDescription)
+        if let advised = error as? any AdvisedError { return advised.advice }
+        return advice(forReason: error.localizedDescription)
+    }
+
+    /// The advice for text from outside the app inside one of its errors,
+    /// the fallback when there is none.
+    static func advice(forOutside text: String) -> String {
+        text.isEmpty ? fallback : advice(forReason: text)
     }
 
     static func advice(forReason reason: String) -> String {
@@ -23,7 +45,7 @@ enum Explain {
         }
 
         if has("reconnecting", "plug is not running", "plug is starting", "background service") {
-            return "Plug is starting. Wait a moment, then try again."
+            return starting
         }
         if code(401) || has("unauthorized", "invalid_token", "invalid token", "sign-in", "sign in", "authorization", "expired") {
             return "Sign in to the server again, then try again."
@@ -59,5 +81,17 @@ enum Explain {
             return "Check what was entered, then try again."
         }
         return fallback
+    }
+}
+
+/// The daemon's own refusal is text from outside the app; the rest is the
+/// connection to it.
+extension PlugIPCError: AdvisedError {
+    var advice: String {
+        switch self {
+        case let .daemon(_, message): Explain.advice(forOutside: message)
+        case .disconnected: Explain.starting
+        default: Explain.fallback
+        }
     }
 }

@@ -944,6 +944,24 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertEqual(Explain.advice(forReason: "zzz"), Explain.fallback)
     }
 
+    /// The app's own errors carry their advice. Their words are the app's,
+    /// so "deadline" or "unexpected" in one is not read as a slow server or
+    /// a bad entry; text from outside the app inside one still is.
+    func testTheAppsOwnErrorsCarryTheirAdvice() {
+        XCTAssertEqual(Explain.advice(for: PlugIPCError.timedOut), Explain.fallback)
+        XCTAssertEqual(Explain.advice(for: PlugIPCError.unexpectedResponse("Tools")), Explain.fallback)
+        XCTAssertEqual(Explain.advice(for: PlugIPCError.disconnected), Explain.starting)
+        XCTAssertEqual(Explain.advice(for: DaemonServiceError.registrationDisabled), Explain.fallback)
+        XCTAssertEqual(Explain.advice(for: DaemonServiceError.commandFailed("")), Explain.fallback)
+
+        XCTAssertTrue(Explain.advice(for: PlugIPCError.daemon("E", "token expired")).contains("Sign in"))
+        XCTAssertTrue(Explain.advice(for: AppLinkError.commandFailed("Permission denied")).contains("access"))
+        XCTAssertTrue(Explain.advice(for: ClientRepairError.commandFailed(status: 1, stderr: "os error 2")).contains("command"))
+
+        let outside = NSError(domain: "x", code: 1, userInfo: [NSLocalizedDescriptionKey: "connection refused"])
+        XCTAssertTrue(Explain.advice(for: outside).contains("address"))
+    }
+
     /// A new sign-in under a name others gave asks which one it is, once.
     func testANewSignInAsksAboutEarlierOnesWithItsName() {
         let now = Date(timeIntervalSince1970: 2_000_000)

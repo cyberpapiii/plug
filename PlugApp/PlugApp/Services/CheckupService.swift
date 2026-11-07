@@ -78,7 +78,7 @@ struct Checkup: Equatable, Sendable, Decodable {
     }
 }
 
-enum CheckupError: LocalizedError, Equatable {
+enum CheckupError: LocalizedError, AdvisedError, Equatable {
     case serviceMissing
     case unreadable
 

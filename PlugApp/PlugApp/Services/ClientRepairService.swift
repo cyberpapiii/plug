@@ -1,6 +1,6 @@
 import Foundation
 
-enum ClientRepairError: LocalizedError, Equatable {
+enum ClientRepairError: LocalizedError, AdvisedError, Equatable {
     case commandFailed(status: Int32, stderr: String)
     case malformedOutput
 
@@ -13,6 +13,11 @@ enum ClientRepairError: LocalizedError, Equatable {
         case .malformedOutput:
             "Plug gave an answer it could not read. Try again."
         }
+    }
+
+    var advice: String {
+        if case let .commandFailed(_, stderr) = self { return Explain.advice(forOutside: stderr) }
+        return Explain.fallback
     }
 }
 

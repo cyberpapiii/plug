@@ -254,8 +254,10 @@ struct ActionError: Identifiable, Equatable {
     let advice: String
 }
 
-private struct RuntimeUnavailableError: LocalizedError {
+private struct RuntimeUnavailableError: LocalizedError, AdvisedError {
     var errorDescription: String? {
         "Plug is starting. Try again in a moment."
     }
+
+    var advice: String { Explain.starting }
 }

@@ -3,7 +3,7 @@ import Foundation
 import PlugIPC
 import ServiceManagement
 
-enum DaemonServiceError: LocalizedError, Equatable {
+enum DaemonServiceError: LocalizedError, AdvisedError, Equatable {
     case adoptionRequired
     case unknownOwnership
     case evidenceChanged
@@ -34,6 +34,11 @@ enum DaemonServiceError: LocalizedError, Equatable {
         case let .commandFailed(detail):
             detail.isEmpty ? "macOS did not change Plug's service. Try again." : detail
         }
+    }
+
+    var advice: String {
+        if case let .commandFailed(detail) = self { return Explain.advice(forOutside: detail) }
+        return Explain.fallback
     }
 }
 
