@@ -144,7 +144,7 @@ jobs:
     name: Warm release cache
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     # No env here on purpose: rust-cache folds every CARGO_* and RUST*
-    # variable into its key, and release.yml's build-app job sets none.
+    # variable into its key, and release.yml's build-daemon job sets none.
     runs-on: macos-26
     timeout-minutes: 45
     steps:
