@@ -1,5 +1,6 @@
 use super::*;
 
+use super::completion::resolve_resource_route;
 use dashmap::Entry as DashEntry;
 use tokio::sync::watch;
 use tokio_util::task::TaskTracker;
@@ -919,11 +920,11 @@ impl SubscriptionRegistry {
         let mut out = Vec::new();
         for item in self.entries.iter() {
             let uri = item.key();
-            match new_routes.get(uri) {
+            match resolve_resource_route(new_routes, uri) {
                 Some(new_server_id) => {
                     let old_side = match &item.value().owner_server_id {
-                        Some(owner) => Some(owner),
-                        None => old_routes.get(uri),
+                        Some(owner) => Some(owner.clone()),
+                        None => resolve_resource_route(old_routes, uri),
                     };
                     if let Some(old_server_id) = old_side
                         && old_server_id != new_server_id
@@ -936,10 +937,10 @@ impl SubscriptionRegistry {
                         );
                         out.push(RouteReconciliation::Rebind {
                             uri: uri.clone(),
-                            old_server_id: old_server_id.clone(),
-                            new_server_id: new_server_id.clone(),
+                            old_server_id,
+                            new_server_id,
                         });
-                    } else if self.owner_connection_is_stale(item.value(), new_server_id) {
+                    } else if self.owner_connection_is_stale(item.value(), &new_server_id) {
                         tracing::debug!(
                             uri = %uri,
                             server = %new_server_id,
@@ -947,11 +948,11 @@ impl SubscriptionRegistry {
                         );
                         out.push(RouteReconciliation::Resubscribe {
                             uri: uri.clone(),
-                            server_id: new_server_id.clone(),
+                            server_id: new_server_id,
                         });
                     }
                 }
-                None => match old_routes.get(uri) {
+                None => match resolve_resource_route(old_routes, uri) {
                     Some(old_server_id) => {
                         tracing::debug!(
                             uri = %uri,
@@ -959,7 +960,7 @@ impl SubscriptionRegistry {
                         );
                         out.push(RouteReconciliation::Prune {
                             uri: uri.clone(),
-                            old_server_id: Some(old_server_id.clone()),
+                            old_server_id: Some(old_server_id),
                         });
                     }
                     None => {
@@ -1354,11 +1355,8 @@ impl super::ToolRouter {
         client_key: Option<&str>,
     ) -> Result<(), McpError> {
         let snapshot = self.cache.load();
-        let server_id = snapshot
-            .resource_routes
-            .get(uri)
+        let server_id = resolve_resource_route(&snapshot.resource_routes, uri)
             .filter(|server_id| self.client_may_use_all_of_server(client_key, server_id))
-            .cloned()
             .ok_or_else(|| {
                 McpError::from(ProtocolError::InvalidRequest {
                     detail: format!("resource not found: {uri}"),
@@ -1408,7 +1406,7 @@ impl super::ToolRouter {
         // refresh's prune plus the entry's recorded owner already drain
         // routeless entries.
         let recorded_owner = self.resource_subscriptions.owner_snapshot(uri).flatten();
-        let published_route = self.cache.load().resource_routes.get(uri).cloned();
+        let published_route = resolve_resource_route(&self.cache.load().resource_routes, uri);
         let heal_outcome = match (&recorded_owner, &published_route) {
             (Some(owner), Some(route)) if owner != route => {
                 tracing::debug!(
@@ -1475,7 +1473,7 @@ impl super::ToolRouter {
     ) -> Result<(), McpError> {
         let route_server_id = {
             let snapshot = self.cache.load();
-            snapshot.resource_routes.get(uri).cloned()
+            resolve_resource_route(&snapshot.resource_routes, uri)
         };
 
         if route_server_id.is_none() && !self.resource_subscriptions.has_entry(uri) {
@@ -1506,10 +1504,7 @@ impl super::ToolRouter {
         self.resource_subscriptions
             .cleanup_target(target, |uri| {
                 let snapshot = self.cache.load();
-                snapshot
-                    .resource_routes
-                    .get(uri)
-                    .cloned()
+                resolve_resource_route(&snapshot.resource_routes, uri)
                     .and_then(|server_id| self.server_manager.get_upstream(&server_id))
                     .map(as_upstream_ops)
             })
@@ -1537,7 +1532,7 @@ impl super::ToolRouter {
             .resource_subscriptions
             .owner_snapshot(&params.uri)
             .flatten()
-            .or_else(|| self.cache.load().resource_routes.get(&params.uri).cloned());
+            .or_else(|| resolve_resource_route(&self.cache.load().resource_routes, &params.uri));
 
         for target in subscribers {
             if let Some(server_id) = &server_id

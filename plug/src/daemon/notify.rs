@@ -17,7 +17,7 @@ pub(super) async fn send_ipc_control_notification(
     >,
     session_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    use plug_core::notifications::{NotificationTarget, ProtocolNotification, fanout};
+    use plug_core::notifications::{NotificationTarget, ProtocolNotification};
     use tokio::sync::broadcast::error::RecvError;
 
     let message = match recv {
@@ -25,9 +25,7 @@ pub(super) async fn send_ipc_control_notification(
             let identity = session_id.map(|sid| NotificationTarget::Ipc {
                 client_id: sid.into(),
             });
-            let deliver = identity
-                .as_ref()
-                .is_some_and(|id| fanout::resolve(fanout::classify(&notification)).deliver_to(id));
+            let deliver = identity.as_ref().is_some_and(|id| notification.is_for(id));
             match notification {
                 ProtocolNotification::ToolListChanged => {
                     Some(IpcResponse::ToolListChangedNotification)

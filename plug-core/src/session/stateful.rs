@@ -55,24 +55,37 @@ struct SessionState {
     reopened: bool,
 }
 
+/// Whether a session may still be used, and if not, why it has to go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Liveness {
+    Live,
+    /// Idle past the store's timeout.
+    Expired,
+    /// The sign-in it was opened under no longer holds.
+    AccessEnded,
+}
+
 impl SessionState {
-    /// Whether the sign-in this session was opened under no longer holds.
-    fn access_ended(&self) -> bool {
-        self.still_allowed.as_ref().is_some_and(|check| !check())
+    fn liveness(&self, timeout: Duration) -> Liveness {
+        if self.last_activity.elapsed() > timeout {
+            Liveness::Expired
+        } else if self.still_allowed.as_ref().is_some_and(|check| !check()) {
+            Liveness::AccessEnded
+        } else {
+            Liveness::Live
+        }
     }
 }
 
 impl SessionStore {
     /// The live sessions, by session id.
     pub fn snapshots(&self) -> Vec<DownstreamSessionSnapshot> {
-        let timeout = self.timeout;
-
         let mut snapshots: Vec<DownstreamSessionSnapshot> = self
             .sessions
             .iter()
             .filter_map(|entry| {
                 let state = entry.value();
-                if state.last_activity.elapsed() > timeout {
+                if state.liveness(self.timeout) != Liveness::Live {
                     return None;
                 }
 
@@ -161,6 +174,15 @@ impl SessionStore {
         }
     }
 
+    /// Remove a session found not live for `why`. Returns whether it went.
+    fn retire(&self, session_id: &str, why: Liveness) -> bool {
+        match why {
+            Liveness::Live => false,
+            Liveness::Expired => self.remove_if_expired(session_id),
+            Liveness::AccessEnded => self.end(session_id, SessionEnd::Lapsed),
+        }
+    }
+
     /// Remove `session_id` only if it is still expired under the map's shard
     /// lock. Checking expiry and removing in two steps let a request that
     /// touched the session in between lose its session anyway: the listener
@@ -180,18 +202,18 @@ impl SessionStore {
         removed
     }
 
-    /// Remove every expired session, rechecking each at removal time. Returns
-    /// how many were removed.
+    /// Remove every session that is no longer live, rechecking expiry at
+    /// removal time. Returns how many were removed.
     fn prune_expired_sessions(&self) -> usize {
-        let candidates: Vec<String> = self
+        let candidates: Vec<(String, Liveness)> = self
             .sessions
             .iter()
-            .filter(|entry| entry.last_activity.elapsed() > self.timeout)
-            .map(|entry| entry.key().clone())
+            .map(|entry| (entry.key().clone(), entry.liveness(self.timeout)))
+            .filter(|(_, liveness)| *liveness != Liveness::Live)
             .collect();
         candidates
-            .iter()
-            .filter(|session_id| self.remove_if_expired(session_id))
+            .into_iter()
+            .filter(|(session_id, why)| self.retire(session_id, *why))
             .count()
     }
 
@@ -285,14 +307,10 @@ impl SessionStore {
             .get_mut(session_id)
             .ok_or(SessionError::NotFound)?;
 
-        if entry.last_activity.elapsed() > self.timeout {
+        let liveness = entry.liveness(self.timeout);
+        if liveness != Liveness::Live {
             drop(entry);
-            self.remove_if_expired(session_id);
-            return Err(SessionError::NotFound);
-        }
-        if entry.access_ended() {
-            drop(entry);
-            self.end(session_id, SessionEnd::Lapsed);
+            self.retire(session_id, liveness);
             return Err(SessionError::NotFound);
         }
 
@@ -308,14 +326,10 @@ impl SessionStore {
             let Some(mut entry) = self.sessions.get_mut(session_id) else {
                 return false;
             };
-            if entry.last_activity.elapsed() > self.timeout {
+            let liveness = entry.liveness(self.timeout);
+            if liveness != Liveness::Live {
                 drop(entry);
-                self.remove_if_expired(session_id);
-                return false;
-            }
-            if entry.access_ended() {
-                drop(entry);
-                self.end(session_id, SessionEnd::Lapsed);
+                self.retire(session_id, liveness);
                 return false;
             }
             let next = Self::next_event(&mut entry, message);
@@ -646,18 +660,14 @@ impl SessionStore {
             .iter()
             .map(|entry| entry.key().clone())
             .collect();
-        let mut expired = Vec::new();
-        let mut ended = Vec::new();
+        let mut retired = Vec::new();
         for session_id in session_ids {
             let Some(mut entry) = self.sessions.get_mut(&session_id) else {
                 continue;
             };
-            if entry.last_activity.elapsed() > self.timeout {
-                expired.push(session_id);
-                continue;
-            }
-            if entry.access_ended() {
-                ended.push(session_id);
+            let liveness = entry.liveness(self.timeout);
+            if liveness != Liveness::Live {
+                retired.push((session_id, liveness));
                 continue;
             }
             // Skipped before `next_event`, so a session that is not admitted
@@ -679,11 +689,8 @@ impl SessionStore {
                 Self::enqueue_pending(&mut entry, event);
             }
         }
-        for session_id in expired {
-            self.remove_if_expired(&session_id);
-        }
-        for session_id in ended {
-            self.end(&session_id, SessionEnd::Lapsed);
+        for (session_id, why) in retired {
+            self.retire(&session_id, why);
         }
     }
 
@@ -698,7 +705,7 @@ impl SessionStore {
         }
     }
 
-    /// Drop expired sessions every 30 seconds until `cancel` fires or the
+    /// Drop sessions that are no longer live every 30 seconds until `cancel` fires or the
     /// store is gone.
     pub(crate) fn spawn_cleanup_task(self: &Arc<Self>, cancel: CancellationToken) {
         let store = Arc::downgrade(self);
@@ -1218,6 +1225,35 @@ mod tests {
                 .all(|snapshot| snapshot.session_id != id)
         );
         assert_eq!(store.session_count(), 1);
+    }
+
+    #[test]
+    fn a_session_whose_sign_in_ended_is_not_listed_and_is_swept() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let store = store_reporting_to(60, 100, tx);
+        let ended = store.create_session().unwrap();
+        let kept = store.create_session().unwrap();
+        let allowed = Arc::new(AtomicBool::new(true));
+        let check = Arc::clone(&allowed);
+        bind(
+            &store,
+            &ended,
+            Some(("client", Arc::new(move || check.load(Ordering::SeqCst)))),
+        );
+        bind(&store, &kept, None);
+        allowed.store(false, Ordering::SeqCst);
+
+        let listed: Vec<String> = store
+            .snapshots()
+            .into_iter()
+            .map(|snapshot| snapshot.session_id)
+            .collect();
+        assert_eq!(listed, vec![kept.clone()]);
+
+        assert_eq!(store.prune_expired_sessions(), 1);
+        assert_eq!(rx.try_recv().ok(), Some(ended));
+        assert!(store.validate(&kept).is_ok());
     }
 
     #[test]

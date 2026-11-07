@@ -30,14 +30,6 @@ impl super::ToolRouter {
 
         let snapshot = self.cache.load();
         let server_id = resolve_resource_route(&snapshot.resource_routes, uri)
-            .or_else(|| {
-                // A skill's files need not be listed: its server's name in
-                // the URI is the route.
-                skills::named_server(uri)
-                    .filter(|server| self.server_manager.get_upstream(server).is_some())
-                    .map(str::to_string)
-            })
-            .or_else(|| skills::only_server(&snapshot.resource_routes, uri))
             .filter(|server_id| self.client_may_use_all_of_server(client_key, server_id))
             .ok_or_else(|| {
                 McpError::from(ProtocolError::InvalidRequest {
@@ -182,19 +174,33 @@ impl super::ToolRouter {
     }
 }
 
-/// Resolve a concrete resource URI against exact routes first and advertised
-/// URI templates second. The matcher deliberately implements the useful MCP
-/// subset of RFC 6570 without accepting arbitrary cross-server fallbacks:
-/// simple variables stay within one path segment, while reserved (`+`) and
-/// fragment (`#`) expansions may contain slashes.
-fn resolve_resource_route(
+/// The server a resource URI belongs to, for reading, completing and
+/// subscribing alike: the server that lists it, else the one server whose
+/// advertised template matches it, else for a skill the server its URI
+/// names, else the one server that lists it under its own name.
+pub(super) fn resolve_resource_route(
     routes: &std::collections::HashMap<String, String>,
     uri: &str,
 ) -> Option<String> {
     if let Some(server) = routes.get(uri) {
         return Some(server.clone());
     }
+    template_route(routes, uri)
+        .or_else(|| {
+            // A skill's files need not be listed: its server's name in the
+            // URI is the route.
+            skills::named_server(uri)
+                .filter(|server| routes.values().any(|listed| listed == server))
+                .map(str::to_string)
+        })
+        .or_else(|| skills::only_server(routes, uri))
+}
 
+/// The one server whose advertised template matches `uri`. The matcher
+/// implements the useful MCP subset of RFC 6570 without accepting
+/// cross-server fallbacks: simple variables stay within one path segment,
+/// while reserved (`+`) and fragment (`#`) expansions may contain slashes.
+fn template_route(routes: &std::collections::HashMap<String, String>, uri: &str) -> Option<String> {
     let mut matches = routes
         .iter()
         .filter(|(template, _)| template.contains('{') && uri_template_matches(template, uri))

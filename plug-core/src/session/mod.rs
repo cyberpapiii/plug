@@ -86,6 +86,26 @@ pub enum BroadcastKind {
     Logging,
 }
 
+impl BroadcastKind {
+    /// The broadcast class of `notification`, or `None` for one that names
+    /// its client.
+    pub(crate) fn of(notification: &crate::notifications::ProtocolNotification) -> Option<Self> {
+        use crate::notifications::ProtocolNotification as N;
+        match notification {
+            N::ToolListChanged => Some(Self::ToolList),
+            N::ResourceListChanged => Some(Self::ResourceList),
+            N::PromptListChanged => Some(Self::PromptList),
+            N::LoggingMessage { .. }
+            | N::TokenRefreshExchanged { .. }
+            | N::AuthStateChanged { .. } => Some(Self::Logging),
+            N::ToolListChangedFor { .. }
+            | N::Progress { .. }
+            | N::Cancelled { .. }
+            | N::ResourceUpdated { .. } => None,
+        }
+    }
+}
+
 /// Which broadcast notifications a session's principal may observe.
 ///
 /// Recorded when the session is bound to its caller, at `initialize` or when
