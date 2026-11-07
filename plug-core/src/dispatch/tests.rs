@@ -582,7 +582,7 @@ fn assert_plug_icons_sequence(icons: &[rmcp::model::Icon]) {
     assert_eq!(svg.sizes.as_deref(), Some(&["any".to_string()][..]));
 }
 
-/// A modern client that declares the tasks extension, calling over IPC.
+/// A modern client as the dispatcher sees it, declaring `client`.
 struct TaskCapableModernCaller {
     call: DownstreamCallContext,
     client: ClientCapabilities,
@@ -667,5 +667,224 @@ async fn a_task_capable_client_calls_a_modern_upstream_as_a_plain_call() {
     assert_eq!(
         state.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
         2
+    );
+}
+
+/// A modern HTTP caller holding `scopes`, whose client may or may not
+/// declare the tasks extension.
+fn http_task_caller(scopes: &[&str], client_supports_tasks: bool) -> TaskCapableModernCaller {
+    TaskCapableModernCaller {
+        call: DownstreamCallContext::http("task-client", RequestId::Number(1), ClientType::Unknown)
+            .with_protocol(
+                ProtocolEra::Modern,
+                crate::protocol::MODERN_PROTOCOL_VERSION,
+            )
+            .with_authorization(
+                crate::types::PrincipalId::configured_credential("task-test", 1),
+                scopes.iter().map(|scope| scope.to_string()),
+            ),
+        client: if client_supports_tasks {
+            ClientCapabilities::builder().enable_tasks().build()
+        } else {
+            ClientCapabilities::default()
+        },
+    }
+}
+
+fn publish_mock_echo(router: &ToolRouter) {
+    router.replace_snapshot(RouterSnapshot {
+        routes: HashMap::from([
+            (
+                "Mock__echo".to_string(),
+                ("mock".to_string(), "echo".to_string()),
+            ),
+            (
+                "plug__search_tools".to_string(),
+                (
+                    crate::tool_naming::INTERNAL_SERVER_ID.to_string(),
+                    "plug__search_tools".to_string(),
+                ),
+            ),
+        ]),
+        tools_all: Arc::new(vec![rmcp::model::Tool::new(
+            "Mock__echo",
+            "Echo",
+            Arc::new(serde_json::Map::new()),
+        )]),
+        ..Default::default()
+    });
+}
+
+#[tokio::test]
+async fn modern_task_admission_matrix_is_consistent() {
+    let router = router();
+    let allowed = http_task_caller(&["tasks:use"], true);
+
+    let unavailable = admit_modern_task(&router, &allowed, &allowed.call)
+        .expect_err("server without task surface must reject all task methods");
+    assert_eq!(unavailable.code, ErrorCode::METHOD_NOT_FOUND);
+
+    publish_mock_echo(&router);
+    let no_tasks = http_task_caller(&["tasks:use"], false);
+    let missing_client = admit_modern_task(&router, &no_tasks, &no_tasks.call)
+        .expect_err("client capability is mandatory");
+    assert_eq!(
+        missing_client.code,
+        ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY
+    );
+
+    let denied = http_task_caller(&["tools:read"], true);
+    let permission =
+        admit_modern_task(&router, &denied, &denied.call).expect_err("task scope is mandatory");
+    assert_eq!(
+        permission.code.0,
+        crate::protocol::ProtocolOutcome::PermissionDenied
+            .encode(ProtocolEra::Modern)
+            .code
+    );
+
+    let owner =
+        admit_modern_task(&router, &allowed, &allowed.call).expect("fully admitted task method");
+    assert_eq!(
+        owner.as_key(),
+        allowed.call.principal().expect("principal").owner_key()
+    );
+}
+
+/// Tasks are offered to a modern caller when its own tool surface lists
+/// tools as they are, whatever the surface of a client of unknown type.
+#[tokio::test]
+async fn modern_tasks_follow_the_callers_own_tool_surface() {
+    let mut lazy_tools = crate::config::LazyToolsConfig {
+        mode: crate::types::LazyToolSetting::Bridge,
+        ..Default::default()
+    };
+    lazy_tools.clients.insert(
+        "claude-code".to_string(),
+        crate::types::LazyToolSetting::Standard,
+    );
+    let router = ToolRouter::new(
+        Arc::new(ServerManager::new()),
+        RouterConfig {
+            lazy_tools,
+            ..Default::default()
+        },
+    );
+    publish_mock_echo(&router);
+    let caller = |client_type| {
+        let mut caller = http_task_caller(&["tasks:use"], true);
+        caller.call.client_type = client_type;
+        caller
+    };
+
+    let standard = caller(ClientType::ClaudeCode);
+    admit_modern_task(&router, &standard, &standard.call)
+        .expect("a Standard client is offered tasks");
+    let unknown = caller(ClientType::Unknown);
+    let bridged = admit_modern_task(&router, &unknown, &unknown.call)
+        .expect_err("a client behind the search bridge is not");
+    assert_eq!(bridged.code, ErrorCode::METHOD_NOT_FOUND);
+}
+
+/// Every modern tools/call from a task-capable client becomes a task, but
+/// one that cannot be a task runs as a plain call instead of failing.
+#[tokio::test]
+async fn a_modern_call_that_cannot_be_a_task_runs_as_a_plain_call() {
+    let router = router();
+    router.set_modern_downstream_enabled(true);
+    publish_mock_echo(&router);
+    let call = |scopes: &'static [&'static str], tool: &'static str| {
+        let router = Arc::clone(&router);
+        async move {
+            let caller = http_task_caller(scopes, true);
+            let params = serde_json::json!({"name": tool, "arguments": {"query": "echo"}});
+            handle(&router, &caller, "tools/call", Some(params)).await
+        }
+    };
+
+    let task = call(&["tools:read", "tasks:use"], "Mock__echo")
+        .await
+        .expect("a task-capable caller gets a task");
+    assert_eq!(task["resultType"], "task", "{task}");
+
+    // With no upstream behind `mock`, a plain call fails as unavailable;
+    // a task would have been created instead.
+    let plain = call(&["tools:read"], "Mock__echo")
+        .await
+        .expect_err("a plain call reaches the missing upstream");
+    assert!(plain.message.contains("unavailable"), "{plain:?}");
+
+    let meta = call(&["tools:read", "tasks:use"], "plug__search_tools")
+        .await
+        .expect("a meta-tool runs as a plain call");
+    assert_ne!(meta["resultType"], "task", "{meta}");
+    assert!(meta.get("content").is_some(), "{meta}");
+}
+
+/// A task admitted while its upstream is not connected judges the era when
+/// it runs. An upstream that came back modern fails the task with the
+/// bridge error before the tool runs.
+#[tokio::test]
+async fn a_task_admitted_while_its_upstream_is_down_refuses_a_modern_reconnect() {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
+    router.set_modern_downstream_enabled(true);
+    publish_tool_route_snapshot_with_metadata(&router, "Modern__tool", "modern", "Tool");
+    let principal = crate::types::PrincipalId::daemon_ipc(uuid::Uuid::from_u128(105));
+    let call = DownstreamCallContext::ipc(
+        "modern-client",
+        RequestId::from(NumberOrString::Number(7)),
+        ClientType::Unknown,
+        None,
+    )
+    .with_local_principal(principal.clone())
+    .with_protocol(
+        ProtocolEra::Modern,
+        crate::protocol::MODERN_PROTOCOL_VERSION,
+    );
+
+    // Dispatch and the round check give the same answer for a down upstream.
+    assert!(router.task_can_carry_tool("Modern__tool"));
+    router
+        .ensure_tool_round_supported("Modern__tool", &call, false, true)
+        .expect("a task to a down upstream is admitted");
+
+    let state = SubscribableUpstreamState::new(&[]);
+    state
+        .tool_requires_input
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let upstream = connect_modern_tool_upstream("modern", Arc::clone(&state)).await;
+    sm.replace_server("modern", upstream).await;
+    assert!(!router.task_can_carry_tool("Modern__tool"));
+
+    let owner = crate::downstream_identity::principal_task_owner(&principal);
+    let created = router
+        .enqueue_tool_task("Modern__tool", None, None, owner.clone(), None, Some(call))
+        .await
+        .expect("the task was admitted before the reconnect");
+    let task = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let info = router
+                .get_task_info_for_owner(&owner, &created.task.task_id)
+                .await
+                .expect("task info");
+            if info.task.status != crate::legacy_tasks::TaskStatus::Working {
+                break info.task;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the task finishes");
+    assert_eq!(task.status, crate::legacy_tasks::TaskStatus::Failed);
+    assert!(
+        task.status_message
+            .as_deref()
+            .is_some_and(|message| message.contains("unsupported protocol bridge")),
+        "{task:?}"
+    );
+    assert_eq!(
+        state.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
     );
 }

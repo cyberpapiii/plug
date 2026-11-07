@@ -387,6 +387,14 @@ enum LazyToolSurface {
     LegacyMeta,
 }
 
+/// Whether a task can carry a call to an upstream of `upstream_era`. A task
+/// cannot carry a modern upstream's rounds. An upstream that is not connected
+/// passes: the task owns its later result, and the era is judged again
+/// against the connection the task's call is sent on.
+fn task_can_carry(upstream_era: Option<crate::protocol::ProtocolEra>) -> bool {
+    upstream_era != Some(crate::protocol::ProtocolEra::Modern)
+}
+
 fn mrtr_pair_supported(
     downstream_era: crate::protocol::ProtocolEra,
     upstream_era: crate::protocol::ProtocolEra,
@@ -398,7 +406,7 @@ fn mrtr_pair_supported(
     if has_continuation && !native_modern {
         return false;
     }
-    if task_requested && upstream_era == crate::protocol::ProtocolEra::Modern {
+    if task_requested && !task_can_carry(Some(upstream_era)) {
         return false;
     }
     !(downstream_era == crate::protocol::ProtocolEra::Legacy
@@ -719,7 +727,6 @@ impl DownstreamCallContext {
     ) -> crate::admission::PolicyDecision {
         crate::admission::decide_method(
             &crate::admission::CapabilityPolicyInput {
-                era: self.protocol_era,
                 principal: self.principal.as_ref(),
                 scopes: self.scopes.as_ref(),
                 local_trust: self.local_trust,
@@ -1445,20 +1452,29 @@ impl ToolRouter {
             .expect("continuation insert gate mutex poisoned") = gate;
     }
 
-    /// The era the connected upstream behind `tool_name` speaks. `None` for a
-    /// tool with no route or whose upstream is not connected.
-    pub(crate) fn tool_upstream_era(
+    /// The server behind `tool_name` and the era its connected upstream
+    /// speaks. `None` for a tool with no route; an era of `None` for an
+    /// upstream that is not connected.
+    fn tool_upstream_era(
         &self,
         tool_name: &str,
-    ) -> Option<crate::protocol::ProtocolEra> {
+    ) -> Option<(String, Option<crate::protocol::ProtocolEra>)> {
         let server_id = self
             .cache
             .load()
             .resolve_route(tool_name)
             .map(|(server_id, _)| server_id.clone())?;
-        self.server_manager
+        let era = self
+            .server_manager
             .get_upstream(&server_id)
-            .map(|upstream| upstream.protocol_era)
+            .map(|upstream| upstream.protocol_era);
+        Some((server_id, era))
+    }
+
+    /// Whether a task can carry a call to `tool_name`'s upstream as it is
+    /// connected now.
+    pub(crate) fn task_can_carry_tool(&self, tool_name: &str) -> bool {
+        task_can_carry(self.tool_upstream_era(tool_name).and_then(|(_, era)| era))
     }
 
     /// Fail-closed MRTR admission before a tools/call can reach an upstream.
@@ -1487,25 +1503,15 @@ impl ToolRouter {
             }
             return Ok(());
         }
-        let cache = self.cache.load();
-        let server_id = cache
-            .resolve_route(tool_name)
-            .map(|(server_id, _)| server_id.clone());
-        drop(cache);
-        let Some(server_id) = server_id else {
+        let Some((server_id, upstream_era)) = self.tool_upstream_era(tool_name) else {
             return Err(McpError::from(ProtocolError::ToolNotFound {
                 tool_name: tool_name.to_string(),
             }));
         };
-        let Some(upstream_era) = self
-            .server_manager
-            .get_upstream(&server_id)
-            .map(|upstream| upstream.protocol_era)
-        else {
-            // Preserve legacy task enqueue semantics: the task owns its later
-            // upstream-unavailable result. Synchronous calls still fail in the
-            // router before any upstream effect.
-            if task_requested {
+        let Some(upstream_era) = upstream_era else {
+            // The task owns its later upstream-unavailable result. Synchronous
+            // calls still fail in the router before any upstream effect.
+            if task_requested && task_can_carry(None) {
                 return Ok(());
             }
             return Err(McpError::from(ProtocolError::ServerUnavailable {
@@ -3628,6 +3634,11 @@ impl ToolRouter {
                 .server_manager
                 .get_upstream(&server_id)
                 .ok_or_else(unavailable)?;
+            // The upstream may have reconnected in another era since the task
+            // was admitted.
+            if matches!(kind, CallKind::Task(_)) && !task_can_carry(Some(upstream.protocol_era)) {
+                return Err(crate::protocol::ProtocolOutcome::UnsupportedBridge.into_error(era));
+            }
 
             if let Some(expected) = &round.expected_route {
                 let (actual, _) = self.tool_route_identity(tool_name)?;
