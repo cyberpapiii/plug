@@ -16,7 +16,7 @@ pub mod file;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::platform_keyring;
@@ -29,10 +29,6 @@ pub use crate::config::{CommandStoreConfig, FILE, KEYCHAIN, OP, SecretsConfig};
 /// How long one read may take unless the store says otherwise. A store that
 /// asks a person for approval can wait forever; a server start cannot.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The stores the running service follows references with. Set from the
-/// config when it loads; the built-in ones until then.
-static CURRENT: RwLock<Option<Stores>> = RwLock::new(None);
 
 /// The last value each reference gave, so a store that locks after the
 /// service started does not take down a server that restarts. Memory only.
@@ -320,22 +316,6 @@ impl Stores {
                     )),
                 )
             })
-    }
-
-    /// Make `config`'s stores the ones the service follows references with.
-    pub fn configure(config: &SecretsConfig) {
-        if let Ok(mut current) = CURRENT.write() {
-            *current = Some(Self::from_config(config));
-        }
-    }
-
-    /// The stores the service follows references with.
-    pub fn current() -> Self {
-        CURRENT
-            .read()
-            .ok()
-            .and_then(|current| current.clone())
-            .unwrap_or_else(Self::builtin)
     }
 
     /// Whether `server` refers to any store, so the caller can prepare what
