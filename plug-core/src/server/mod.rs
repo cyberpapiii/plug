@@ -2574,14 +2574,9 @@ async fn resolve_upstream_auth(
     url: &str,
     config: &ServerConfig,
 ) -> Result<Option<String>, anyhow::Error> {
-    let parsed = url
-        .parse::<http::Uri>()
-        .map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
-    if let Some(host) = parsed.host()
-        && crate::upstream_http::is_blocked_host(host)
-    {
-        anyhow::bail!("URL host '{host}' is blocked: cloud metadata endpoint");
-    }
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
+    crate::upstream_http::refuse_blocked(&parsed)?;
 
     if !config.is_oauth() {
         return Ok(config.auth_token.as_ref().map(|t| t.as_str().to_string()));
