@@ -182,6 +182,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Advice to restart Plug points at the Restart button under Plug in Plug.app's Settings, where it is. It used to name a Service section that no longer exists.
 - The file an upstream sign-in keeps while you approve it in the browser is written as a new owner-only file put in place in one step, like the token file, so a link planted at its path is replaced rather than written through.
 - A remote client that comes back to a session Plug timed out keeps it. Reopening the session queued the old one's cleanup, which then ran on the reopened session and dropped its notifications, subscriptions and what the client said it supports.
+- The app and `plug clients` no longer list a remote session whose sign-in has ended, and Plug closes such a session within thirty seconds. It used to stay listed, and open, until its client next used it or it timed out.
 
 ## [0.11.0] - 2026-10-07
 
