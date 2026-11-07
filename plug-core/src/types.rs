@@ -155,7 +155,7 @@ fn is_non_forwarded_meta_key(key: &str) -> bool {
             | "traceparent"
             | "tracestate"
             | "baggage"
-            | "io.modelcontextprotocol/protocolVersion"
+            | crate::protocol::PROTOCOL_VERSION_META_KEY
             | "io.modelcontextprotocol/clientInfo"
             | "io.modelcontextprotocol/clientCapabilities"
             | "io.modelcontextprotocol/logLevel"

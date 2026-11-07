@@ -20,6 +20,36 @@ pub const RESULT_TYPE_COMPLETE: &str = "complete";
 /// SEP-2322 discriminator for a result that asks the client for input first.
 pub const RESULT_TYPE_INPUT_REQUIRED: &str = "input_required";
 
+/// The `_meta` key a modern message declares its protocol version under.
+pub const PROTOCOL_VERSION_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+
+/// The protocol versions a JSON-RPC message declares in its body.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeclaredVersions<'a> {
+    /// Under [`PROTOCOL_VERSION_META_KEY`] in `params._meta`.
+    pub meta: Option<&'a str>,
+    /// An `initialize` request's `params.protocolVersion`.
+    pub initialize: Option<&'a str>,
+}
+
+impl<'a> DeclaredVersions<'a> {
+    pub fn of(value: &'a serde_json::Value) -> Self {
+        let params = value.get("params");
+        let initialize =
+            value.get("method").and_then(serde_json::Value::as_str) == Some("initialize");
+        Self {
+            meta: params
+                .and_then(|params| params.get("_meta"))
+                .and_then(|meta| meta.get(PROTOCOL_VERSION_META_KEY))
+                .and_then(serde_json::Value::as_str),
+            initialize: params
+                .filter(|_| initialize)
+                .and_then(|params| params.get("protocolVersion"))
+                .and_then(serde_json::Value::as_str),
+        }
+    }
+}
+
 /// Classify an HTTP JSON-RPC envelope before any era-specific rewriting or
 /// typed deserialization occurs.
 pub fn classify_http_request_era(
@@ -27,19 +57,10 @@ pub fn classify_http_request_era(
     header_version: Option<&str>,
 ) -> Result<ProtocolEra, String> {
     let method = value.get("method").and_then(serde_json::Value::as_str);
-    let meta_version = value
-        .get("params")
-        .and_then(|params| params.get("_meta"))
-        .and_then(|meta| meta.get("io.modelcontextprotocol/protocolVersion"))
-        .and_then(serde_json::Value::as_str);
-    let initialize_version = (method == Some("initialize"))
-        .then(|| {
-            value
-                .get("params")
-                .and_then(|params| params.get("protocolVersion"))
-                .and_then(serde_json::Value::as_str)
-        })
-        .flatten();
+    let DeclaredVersions {
+        meta: meta_version,
+        initialize: initialize_version,
+    } = DeclaredVersions::of(value);
 
     let declared = [header_version, meta_version, initialize_version]
         .into_iter()

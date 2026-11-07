@@ -3,13 +3,7 @@
 
 use std::sync::Arc;
 
-fn is_modern_stdio_message(value: &serde_json::Value) -> bool {
-    value.get("method").and_then(serde_json::Value::as_str) == Some("server/discover")
-        || value
-            .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
-            .and_then(serde_json::Value::as_str)
-            == Some(plug_core::protocol::MODERN_PROTOCOL_VERSION)
-}
+use plug_core::protocol::{DeclaredVersions, MODERN_PROTOCOL_VERSION};
 
 #[derive(Default)]
 struct StdioProtocolState {
@@ -34,11 +28,9 @@ impl StdioProtocolState {
         }
 
         let method = value.get("method").and_then(serde_json::Value::as_str);
-        let explicit_legacy_initialize = method == Some("initialize")
-            && value
-                .pointer("/params/protocolVersion")
-                .and_then(serde_json::Value::as_str)
-                != Some(plug_core::protocol::MODERN_PROTOCOL_VERSION);
+        let declared = DeclaredVersions::of(value);
+        let explicit_legacy_initialize =
+            method == Some("initialize") && declared.initialize != Some(MODERN_PROTOCOL_VERSION);
         if explicit_legacy_initialize {
             self.modern_confirmed = false;
             self.pending_discovery_ids.clear();
@@ -54,7 +46,7 @@ impl StdioProtocolState {
             if let Some(id) = value.get("id") {
                 self.pending_modern_initialize_ids.insert(id.to_string());
             }
-        } else if is_modern_stdio_message(value) {
+        } else if declared.meta == Some(MODERN_PROTOCOL_VERSION) {
             self.modern_confirmed = true;
         }
         self.modern_confirmed
@@ -70,7 +62,7 @@ impl StdioProtocolState {
                 && value
                     .pointer("/result/protocolVersion")
                     .and_then(serde_json::Value::as_str)
-                    == Some(plug_core::protocol::MODERN_PROTOCOL_VERSION);
+                    == Some(MODERN_PROTOCOL_VERSION);
             if discovered || negotiated_modern {
                 self.modern_confirmed = true;
             }
@@ -357,7 +349,7 @@ mod tests {
         }
     }
 
-    const MODERN_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+    const MODERN_META_KEY: &str = plug_core::protocol::PROTOCOL_VERSION_META_KEY;
 
     fn modern_tools_call(id: u64) -> serde_json::Value {
         serde_json::json!({
