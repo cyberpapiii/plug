@@ -15,7 +15,6 @@ use tokio_util::task::TaskTracker;
 
 use crate::config::{Config, ServerConfig};
 use crate::health::{Monitor, Reconnect, Recovery};
-use crate::notifications::ProtocolNotification;
 use crate::proxy::{RouterConfig, ToolRouter};
 use crate::reload::{ReloadReport, ServerChange, server_change};
 use crate::server::{ServerManager, UpstreamEvents, UpstreamServer, retire_upstream_owned};
@@ -796,8 +795,7 @@ impl Engine {
             }
         }
 
-        let tools_toggled = old_config.disabled_tools != new_config.disabled_tools;
-        let catalog_dirty = tools_toggled
+        let catalog_dirty = old_config.disabled_tools != new_config.disabled_tools
             || !diff.added.is_empty()
             || !diff.changed.is_empty()
             || !diff.removed.is_empty()
@@ -823,10 +821,6 @@ impl Engine {
 
         if catalog_dirty {
             self.tool_router.refresh_tools().await;
-        }
-        if tools_toggled {
-            self.tool_router
-                .publish_protocol_notification(ProtocolNotification::ToolListChanged);
         }
 
         for warning in &diff.restart_required {
@@ -1156,6 +1150,26 @@ mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(engine.server_manager().get_upstream("on").is_some());
         assert!(engine.server_manager().get_upstream("off").is_none());
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn clients_hear_a_reload_add_or_remove_a_servers_tools() {
+        let engine = Engine::new(Config::default());
+        let mut notifications = engine.tool_router().subscribe_notifications();
+        let mut told_tools_changed = || {
+            std::iter::from_fn(|| notifications.try_recv().ok())
+                .any(|n| n == crate::notifications::ProtocolNotification::ToolListChanged)
+        };
+
+        engine.reload_config(mock_stdio_config("foo", "echo")).await;
+        assert!(told_tools_changed(), "server added");
+
+        engine.reload_config(Config::default()).await;
+        assert!(told_tools_changed(), "server removed");
+
+        engine.reload_config(Config::default()).await;
+        assert!(!told_tools_changed(), "nothing changed");
         engine.shutdown().await;
     }
 
@@ -1538,7 +1552,7 @@ mod tests {
         assert!(names.iter().any(|name| name.ends_with("add")), "{names:?}");
         assert!(matches!(
             notifications.try_recv(),
-            Ok(ProtocolNotification::ToolListChanged)
+            Ok(crate::notifications::ProtocolNotification::ToolListChanged)
         ));
 
         engine

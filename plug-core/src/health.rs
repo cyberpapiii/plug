@@ -625,6 +625,7 @@ mod tests {
 
         let engine = Engine::new(config);
         engine.start().await;
+        let mut notifications = engine.tool_router().subscribe_notifications();
 
         // The upstream appears once the first recovery attempt has failed.
         tokio::time::timeout(Duration::from_secs(15), async {
@@ -638,14 +639,20 @@ mod tests {
         .expect("the first recovery attempt should fail");
         std::os::unix::fs::symlink(mock, &command).expect("install the upstream");
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        while engine.server_manager().get_upstream("late").is_none() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the server should recover once its command exists"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !events_for(&capture.events(), "late")
+                .any(|event| event.fields.contains("server recovered"))
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the server should recover once its command exists");
+        // Clients hear that the server's tools are back.
+        assert!(
+            std::iter::from_fn(|| notifications.try_recv().ok())
+                .any(|n| n == crate::notifications::ProtocolNotification::ToolListChanged)
+        );
         engine.shutdown().await;
 
         let events = capture.events();

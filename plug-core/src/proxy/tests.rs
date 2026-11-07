@@ -230,14 +230,14 @@ fn a_watch_takes_the_servers_word_over_the_tools_name() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn schedule_tool_list_changed_refresh_debounces_bursts() {
+async fn schedule_resource_list_changed_refresh_debounces_bursts() {
     let sm = Arc::new(ServerManager::new());
     let router = Arc::new(ToolRouter::new(sm, RouterConfig::default()));
     let mut rx = router.subscribe_notifications();
 
-    router.schedule_tool_list_changed_refresh();
-    router.schedule_tool_list_changed_refresh();
-    router.schedule_tool_list_changed_refresh();
+    router.schedule_resource_list_changed_refresh();
+    router.schedule_resource_list_changed_refresh();
+    router.schedule_resource_list_changed_refresh();
 
     tokio::task::yield_now().await;
     assert!(
@@ -253,8 +253,8 @@ async fn schedule_tool_list_changed_refresh_debounces_bursts() {
     );
 
     tokio::time::advance(Duration::from_millis(1)).await;
-    let notification = rx.recv().await.expect("tool list changed notification");
-    assert_eq!(notification, ProtocolNotification::ToolListChanged);
+    let notification = rx.recv().await.expect("resource list changed notification");
+    assert_eq!(notification, ProtocolNotification::ResourceListChanged);
     assert!(
         rx.try_recv().is_err(),
         "burst should coalesce into a single notification"
@@ -268,10 +268,10 @@ async fn refresh_task_releases_in_progress_flag_for_subsequent_refresh() {
     let mut rx = router.subscribe_notifications();
 
     // First refresh cycle.
-    router.schedule_tool_list_changed_refresh();
+    router.schedule_resource_list_changed_refresh();
     tokio::time::advance(LIST_CHANGED_REFRESH_DEBOUNCE).await;
     let first = rx.recv().await.expect("first notification");
-    assert_eq!(first, ProtocolNotification::ToolListChanged);
+    assert_eq!(first, ProtocolNotification::ResourceListChanged);
 
     // After the cycle completes the in-progress flag must be released —
     // a wedged flag (the regression) would silently drop every future
@@ -286,10 +286,10 @@ async fn refresh_task_releases_in_progress_flag_for_subsequent_refresh() {
 
     // A second schedule must therefore spawn a fresh task and publish
     // again.
-    router.schedule_tool_list_changed_refresh();
+    router.schedule_resource_list_changed_refresh();
     tokio::time::advance(LIST_CHANGED_REFRESH_DEBOUNCE).await;
     let second = rx.recv().await.expect("second notification");
-    assert_eq!(second, ProtocolNotification::ToolListChanged);
+    assert_eq!(second, ProtocolNotification::ResourceListChanged);
 }
 
 #[test]

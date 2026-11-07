@@ -365,10 +365,6 @@ fn mrtr_pair_supported(
         && upstream_era == crate::protocol::ProtocolEra::Modern)
 }
 
-/// Backs [`ToolRouter::catalog_revision`]. See that method for why it is
-/// process-global instead of a field.
-static CATALOG_REVISION: AtomicU64 = AtomicU64::new(0);
-
 pub struct ToolRouter {
     server_manager: Arc<ServerManager>,
     activity_store: crate::activity::ActivityStore,
@@ -377,6 +373,8 @@ pub struct ToolRouter {
     /// without invalidating parked rounds; route targets and upstream
     /// instances may not.
     published_tool_routes: std::sync::Mutex<HashMap<String, MaterialToolRoute>>,
+    /// Backs [`ToolRouter::catalog_revision`].
+    catalog_revision: AtomicU64,
     /// Search index for the current snapshot, rebuilt lazily when the
     /// snapshot changes. See [`ToolRouter::search_index_for`].
     search_index: std::sync::Mutex<Option<Arc<ToolSearchIndex>>>,
@@ -399,7 +397,6 @@ pub struct ToolRouter {
     upstream_progress_lookup: DashMap<UpstreamProgressKey, u64>,
     notification_refresh_in_progress: AtomicBool,
     notification_refresh_pending: AtomicBool,
-    pending_tool_list_changed: AtomicBool,
     pending_resource_list_changed: AtomicBool,
     pending_prompt_list_changed: AtomicBool,
     /// Reconnects a server whose session failed under a call. Weak: the
@@ -935,15 +932,9 @@ impl ToolRouter {
     }
 
     /// Changes whenever the merged tool catalog could look different to a
-    /// reader: a refreshed upstream catalog, or a reload that rebuilt the
-    /// router around new configuration.
-    ///
-    /// Process-global rather than per-router on purpose. A reload replaces the
-    /// `ToolRouter`, and a per-instance counter would restart at zero, letting
-    /// a client that had already seen revision zero skip the refetch the
-    /// reload just made necessary.
+    /// reader.
     pub fn catalog_revision(&self) -> u64 {
-        CATALOG_REVISION.load(Ordering::Relaxed)
+        self.catalog_revision.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -968,9 +959,6 @@ impl ToolRouter {
         tracker: tokio_util::task::TaskTracker,
         recovery: Weak<dyn Recovery>,
     ) -> Self {
-        // A reload builds a new router around new configuration, which can
-        // change the catalog a reader sees before any upstream refresh runs.
-        CATALOG_REVISION.fetch_add(1, Ordering::Relaxed);
         let (protocol_notification_tx, _) = broadcast::channel(128);
         let (logging_tx, _) = broadcast::channel(512);
         let cache = Arc::new(ArcSwap::from_pointee(RouterSnapshot {
@@ -1069,6 +1057,7 @@ impl ToolRouter {
             activity_store: crate::activity::ActivityStore::default(),
             cache,
             published_tool_routes: std::sync::Mutex::new(HashMap::new()),
+            catalog_revision: AtomicU64::new(0),
             search_index: std::sync::Mutex::new(None),
             config,
             protocol_notification_tx,
@@ -1083,7 +1072,6 @@ impl ToolRouter {
             upstream_progress_lookup: DashMap::new(),
             notification_refresh_in_progress: AtomicBool::new(false),
             notification_refresh_pending: AtomicBool::new(false),
-            pending_tool_list_changed: AtomicBool::new(false),
             pending_resource_list_changed: AtomicBool::new(false),
             pending_prompt_list_changed: AtomicBool::new(false),
             recovery,
@@ -1552,12 +1540,21 @@ impl ToolRouter {
             .lock()
             .expect("published route mutex poisoned");
         let invalidate = *published != material_routes;
+        let mut tools_changed = false;
         self.continuation_registry
             .publish_with_invalidation(invalidate, || {
                 *published = material_routes;
+                tools_changed = self.cache.load().tools_all != snapshot.tools_all;
                 self.cache.store(snapshot);
-                CATALOG_REVISION.fetch_add(1, Ordering::Relaxed);
+                self.catalog_revision.fetch_add(1, Ordering::Relaxed);
             });
+        drop(published);
+        // The one place clients hear their tool list changed, whatever
+        // changed it: an upstream's own notice, a reload, a server going
+        // down or coming back, or a server needing sign-in.
+        if tools_changed {
+            self.publish_protocol_notification(ProtocolNotification::ToolListChanged);
+        }
     }
 
     /// Reserve one process-wide modern request slot before adapter code can
@@ -1843,9 +1840,6 @@ impl ToolRouter {
 
     fn schedule_list_changed_refresh(self: &Arc<Self>, notification: ProtocolNotification) {
         match notification {
-            ProtocolNotification::ToolListChanged => {
-                self.pending_tool_list_changed.store(true, Ordering::SeqCst);
-            }
             ProtocolNotification::ResourceListChanged => {
                 self.pending_resource_list_changed
                     .store(true, Ordering::SeqCst);
@@ -1912,12 +1906,6 @@ impl ToolRouter {
                     );
                 }
 
-                if router
-                    .pending_tool_list_changed
-                    .swap(false, Ordering::SeqCst)
-                {
-                    router.publish_protocol_notification(ProtocolNotification::ToolListChanged);
-                }
                 if router
                     .pending_resource_list_changed
                     .swap(false, Ordering::SeqCst)
