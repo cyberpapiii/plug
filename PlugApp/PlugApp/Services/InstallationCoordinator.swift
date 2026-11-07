@@ -289,11 +289,11 @@ final class InstallationCoordinator {
         } catch let error as DaemonServiceError {
             publishOperationalFailure(error)
         } catch let error as LegacyInstallError {
-            if case let .unrelatedShellCommand(path) = error {
+            if case .unrelatedShellCommand = error {
                 state = .repairableDrift(
                     InstallationDrift(
                         summary: "A local Plug command conflict needs repair",
-                        detail: "Another file is in the way at \(path.path). Move it, then try again."
+                        detail: error.localizedDescription
                     )
                 )
             } else {
@@ -673,7 +673,7 @@ final class InstallationCoordinator {
             state = .repairableDrift(
                 InstallationDrift(
                     summary: "A local Plug command conflict needs repair",
-                    detail: "Another file is in the way at \(path.path). Move it, then try again."
+                    detail: LegacyInstallError.unrelatedShellCommand(path).localizedDescription
                 )
             )
         case let .unknownLocalState(paths):
@@ -724,13 +724,10 @@ final class InstallationCoordinator {
     }
 
     /// The detail lands in the menu bar panel, so it has to read as a
-    /// sentence. Errors that wrote one are used as is; the rest fall back to
-    /// their case name, which at least says what happened.
+    /// sentence. An error that wrote none falls back to its case name, which
+    /// at least says what happened.
     private static func describe(_ error: Error) -> String {
-        if let localized = error as? LocalizedError, let description = localized.errorDescription {
-            return description
-        }
-        return String(describing: error)
+        (error as? LocalizedError)?.errorDescription ?? String(describing: error)
     }
 }
 

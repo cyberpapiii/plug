@@ -9,9 +9,20 @@ protocol LaunchdJobInspecting: Sendable {
     ) async throws -> DaemonOwnershipState
 }
 
-enum LaunchdJobInspectionError: Error, Equatable {
+enum LaunchdJobInspectionError: LocalizedError, Equatable {
     case listFailed(status: Int32, detail: String)
     case printFailed(label: String, status: Int32, detail: String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .listFailed(status, detail):
+            "Plug could not list launchd jobs (launchctl exit status \(status)). \(detail)"
+                .trimmingCharacters(in: .whitespaces)
+        case let .printFailed(label, status, detail):
+            "Plug could not read the launchd job \(label) (launchctl exit status \(status)). \(detail)"
+                .trimmingCharacters(in: .whitespaces)
+        }
+    }
 }
 
 /// Reads launchd the way `plug doctor` does (`plug/src/service.rs`): the

@@ -56,6 +56,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- When Plug cannot start, stop or check its service, the app says why in a sentence. The reconcile panel used to show a Swift case name such as `verificationFailed(expectedVersion: "0.9.1", actualVersion: nil)`, and a failed restart or switch showed a generic "error 6".
 - The mark beside Plug in the menu bar panel takes the same colour as in the window and Settings. With one server down it was red in the panel and orange everywhere else.
 - A client on another Mac that signs in over the network no longer shows as connected in the row of the same app on this Mac, and the Clients page counts connected clients the way the menu bar panel does.
 - Activity shows a call under the server that answered it. A tool a group rule files under another name, such as `Gmail__send_message` on Google Workspace, used to show "Gmail" as its server and Gmail's icon, while Show Server opened Workspace. Activity's search also finds a call by the client name its row shows.

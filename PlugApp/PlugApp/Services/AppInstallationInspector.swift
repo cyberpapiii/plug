@@ -8,7 +8,7 @@ struct AppSignatureEvidence: Equatable, Sendable {
     let teamID: String
 }
 
-enum AppInstallationError: Error, Equatable {
+enum AppInstallationError: LocalizedError, Equatable {
     case invalidSignature
     case wrongBundleIdentifier(String)
     case untrustedTeam(String)
@@ -16,6 +16,25 @@ enum AppInstallationError: Error, Equatable {
     case missingEmbeddedExecutable(URL)
     case embeddedVersionFailure(String)
     case versionMismatch(app: String, embedded: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidSignature:
+            "This copy of Plug is damaged or was changed. Download Plug again and replace this copy."
+        case let .wrongBundleIdentifier(identifier):
+            "This app is \(identifier), not Plug. Download Plug again and replace this copy."
+        case let .untrustedTeam(team):
+            "This copy of Plug was signed by someone else (\(team)). Download Plug again and replace this copy."
+        case .missingMetadata:
+            "This copy of Plug does not say which version it is. Download Plug again and replace this copy."
+        case .missingEmbeddedExecutable:
+            "This copy of Plug has no service inside it. Download Plug again and replace this copy."
+        case let .embeddedVersionFailure(detail):
+            "Plug's service could not say which version it is: \(detail)"
+        case let .versionMismatch(app, embedded):
+            "This copy of Plug is version \(app), and the service inside it is \(embedded). Download Plug again and replace this copy."
+        }
+    }
 }
 
 protocol AppInstallationInspecting: Sendable {
