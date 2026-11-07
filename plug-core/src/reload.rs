@@ -59,8 +59,6 @@ pub(crate) fn server_change(old: &ServerConfig, new: &ServerConfig) -> ServerCha
         max_concurrent,
         health_check_interval_secs,
         circuit_breaker_enabled,
-        // Read into the router when Plug starts; reported by `diff_configs`.
-        enrichment: _,
         tool_renames,
         tool_groups,
         sandbox,
@@ -177,7 +175,7 @@ fn settings_needing_restart(old: &Config, new: &Config) -> Vec<String> {
         // Watches and supervision policy are read from the live config.
         events: _,
         supervision: _,
-        // Classified per server by `server_change`, except `enrichment` below.
+        // Classified per server by `server_change`.
         servers: _,
         http,
     } = new;

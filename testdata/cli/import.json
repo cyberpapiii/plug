@@ -13,7 +13,6 @@
         "circuit_breaker_enabled": true,
         "command": "npx",
         "enabled": true,
-        "enrichment": false,
         "env": {
           "GITHUB_TOKEN": "$GITHUB_TOKEN"
         },
@@ -42,7 +41,6 @@
         "circuit_breaker_enabled": true,
         "command": null,
         "enabled": true,
-        "enrichment": false,
         "env": {},
         "health_check_interval_secs": 60,
         "max_concurrent": 1,
@@ -77,7 +75,6 @@
             "circuit_breaker_enabled": true,
             "command": "npx",
             "enabled": true,
-            "enrichment": false,
             "env": {
               "GITHUB_TOKEN": "$GITHUB_TOKEN"
             },
@@ -113,7 +110,6 @@
             "circuit_breaker_enabled": true,
             "command": null,
             "enabled": true,
-            "enrichment": false,
             "env": {},
             "health_check_interval_secs": 60,
             "max_concurrent": 1,

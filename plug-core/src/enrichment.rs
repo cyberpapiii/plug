@@ -1,9 +1,8 @@
-//! Safety hints read from a tool's name. `plug` normalizes every routed
-//! tool, so clients do not inherit obviously wrong upstream hints.
+//! Safety hints read from a tool's name, description, input schema and
+//! `x-actions`. `plug` normalizes every routed tool, so clients do not
+//! inherit obviously wrong upstream hints.
 
 use rmcp::model::Tool;
-
-const LEGACY_TASK_SUPPORT_META_KEY: &str = "plug.dev/legacy-task-support";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolSemantics {
@@ -28,19 +27,10 @@ enum ToolWorldScope {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolTaskSupportMode {
-    Forbidden,
-    Optional,
-    Required,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ToolProfile {
     semantics: ToolSemantics,
     repeatability: ToolRepeatability,
     world_scope: ToolWorldScope,
-    task_support: ToolTaskSupportMode,
 }
 
 impl ToolProfile {
@@ -55,13 +45,11 @@ impl ToolProfile {
 
         let repeatability = infer_repeatability(name, semantics, tool.description.as_deref());
         let world_scope = infer_world_scope(tool, name);
-        let task_support = infer_task_support(tool, name, semantics);
 
         Self {
             semantics,
             repeatability,
             world_scope,
-            task_support,
         }
     }
 }
@@ -545,53 +533,6 @@ fn infer_world_scope(tool: &Tool, name: &str) -> ToolWorldScope {
     ToolWorldScope::Unknown
 }
 
-fn infer_task_support(tool: &Tool, name: &str, semantics: ToolSemantics) -> ToolTaskSupportMode {
-    if let Some(task_support) = tool
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.0.get(LEGACY_TASK_SUPPORT_META_KEY))
-        .and_then(serde_json::Value::as_str)
-    {
-        return match task_support {
-            "forbidden" => ToolTaskSupportMode::Forbidden,
-            "optional" => ToolTaskSupportMode::Optional,
-            "required" => ToolTaskSupportMode::Required,
-            _ => ToolTaskSupportMode::Unknown,
-        };
-    }
-
-    let lowered_name = name.to_ascii_lowercase();
-    let description = tool
-        .description
-        .as_deref()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let long_running_signals = [
-        "watch",
-        "stream",
-        "tail",
-        "deep_researcher_start",
-        "takes 15 seconds",
-        "takes 15 seconds to 2 minutes",
-        "long-running",
-        "background",
-        "while user tests manually",
-    ];
-
-    if long_running_signals
-        .iter()
-        .any(|signal| lowered_name.contains(signal) || description.contains(signal))
-    {
-        return match semantics {
-            ToolSemantics::ReadOnly => ToolTaskSupportMode::Optional,
-            ToolSemantics::Mutating | ToolSemantics::Destructive => ToolTaskSupportMode::Required,
-            ToolSemantics::Unknown => ToolTaskSupportMode::Optional,
-        };
-    }
-
-    ToolTaskSupportMode::Unknown
-}
-
 /// Normalize annotation hints from a tool name.
 ///
 /// For high-confidence semantic prefixes, `plug` prefers the tool-name-derived
@@ -627,19 +568,6 @@ pub fn normalize_annotations(tool: &mut Tool, name: &str) {
         ToolWorldScope::Closed => annotations.open_world_hint = Some(false),
         ToolWorldScope::Open => annotations.open_world_hint = Some(true),
         ToolWorldScope::Unknown => {}
-    }
-
-    let task_support = match profile.task_support {
-        ToolTaskSupportMode::Forbidden => Some("forbidden"),
-        ToolTaskSupportMode::Optional => Some("optional"),
-        ToolTaskSupportMode::Required => Some("required"),
-        ToolTaskSupportMode::Unknown => None,
-    };
-    if let Some(task_support) = task_support {
-        tool.meta.get_or_insert_with(Default::default).0.insert(
-            LEGACY_TASK_SUPPORT_META_KEY.to_string(),
-            task_support.into(),
-        );
     }
 }
 
@@ -1122,25 +1050,6 @@ mod tests {
         assert_eq!(
             comments_tool.annotations.as_ref().unwrap().open_world_hint,
             Some(true)
-        );
-    }
-
-    #[test]
-    fn task_support_is_inferred_for_long_running_tools_without_upstream_execution() {
-        let mut tool: Tool = serde_json::from_value(json!({
-            "name": "deep_researcher_start",
-            "description": "Start an AI research agent that searches, reads, and writes a detailed report. Takes 15 seconds to 2 minutes.",
-            "inputSchema": { "type": "object" }
-        }))
-        .unwrap();
-
-        normalize_annotations(&mut tool, "deep_researcher_start");
-        assert_eq!(
-            tool.meta
-                .as_ref()
-                .and_then(|meta| meta.0.get(LEGACY_TASK_SUPPORT_META_KEY))
-                .and_then(serde_json::Value::as_str),
-            Some("required")
         );
     }
 
