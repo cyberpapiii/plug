@@ -1,5 +1,5 @@
 use super::server::HttpState;
-use crate::notifications::{NotificationTarget, ProtocolNotification};
+use crate::notifications::{ListsChanged, NotificationTarget, ProtocolNotification};
 use crate::session::SseMessage;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -35,18 +35,7 @@ impl HttpState {
                                         }
                                     }
                                     Some(_) => {}
-                                    None => {
-                                        if let Some(kind) =
-                                            crate::session::BroadcastKind::of(&notification)
-                                            && let Some(message) =
-                                                notification_to_sse_message(&notification)
-                                        {
-                                            let router = &state.router;
-                                            state.sessions.broadcast_where(message, kind, &|grant| {
-                                                may_be_told(router, grant, &notification)
-                                            });
-                                        }
-                                    }
+                                    None => broadcast(&state, &notification),
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -63,6 +52,10 @@ impl HttpState {
                                         message,
                                         crate::session::BroadcastKind::Logging,
                                     );
+                                }
+                                // What was skipped may have said a list changed.
+                                for notification in ListsChanged::ALL.notifications() {
+                                    broadcast(&state, &notification);
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -116,6 +109,19 @@ impl HttpState {
                     }
                 }
             }
+        });
+    }
+}
+
+/// Send `notification`, which names no session, to every session that may
+/// hear it.
+fn broadcast(state: &HttpState, notification: &ProtocolNotification) {
+    if let Some(kind) = crate::session::BroadcastKind::of(notification)
+        && let Some(message) = notification_to_sse_message(notification)
+    {
+        let router = &state.router;
+        state.sessions.broadcast_where(message, kind, &|grant| {
+            may_be_told(router, grant, notification)
         });
     }
 }
@@ -275,6 +281,53 @@ mod tests {
                 .any(|event| event.contains("notifications/tools/list_changed")),
             "expected SSE stream to contain tools/list_changed notification, got {events:?}"
         );
+    }
+
+    /// Notifications the fan-out fell too far behind to read may have said a
+    /// list changed, so every session is told all three may have.
+    #[tokio::test]
+    async fn a_lagged_fan_out_tells_sessions_every_list_may_have_changed() {
+        let state = test_state();
+        let app = build_router(state.clone());
+        let session_id = state.sessions.create_session().unwrap();
+        bind_for_tests(&state.sessions, &session_id, None);
+        let sse_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, &session_id)
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+        let sse_resp = app.oneshot(sse_req).await.unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+
+        // Word for another session, more than the channel holds, published
+        // before the fan-out task runs.
+        for step in 0..200 {
+            state
+                .router
+                .publish_protocol_notification(ProtocolNotification::Progress {
+                    target: NotificationTarget::Http {
+                        session_id: Arc::from("another-session"),
+                    },
+                    params: ProgressNotificationParam::new(
+                        ProgressToken(NumberOrString::Number(step)),
+                        0.5,
+                    ),
+                });
+        }
+
+        let events = collect_sse_events(sse_resp.into_body(), 5).await;
+        for method in [
+            "notifications/tools/list_changed",
+            "notifications/resources/list_changed",
+            "notifications/prompts/list_changed",
+        ] {
+            assert!(
+                events.iter().any(|event| event.contains(method)),
+                "{method} missing from {events:?}"
+            );
+        }
     }
 
     #[tokio::test]

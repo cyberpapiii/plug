@@ -21,7 +21,7 @@ use crate::config::{Config, LazyToolsConfig};
 use crate::downstream_identity::DownstreamTransport;
 use crate::error::ProtocolError;
 use crate::health::Recovery;
-use crate::notifications::{NotificationTarget, ProtocolNotification};
+use crate::notifications::{ListsChanged, NotificationTarget, ProtocolNotification};
 use crate::server::ServerManager;
 use crate::tasks::{TaskOwner, TaskStore, TaskUpstreamRef};
 use crate::tool_patterns::is_disabled_tool;
@@ -54,8 +54,12 @@ fn outward_tool_result(server_id: &str, result: &mut CallToolResult) {
 pub(crate) struct RouterSnapshot {
     /// Every routed tool, priority-sorted.
     pub tools_all: Arc<Vec<Tool>>,
-    /// Meta-tool-only list exposed when meta-tool mode is enabled.
+    /// What a Bridge client is listed before it loads any tool: Plug's
+    /// search tool, unless `disabled_tools` hides it.
     pub meta_tools_all: Arc<Vec<Tool>>,
+    /// What a legacy meta-tool client is listed, less what `disabled_tools`
+    /// hides.
+    pub legacy_meta_tools: Arc<Vec<Tool>>,
     /// Tool name → (server name, original tool name) routing table.
     pub routes: HashMap<String, (String, String)>,
     /// ASCII-lowercased route keys for O(1) case-insensitive tools/call fallback.
@@ -95,6 +99,7 @@ impl Default for RouterSnapshot {
         Self {
             tools_all: Arc::default(),
             meta_tools_all: Arc::new(build_meta_tools()),
+            legacy_meta_tools: Arc::new(build_legacy_meta_tools()),
             routes: HashMap::new(),
             routes_lower: HashMap::new(),
             tools_by_name: HashMap::new(),
@@ -111,6 +116,19 @@ impl Default for RouterSnapshot {
 }
 
 impl RouterSnapshot {
+    /// Which lists a client is served differ between `previous` and this
+    /// snapshot, whatever surface the client lists tools through.
+    fn lists_changed_since(&self, previous: &Self) -> ListsChanged {
+        ListsChanged {
+            tools: self.tools_all != previous.tools_all
+                || self.meta_tools_all != previous.meta_tools_all
+                || self.legacy_meta_tools != previous.legacy_meta_tools,
+            resources: self.resources_all != previous.resources_all
+                || self.resource_templates_all != previous.resource_templates_all,
+            prompts: self.prompts_all != previous.prompts_all,
+        }
+    }
+
     /// Whether the tool listed as `name` only reads, so a watch may call it
     /// again and again. Only the server's own word counts. Plug's reading of
     /// a tool's name is a guess, good for sorting a list and not for calling
@@ -419,8 +437,6 @@ pub struct ToolRouter {
     upstream_progress_lookup: DashMap<UpstreamProgressKey, u64>,
     notification_refresh_in_progress: AtomicBool,
     notification_refresh_pending: AtomicBool,
-    pending_resource_list_changed: AtomicBool,
-    pending_prompt_list_changed: AtomicBool,
     /// Reconnects a server whose session failed under a call. Weak: the
     /// runtime behind it owns this router.
     recovery: Weak<dyn Recovery>,
@@ -1078,8 +1094,6 @@ impl ToolRouter {
             upstream_progress_lookup: DashMap::new(),
             notification_refresh_in_progress: AtomicBool::new(false),
             notification_refresh_pending: AtomicBool::new(false),
-            pending_resource_list_changed: AtomicBool::new(false),
-            pending_prompt_list_changed: AtomicBool::new(false),
             recovery,
             artifact_store: ArtifactStore::new(),
             resource_subscriptions,
@@ -1196,11 +1210,11 @@ impl ToolRouter {
         };
         let servers_changed = server_blocks(&current) != server_blocks(&next);
         self.client_access.store(Arc::new(next));
-        self.publish_protocol_notification(ProtocolNotification::ToolListChanged);
-        if servers_changed {
-            self.publish_protocol_notification(ProtocolNotification::ResourceListChanged);
-            self.publish_protocol_notification(ProtocolNotification::PromptListChanged);
-        }
+        self.publish_lists_changed(ListsChanged {
+            tools: true,
+            resources: servers_changed,
+            prompts: servers_changed,
+        });
     }
 
     /// Take the owner's `disabled_tools`. The catalog they filter changes at
@@ -1553,20 +1567,24 @@ impl ToolRouter {
             .lock()
             .expect("published route mutex poisoned");
         let invalidate = *published != material_routes;
-        let mut tools_changed = false;
+        let mut changed = ListsChanged::default();
         self.continuation_registry
             .publish_with_invalidation(invalidate, || {
                 *published = material_routes;
-                tools_changed = self.cache.load().tools_all != snapshot.tools_all;
+                changed = snapshot.lists_changed_since(&self.cache.load());
                 self.cache.store(snapshot);
                 self.catalog_revision.fetch_add(1, Ordering::Relaxed);
             });
         drop(published);
-        // The one place clients hear their tool list changed, whatever
-        // changed it: an upstream's own notice, a reload, a server going
-        // down or coming back, or a server needing sign-in.
-        if tools_changed {
-            self.publish_protocol_notification(ProtocolNotification::ToolListChanged);
+        // The one place clients hear their lists changed, whatever changed
+        // them: an upstream's own notice, a reload, a server going down or
+        // coming back, or a server needing sign-in.
+        self.publish_lists_changed(changed);
+    }
+
+    fn publish_lists_changed(&self, changed: ListsChanged) {
+        for notification in changed.notifications() {
+            self.publish_protocol_notification(notification);
         }
     }
 
@@ -1851,19 +1869,10 @@ impl ToolRouter {
             })
     }
 
-    fn schedule_list_changed_refresh(self: &Arc<Self>, notification: ProtocolNotification) {
-        match notification {
-            ProtocolNotification::ResourceListChanged => {
-                self.pending_resource_list_changed
-                    .store(true, Ordering::SeqCst);
-            }
-            ProtocolNotification::PromptListChanged => {
-                self.pending_prompt_list_changed
-                    .store(true, Ordering::SeqCst);
-            }
-            _ => {}
-        }
-
+    /// Refresh the catalog after an upstream says one of its lists changed,
+    /// once for a burst of such notices. Clients hear about whatever list the
+    /// refresh finds different.
+    pub fn schedule_catalog_refresh(self: &Arc<Self>) {
         self.notification_refresh_pending
             .store(true, Ordering::SeqCst);
 
@@ -1920,19 +1929,6 @@ impl ToolRouter {
                 }
 
                 if router
-                    .pending_resource_list_changed
-                    .swap(false, Ordering::SeqCst)
-                {
-                    router.publish_protocol_notification(ProtocolNotification::ResourceListChanged);
-                }
-                if router
-                    .pending_prompt_list_changed
-                    .swap(false, Ordering::SeqCst)
-                {
-                    router.publish_protocol_notification(ProtocolNotification::PromptListChanged);
-                }
-
-                if router
                     .notification_refresh_pending
                     .swap(false, Ordering::SeqCst)
                 {
@@ -1960,18 +1956,6 @@ impl ToolRouter {
                 break;
             }
         });
-    }
-
-    pub fn schedule_tool_list_changed_refresh(self: &Arc<Self>) {
-        self.schedule_list_changed_refresh(ProtocolNotification::ToolListChanged);
-    }
-
-    pub fn schedule_resource_list_changed_refresh(self: &Arc<Self>) {
-        self.schedule_list_changed_refresh(ProtocolNotification::ResourceListChanged);
-    }
-
-    pub fn schedule_prompt_list_changed_refresh(self: &Arc<Self>) {
-        self.schedule_list_changed_refresh(ProtocolNotification::PromptListChanged);
     }
 
     fn track_call(&self) -> InFlightCall<'_> {
@@ -2889,10 +2873,20 @@ impl ToolRouter {
             futures::future::join_all(prune_futs).await;
         }
 
+        let enabled = |tools: Vec<Tool>| -> Arc<Vec<Tool>> {
+            Arc::new(
+                tools
+                    .into_iter()
+                    .filter(|tool| !is_disabled_tool(&disabled_tools, tool.name.as_ref()))
+                    .collect(),
+            )
+        };
         let snapshot = Arc::new(
             RouterSnapshot {
                 routes,
                 tools_all,
+                meta_tools_all: enabled(build_meta_tools()),
+                legacy_meta_tools: enabled(build_legacy_meta_tools()),
                 resources_all,
                 resource_templates_all,
                 prompts_all,
@@ -4424,15 +4418,15 @@ impl crate::server::UpstreamEvents for ToolRouter {
     }
 
     fn tools_changed(self: Arc<Self>) {
-        self.schedule_tool_list_changed_refresh();
+        self.schedule_catalog_refresh();
     }
 
     fn resources_changed(self: Arc<Self>) {
-        self.schedule_resource_list_changed_refresh();
+        self.schedule_catalog_refresh();
     }
 
     fn prompts_changed(self: Arc<Self>) {
-        self.schedule_prompt_list_changed_refresh();
+        self.schedule_catalog_refresh();
     }
 
     fn progress(&self, server: &str, params: ProgressNotificationParam) {

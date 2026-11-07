@@ -217,15 +217,32 @@ fn a_watch_takes_the_servers_word_over_the_tools_name() {
     assert_eq!(with(None, None), Some(false));
 }
 
-#[tokio::test(start_paused = true)]
-async fn schedule_resource_list_changed_refresh_debounces_bursts() {
+/// A router serving one upstream whose resources the test can change.
+async fn router_with_resource_server(
+    resources: &[&str],
+) -> (Arc<ToolRouter>, Arc<SubscribableUpstreamState>) {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(sm, RouterConfig::default()));
-    let mut rx = router.subscribe_notifications();
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
+    let state = SubscribableUpstreamState::new(resources);
+    sm.replace_server(
+        "mock",
+        connect_subscribable_upstream("mock", Arc::clone(&state)).await,
+    )
+    .await;
+    router.refresh_tools().await;
+    (router, state)
+}
 
-    router.schedule_resource_list_changed_refresh();
-    router.schedule_resource_list_changed_refresh();
-    router.schedule_resource_list_changed_refresh();
+#[tokio::test(start_paused = true)]
+async fn a_burst_of_upstream_list_notices_refreshes_once() {
+    let (router, state) = router_with_resource_server(&["memory://old"]).await;
+    let mut rx = router.subscribe_notifications();
+    let lists_before = state.list_count();
+
+    state.set_resources(&["memory://new"]);
+    router.schedule_catalog_refresh();
+    router.schedule_catalog_refresh();
+    router.schedule_catalog_refresh();
 
     tokio::task::yield_now().await;
     assert!(
@@ -247,16 +264,17 @@ async fn schedule_resource_list_changed_refresh_debounces_bursts() {
         rx.try_recv().is_err(),
         "burst should coalesce into a single notification"
     );
+    assert_eq!(state.list_count(), lists_before + 1);
 }
 
 #[tokio::test(start_paused = true)]
 async fn refresh_task_releases_in_progress_flag_for_subsequent_refresh() {
-    let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(sm, RouterConfig::default()));
+    let (router, state) = router_with_resource_server(&["memory://a"]).await;
     let mut rx = router.subscribe_notifications();
 
     // First refresh cycle.
-    router.schedule_resource_list_changed_refresh();
+    state.set_resources(&["memory://b"]);
+    router.schedule_catalog_refresh();
     tokio::time::advance(LIST_CHANGED_REFRESH_DEBOUNCE).await;
     let first = rx.recv().await.expect("first notification");
     assert_eq!(first, ProtocolNotification::ResourceListChanged);
@@ -274,10 +292,83 @@ async fn refresh_task_releases_in_progress_flag_for_subsequent_refresh() {
 
     // A second schedule must therefore spawn a fresh task and publish
     // again.
-    router.schedule_resource_list_changed_refresh();
+    state.set_resources(&["memory://c"]);
+    router.schedule_catalog_refresh();
     tokio::time::advance(LIST_CHANGED_REFRESH_DEBOUNCE).await;
     let second = rx.recv().await.expect("second notification");
     assert_eq!(second, ProtocolNotification::ResourceListChanged);
+}
+
+/// An upstream's notice that turns out to change nothing tells no client
+/// anything, and a list that changed without a notice (a server gone, a
+/// reload) is told all the same.
+#[tokio::test]
+async fn clients_hear_of_exactly_the_lists_a_refresh_changed() {
+    let (router, state) = router_with_resource_server(&["memory://a"]).await;
+    let mut rx = router.subscribe_notifications();
+    let heard = |rx: &mut broadcast::Receiver<ProtocolNotification>| {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>()
+    };
+
+    router.refresh_tools().await;
+    assert_eq!(heard(&mut rx), Vec::new());
+
+    state.set_resources(&["memory://a", "memory://b"]);
+    router.refresh_tools().await;
+    assert_eq!(
+        heard(&mut rx),
+        vec![ProtocolNotification::ResourceListChanged]
+    );
+
+    *state.templates.lock().unwrap() = vec!["memory://{id}".to_string()];
+    router.refresh_tools().await;
+    assert_eq!(
+        heard(&mut rx),
+        vec![ProtocolNotification::ResourceListChanged]
+    );
+
+    router.server_manager.stop_server("mock").await;
+    router.refresh_tools().await;
+    assert_eq!(
+        heard(&mut rx),
+        vec![ProtocolNotification::ResourceListChanged]
+    );
+}
+
+/// Turning Plug's own search tool off changes what a Bridge client is
+/// listed though no upstream tool changed.
+#[tokio::test]
+async fn hiding_a_meta_tool_tells_clients_their_tool_list_changed() {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(
+        sm,
+        RouterConfig {
+            lazy_tools: LazyToolsConfig {
+                mode: crate::types::LazyToolSetting::Bridge,
+                ..LazyToolsConfig::default()
+            },
+            ..RouterConfig::default()
+        },
+    ));
+    router.refresh_tools().await;
+    let listed = || {
+        router
+            .list_tools()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(listed(), vec!["plug__search_tools".to_string()]);
+    let mut rx = router.subscribe_notifications();
+
+    router.set_disabled_tools(&["plug__search_tools".to_string()]);
+    router.refresh_tools().await;
+    assert_eq!(listed(), Vec::<String>::new());
+    assert_eq!(
+        rx.try_recv().ok(),
+        Some(ProtocolNotification::ToolListChanged)
+    );
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]
@@ -1085,6 +1176,7 @@ async fn disabled_bridge_search_tool_is_not_visible_or_callable() {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, RouterConfig::default());
     router.set_disabled_tools(&["plug__search_tools".to_string()]);
+    router.refresh_tools().await;
 
     assert!(
         router

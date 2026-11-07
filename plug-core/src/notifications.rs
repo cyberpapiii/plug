@@ -41,6 +41,35 @@ pub enum ProtocolNotification {
     },
 }
 
+/// Which of the lists every client is served may have changed: tools,
+/// resources (with resource templates) and prompts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListsChanged {
+    pub tools: bool,
+    pub resources: bool,
+    pub prompts: bool,
+}
+
+impl ListsChanged {
+    /// All three, for a client that may have missed word of a change.
+    pub const ALL: Self = Self {
+        tools: true,
+        resources: true,
+        prompts: true,
+    };
+
+    /// The `list_changed` notifications that say so.
+    pub fn notifications(self) -> impl Iterator<Item = ProtocolNotification> {
+        [
+            (self.tools, ProtocolNotification::ToolListChanged),
+            (self.resources, ProtocolNotification::ResourceListChanged),
+            (self.prompts, ProtocolNotification::PromptListChanged),
+        ]
+        .into_iter()
+        .filter_map(|(changed, notification)| changed.then_some(notification))
+    }
+}
+
 /// One downstream connection: a legacy HTTP session, or a `plug connect`
 /// session on the daemon socket.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

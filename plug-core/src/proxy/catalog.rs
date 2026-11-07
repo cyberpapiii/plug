@@ -538,8 +538,8 @@ impl super::ToolRouter {
     pub fn list_tools(&self) -> Arc<Vec<Tool>> {
         let snapshot = self.cache.load();
         match self.config.lazy_surface_for_client(ClientType::Unknown) {
-            LazyToolSurface::Bridge => Arc::new(self.filter_meta_tools(&snapshot.meta_tools_all)),
-            LazyToolSurface::LegacyMeta => Arc::new(self.filtered_legacy_meta_tools()),
+            LazyToolSurface::Bridge => Arc::clone(&snapshot.meta_tools_all),
+            LazyToolSurface::LegacyMeta => Arc::clone(&snapshot.legacy_meta_tools),
             LazyToolSurface::Standard | LazyToolSurface::Native => Arc::clone(&snapshot.tools_all),
         }
     }
@@ -730,7 +730,7 @@ impl super::ToolRouter {
             self.config.lazy_surface_for_client(client_type),
             LazyToolSurface::LegacyMeta
         ) {
-            return Arc::new(self.filtered_legacy_meta_tools());
+            return Arc::clone(&self.cache.load().legacy_meta_tools);
         }
         let snapshot = self.cache.load();
         // This client's own surface is Standard or Native here, so with
@@ -749,7 +749,7 @@ impl super::ToolRouter {
 
     fn bridge_visible_tools(&self, session_key: Option<&str>) -> Arc<Vec<Tool>> {
         let snapshot = self.cache.load();
-        let mut tools = self.filter_meta_tools(&snapshot.meta_tools_all);
+        let mut tools = (*snapshot.meta_tools_all).clone();
         let Some(session_key) = session_key else {
             return Arc::new(tools);
         };
@@ -765,23 +765,6 @@ impl super::ToolRouter {
             }
         }
         Arc::new(tools)
-    }
-
-    fn filter_meta_tools(&self, tools: &[Tool]) -> Vec<Tool> {
-        let disabled_tools = self.disabled_tools.load();
-        tools
-            .iter()
-            .filter(|tool| !is_disabled_tool(&disabled_tools, tool.name.as_ref()))
-            .cloned()
-            .collect()
-    }
-
-    fn filtered_legacy_meta_tools(&self) -> Vec<Tool> {
-        let disabled_tools = self.disabled_tools.load();
-        build_legacy_meta_tools()
-            .into_iter()
-            .filter(|tool| !is_disabled_tool(&disabled_tools, tool.name.as_ref()))
-            .collect()
     }
 
     pub fn list_resources(&self) -> Arc<Vec<Resource>> {
