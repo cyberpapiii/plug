@@ -2,13 +2,13 @@
 //!
 //! `requests.json` holds every request Plug.app sends and `responses.json`
 //! every reply it reads, by the name the app's own golden tests use;
-//! `chunked_response.json` holds the frames of a reply too large for one;
-//! `cli_requests.json` and `cli_responses.json` what only the command line
-//! sends and reads.
+//! `chunked_response.json` holds the frames of a reply too large for one.
 //! Both sides are checked against the same files: here, that the files are
 //! what the daemon's types write and read; in
 //! `PlugApp/PlugIPC/Tests/PlugIPCTests/GoldenPayloadTests.swift`, that the
-//! app writes the same requests and reads the same replies.
+//! app writes the same requests and reads the same replies. What only
+//! `plug connect` and the command line send and read has no golden: they are
+//! the daemon's own binary, and a daemon of another version is refused.
 //!
 //! A change to the wire fails this test. When the change is meant, run it
 //! with `PLUG_REGENERATE_GOLDENS=1` to rewrite the files, and change the app
@@ -541,52 +541,6 @@ fn reload_report() -> plug_core::reload::ReloadReport {
     }
 }
 
-/// Requests only the command line sends, so the app's golden tests leave
-/// them out.
-fn cli_requests() -> BTreeMap<&'static str, IpcRequest> {
-    BTreeMap::from([
-        (
-            "import_servers",
-            mutate(OperatorMutation::ImportServers {
-                servers: vec![plug_core::import::ImportedServer {
-                    name: "github".to_string(),
-                    source_target: "cursor".to_string(),
-                    server: ServerConfig {
-                        command: Some("npx".to_string()),
-                        args: vec!["-y".to_string(), "github-mcp".to_string()],
-                        ..Default::default()
-                    },
-                }],
-            }),
-        ),
-        (
-            "set_lazy_tools",
-            mutate(OperatorMutation::SetLazyTools {
-                client: "claude-code".to_string(),
-                setting: plug_core::types::LazyToolSetting::Bridge,
-            }),
-        ),
-    ])
-}
-
-/// Replies only the command line reads.
-fn cli_responses() -> BTreeMap<&'static str, IpcResponse> {
-    BTreeMap::from([(
-        "imported",
-        IpcResponse::OperatorMutation {
-            result: OperatorMutationResult {
-                server: None,
-                disabled_tools: None,
-                imported: Some(vec![OperatorServerSummary::from_config(
-                    "github-cursor".to_string(),
-                    &ServerConfig::default(),
-                )]),
-            },
-            reload: reload_report(),
-        },
-    )])
-}
-
 fn responses() -> BTreeMap<&'static str, IpcResponse> {
     BTreeMap::from([
         (
@@ -787,8 +741,6 @@ fn check(name: &str, contents: String) {
 fn the_goldens_are_what_the_daemon_writes() {
     check("requests.json", pretty(&requests()));
     check("responses.json", pretty(&responses()));
-    check("cli_requests.json", pretty(&cli_requests()));
-    check("cli_responses.json", pretty(&cli_responses()));
     check("chunked_response.json", pretty(&chunked_response()));
     // What the daemon fills in for a field a server leaves out, which is how
     // the app sends a setting the person did not set.
@@ -806,8 +758,6 @@ fn the_goldens_are_what_the_daemon_writes() {
         files,
         [
             "chunked_response.json",
-            "cli_requests.json",
-            "cli_responses.json",
             "requests.json",
             "responses.json",
             "server_config_default.json"
@@ -816,17 +766,14 @@ fn the_goldens_are_what_the_daemon_writes() {
     );
 }
 
-/// The daemon reads every request the app and the command line send as
-/// what it was written from.
+fn golden(name: &str) -> BTreeMap<String, serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(dir().join(name)).unwrap()).unwrap()
+}
+
+/// The daemon reads every request the app sends as what it was written from.
 #[test]
 fn the_daemon_reads_every_request_golden() {
-    let golden = |name: &str| -> BTreeMap<String, serde_json::Value> {
-        serde_json::from_str(&std::fs::read_to_string(dir().join(name)).unwrap()).unwrap()
-    };
-    for (name, value) in golden("requests.json")
-        .into_iter()
-        .chain(golden("cli_requests.json"))
-    {
+    for (name, value) in golden("requests.json") {
         let request: IpcRequest = serde_json::from_value(value.clone())
             .unwrap_or_else(|e| panic!("request {name} does not parse: {e}"));
         assert_eq!(
@@ -854,6 +801,49 @@ const NOT_SENT_BY_THE_APP: &[&str] = &[
     "UpdateSession",
 ];
 
+/// Changes only the command line asks for.
+const MUTATIONS_NOT_SENT_BY_THE_APP: &[&str] = &["ImportServers", "SetLazyTools"];
+
+/// Replies the app never reads: they answer `plug connect`, the command line,
+/// or a request the app does not send.
+const NOT_READ_BY_THE_APP: &[&str] = &[
+    "AuthStateChanged",
+    "AuthStatus",
+    "CancelledNotification",
+    "Capabilities",
+    "LiveSessions",
+    "LoggingNotification",
+    "McpResponse",
+    "ModernDownstreamGate",
+    "ModernDownstreamGateChanged",
+    "Pong",
+    "ProgressNotification",
+    "PromptListChangedNotification",
+    "Registered",
+    "ResourceListChangedNotification",
+    "ResourceUpdatedNotification",
+    "ToolListChangedNotification",
+];
+
+/// The wire names of `T` less `exempt`, each of which must be one of them.
+fn shown_to_the_app<T: serde::de::DeserializeOwned>(
+    unknown: serde_json::Value,
+    exempt: &[&str],
+) -> std::collections::BTreeSet<String> {
+    let names = wire_names::<T>(unknown);
+    for name in exempt {
+        assert!(
+            names.iter().any(|known| known == name),
+            "{name} is not a {}",
+            std::any::type_name::<T>()
+        );
+    }
+    names
+        .into_iter()
+        .filter(|name| !exempt.contains(&name.as_str()))
+        .collect()
+}
+
 /// Every variant of `T` by its wire name, as serde lists them when it meets
 /// one it does not know: "unknown variant `x`, expected one of `A`, `B`".
 fn wire_names<T: serde::de::DeserializeOwned>(unknown: serde_json::Value) -> Vec<String> {
@@ -873,19 +863,11 @@ fn wire_names<T: serde::de::DeserializeOwned>(unknown: serde_json::Value) -> Vec
 }
 
 /// A request, operator request, change or block kind added to the wire
-/// without a golden fails here: in `requests.json` when the app sends it, in
-/// `cli_requests.json` when only the command line does.
+/// without a golden in `requests.json` fails here, unless the app never
+/// sends it.
 #[test]
 fn every_request_has_a_golden() {
-    let golden: BTreeMap<String, serde_json::Value> = ["requests.json", "cli_requests.json"]
-        .into_iter()
-        .flat_map(|file| {
-            serde_json::from_str::<BTreeMap<String, serde_json::Value>>(
-                &std::fs::read_to_string(dir().join(file)).unwrap(),
-            )
-            .unwrap()
-        })
-        .collect();
+    let golden = golden("requests.json");
     let shown = |pointer: &str| -> std::collections::BTreeSet<String> {
         golden
             .values()
@@ -894,18 +876,11 @@ fn every_request_has_a_golden() {
     };
     let unknown_tag = serde_json::json!({"type": "\u{0}"});
 
-    let requests = wire_names::<IpcRequest>(unknown_tag.clone());
-    for name in NOT_SENT_BY_THE_APP {
-        assert!(
-            requests.iter().any(|request| request == name),
-            "{name} is not a request"
-        );
-    }
-    let sent: std::collections::BTreeSet<String> = requests
-        .into_iter()
-        .filter(|request| !NOT_SENT_BY_THE_APP.contains(&request.as_str()))
-        .collect();
-    assert_eq!(shown("/type"), sent, "IpcRequest");
+    assert_eq!(
+        shown("/type"),
+        shown_to_the_app::<IpcRequest>(unknown_tag.clone(), NOT_SENT_BY_THE_APP),
+        "IpcRequest"
+    );
     assert_eq!(
         shown("/request/type"),
         wire_names::<OperatorRequest>(unknown_tag.clone())
@@ -915,9 +890,7 @@ fn every_request_has_a_golden() {
     );
     assert_eq!(
         shown("/request/mutation/type"),
-        wire_names::<OperatorMutation>(unknown_tag)
-            .into_iter()
-            .collect(),
+        shown_to_the_app::<OperatorMutation>(unknown_tag, MUTATIONS_NOT_SENT_BY_THE_APP),
         "OperatorMutation"
     );
     assert_eq!(
@@ -926,6 +899,21 @@ fn every_request_has_a_golden() {
             .into_iter()
             .collect(),
         "ClientBlockKind"
+    );
+}
+
+/// A reply added to the wire without a golden in `responses.json` fails
+/// here, unless the app never reads it.
+#[test]
+fn every_response_has_a_golden() {
+    let shown: std::collections::BTreeSet<String> = golden("responses.json")
+        .values()
+        .filter_map(|response| response["type"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        shown,
+        shown_to_the_app::<IpcResponse>(serde_json::json!({"type": "\u{0}"}), NOT_READ_BY_THE_APP),
+        "IpcResponse"
     );
 }
 
