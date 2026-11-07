@@ -89,6 +89,27 @@ pub struct ToolRisk {
     pub effective: Option<ToolAnnotations>,
 }
 
+impl Default for RouterSnapshot {
+    /// No server's tools, resources or prompts: only Plug's own meta tools.
+    fn default() -> Self {
+        Self {
+            tools_all: Arc::default(),
+            meta_tools_all: Arc::new(build_meta_tools()),
+            routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
+            resources_all: Arc::default(),
+            resource_templates_all: Arc::default(),
+            prompts_all: Arc::default(),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
+        }
+    }
+}
+
 impl RouterSnapshot {
     /// Whether the tool listed as `name` only reads, so a watch may call it
     /// again and again. Only the server's own word counts. Plug's reading of
@@ -962,21 +983,7 @@ impl ToolRouter {
     ) -> Self {
         let (protocol_notification_tx, _) = broadcast::channel(128);
         let (logging_tx, _) = broadcast::channel(512);
-        let cache = Arc::new(ArcSwap::from_pointee(RouterSnapshot {
-            routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            tools_all: Arc::new(Vec::new()),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
-        }));
+        let cache = Arc::new(ArcSwap::from_pointee(RouterSnapshot::default()));
         let resource_subscriptions = subscriptions::SubscriptionRegistry::new(tracker);
         // Drains resolve an entry's recorded owning server to a live handle
         // at drain time — never trusting a handle resolved earlier from the
@@ -2885,11 +2892,7 @@ impl ToolRouter {
         let snapshot = Arc::new(
             RouterSnapshot {
                 routes,
-                routes_lower: HashMap::new(),
-                tools_by_name: HashMap::new(),
-                tools_by_name_lower: HashMap::new(),
                 tools_all,
-                meta_tools_all: Arc::new(build_meta_tools()),
                 resources_all,
                 resource_templates_all,
                 prompts_all,
@@ -2897,6 +2900,7 @@ impl ToolRouter {
                 prompt_routes,
                 tool_definition_fingerprints,
                 tool_risk_inventory,
+                ..Default::default()
             }
             .with_indexes(),
         );

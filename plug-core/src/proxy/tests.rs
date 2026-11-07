@@ -139,17 +139,7 @@ pub(super) fn router_with_git_commit_tool() -> ToolRouter {
                 Cow::Borrowed("Create a git commit"),
                 Arc::new(serde_json::Map::new()),
             )]),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -523,18 +513,8 @@ fn store_plain_tools_snapshot(router: &ToolRouter, tools: Vec<Tool>) {
     router.cache.store(Arc::new(
         RouterSnapshot {
             routes,
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
             tools_all: Arc::new(tools),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -631,17 +611,7 @@ fn search_tools_returns_matches() {
         RouterSnapshot {
             routes,
             tools_all: Arc::new(tools),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -769,17 +739,7 @@ fn meta_tool_mode_lists_only_meta_tools() {
         RouterSnapshot {
             routes,
             tools_all: Arc::new(tools),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -804,23 +764,12 @@ fn client_lazy_bridge_policy_lists_meta_tools_for_opencode() {
 
     router.cache.store(Arc::new(
         RouterSnapshot {
-            routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
             tools_all: Arc::new(vec![Tool::new(
                 Cow::Borrowed("git__commit"),
                 Cow::Borrowed("Create a git commit"),
                 Arc::new(serde_json::Map::new()),
             )]),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -856,17 +805,7 @@ fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
                 Cow::Borrowed("Create a git commit"),
                 Arc::new(serde_json::Map::new()),
             )]),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -917,17 +856,7 @@ fn bridge_search_keeps_session_working_set_bounded() {
         RouterSnapshot {
             routes,
             tools_all: Arc::new(tools),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -979,17 +908,7 @@ fn bridge_search_publish_tool_list_changed_for_newly_loaded_matches() {
                 Cow::Borrowed("Create a git commit"),
                 Arc::new(serde_json::Map::new()),
             )]),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -1040,17 +959,7 @@ async fn bridge_session_rejects_unloaded_direct_tool_call() {
                 Cow::Borrowed("Create a git commit"),
                 Arc::new(serde_json::Map::new()),
             )]),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -1222,17 +1131,7 @@ fn synthesized_capabilities_include_tasks_when_tools_exist() {
         RouterSnapshot {
             routes,
             tools_all: Arc::new(tools),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -1335,18 +1234,7 @@ fn case_insensitive_route_lookup() {
     router.cache.store(Arc::new(
         RouterSnapshot {
             routes,
-            tools_all: Arc::new(Vec::new()),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -1385,18 +1273,7 @@ async fn call_tool_times_out_waiting_for_semaphore() {
     router.cache.store(Arc::new(
         RouterSnapshot {
             routes,
-            tools_all: Arc::new(Vec::new()),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -1496,19 +1373,8 @@ fn list_tools_page_for_client_uses_cursor_pagination() {
         .collect();
     router.cache.store(Arc::new(
         RouterSnapshot {
-            routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
             tools_all: Arc::new(tools),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -2847,19 +2713,8 @@ async fn cancelled_refresh_leader_does_not_wedge_waiting_refresh() {
 /// none of the pass's own reconciliation — classify, rebind, sweep — runs).
 fn publish_route_snapshot(router: &ToolRouter, uri: &str, server_id: &str) {
     router.replace_snapshot(RouterSnapshot {
-        routes: HashMap::new(),
-        routes_lower: HashMap::new(),
-        tools_by_name: HashMap::new(),
-        tools_by_name_lower: HashMap::new(),
-        tools_all: Arc::new(Vec::new()),
-        meta_tools_all: Arc::new(build_meta_tools()),
-        resources_all: Arc::new(Vec::new()),
-        resource_templates_all: Arc::new(Vec::new()),
-        prompts_all: Arc::new(Vec::new()),
         resource_routes: HashMap::from([(uri.to_string(), server_id.to_string())]),
-        prompt_routes: HashMap::new(),
-        tool_definition_fingerprints: HashMap::new(),
-        tool_risk_inventory: HashMap::new(),
+        ..Default::default()
     });
 }
 
@@ -2878,18 +2733,7 @@ fn publish_tool_route_snapshot_with_original(
             tool.to_string(),
             (server_id.to_string(), original_name.to_string()),
         )]),
-        tools_all: Arc::new(Vec::new()),
-        meta_tools_all: Arc::new(build_meta_tools()),
-        resources_all: Arc::new(Vec::new()),
-        resource_templates_all: Arc::new(Vec::new()),
-        prompts_all: Arc::new(Vec::new()),
-        resource_routes: HashMap::new(),
-        routes_lower: HashMap::new(),
-        tools_by_name: HashMap::new(),
-        tools_by_name_lower: HashMap::new(),
-        prompt_routes: HashMap::new(),
-        tool_definition_fingerprints: HashMap::new(),
-        tool_risk_inventory: HashMap::new(),
+        ..Default::default()
     });
 }
 
@@ -2909,17 +2753,7 @@ fn publish_tool_route_snapshot_with_metadata(
             Cow::Borrowed(description),
             Arc::new(serde_json::Map::new()),
         )]),
-        meta_tools_all: Arc::new(build_meta_tools()),
-        resources_all: Arc::new(Vec::new()),
-        resource_templates_all: Arc::new(Vec::new()),
-        prompts_all: Arc::new(Vec::new()),
-        resource_routes: HashMap::new(),
-        routes_lower: HashMap::new(),
-        tools_by_name: HashMap::new(),
-        tools_by_name_lower: HashMap::new(),
-        prompt_routes: HashMap::new(),
-        tool_definition_fingerprints: HashMap::new(),
-        tool_risk_inventory: HashMap::new(),
+        ..Default::default()
     });
 }
 
@@ -4897,12 +4731,6 @@ fn a_block_on_a_tool_covers_a_watch_of_it_and_survives_a_rename() {
 fn router_with_blocked_resources_and_prompts() -> Arc<ToolRouter> {
     let router = ToolRouter::new(Arc::new(ServerManager::new()), RouterConfig::default());
     router.replace_snapshot(RouterSnapshot {
-        routes: HashMap::new(),
-        routes_lower: HashMap::new(),
-        tools_by_name: HashMap::new(),
-        tools_by_name_lower: HashMap::new(),
-        tools_all: Arc::new(Vec::new()),
-        meta_tools_all: Arc::new(build_meta_tools()),
         resources_all: Arc::new(vec![
             Resource::new("git://log", "git__log"),
             Resource::new("slack://inbox", "slack__inbox"),
@@ -4931,8 +4759,7 @@ fn router_with_blocked_resources_and_prompts() -> Arc<ToolRouter> {
                 ("slack".to_string(), "digest".to_string()),
             ),
         ]),
-        tool_definition_fingerprints: HashMap::new(),
-        tool_risk_inventory: HashMap::new(),
+        ..Default::default()
     });
     let mut clients = std::collections::BTreeMap::new();
     clients.insert(

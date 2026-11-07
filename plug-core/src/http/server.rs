@@ -766,7 +766,6 @@ mod tests {
 
     use axum::body::Body;
     use http::Request as HttpRequest;
-    use std::collections::HashMap;
     use std::time::Duration;
     use tower::ServiceExt;
 
@@ -1839,10 +1838,6 @@ mod tests {
         // Give the router a routable tool so `enqueue_tool_task` can create a
         // task record for this session without needing a live upstream.
         state.router.replace_snapshot(crate::proxy::RouterSnapshot {
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-
             routes: std::collections::HashMap::from([(
                 "git__commit".to_string(),
                 ("git".to_string(), "commit".to_string()),
@@ -1852,14 +1847,7 @@ mod tests {
                 std::borrow::Cow::Borrowed("Create a git commit"),
                 Arc::new(serde_json::Map::new()),
             )]),
-            meta_tools_all: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: std::collections::HashMap::new(),
-            prompt_routes: std::collections::HashMap::new(),
-            tool_definition_fingerprints: std::collections::HashMap::new(),
-            tool_risk_inventory: std::collections::HashMap::new(),
+            ..Default::default()
         });
 
         let owner = crate::downstream_identity::http_session_task_owner(&session_id);
@@ -2188,10 +2176,6 @@ mod tests {
         ));
 
         state.router.replace_snapshot(crate::proxy::RouterSnapshot {
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-
             routes: std::collections::HashMap::from([(
                 "Git__commit".to_string(),
                 ("git".to_string(), "commit".to_string()),
@@ -2206,13 +2190,7 @@ mod tests {
                 std::borrow::Cow::Borrowed("Search tools"),
                 Arc::new(serde_json::Map::new()),
             )]),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: std::collections::HashMap::new(),
-            prompt_routes: std::collections::HashMap::new(),
-            tool_definition_fingerprints: std::collections::HashMap::new(),
-            tool_risk_inventory: std::collections::HashMap::new(),
+            ..Default::default()
         });
 
         let app = build_router(state.clone());

@@ -5705,23 +5705,11 @@ mod tests {
             crate::proxy::RouterConfig::default(),
         ));
         router.replace_snapshot(crate::proxy::RouterSnapshot {
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-
             routes: std::collections::HashMap::from([(
                 "Mock__echo".to_string(),
                 ("missing".to_string(), "echo".to_string()),
             )]),
-            tools_all: Arc::new(Vec::new()),
-            meta_tools_all: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: std::collections::HashMap::new(),
-            prompt_routes: std::collections::HashMap::new(),
-            tool_definition_fingerprints: std::collections::HashMap::new(),
-            tool_risk_inventory: std::collections::HashMap::new(),
+            ..Default::default()
         });
 
         let principal = crate::types::PrincipalId::downstream_oauth(

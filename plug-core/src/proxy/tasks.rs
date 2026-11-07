@@ -1549,18 +1549,7 @@ mod tests {
         );
         router.replace_snapshot(RouterSnapshot {
             routes,
-            tools_all: Arc::new(Vec::new()),
-            meta_tools_all: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         });
 
         let owner = crate::downstream_identity::http_session_task_owner("session-native-race");
@@ -1651,18 +1640,7 @@ mod tests {
         );
         router.replace_snapshot(RouterSnapshot {
             routes,
-            tools_all: Arc::new(Vec::new()),
-            meta_tools_all: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         });
 
         let owner = crate::downstream_identity::http_session_task_owner("session-full-peer-queue");
@@ -1689,18 +1667,7 @@ mod tests {
         );
         router.replace_snapshot(RouterSnapshot {
             routes,
-            tools_all: Arc::new(Vec::new()),
-            meta_tools_all: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         });
     }
 
