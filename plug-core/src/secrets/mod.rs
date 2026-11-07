@@ -313,24 +313,17 @@ impl Stores {
     /// The stores every Plug has.
     ///
     /// Where the isolated test credential backend is installed, the Keychain
-    /// is a map in memory and the file is a temporary one, so no test reads
-    /// or writes the secrets of the person running it.
+    /// is a map in memory, so no test reads or writes the Keychain of the
+    /// person running it. A test build's config folder is already temporary.
     pub fn builtin() -> Self {
+        let file = file::File::new(crate::config::env::env_file_path(
+            &crate::paths::default_config_path(),
+        ));
         #[cfg(any(test, feature = "test-helpers"))]
         if crate::oauth::uses_test_credentials() {
-            let path =
-                std::env::temp_dir().join(format!("plug-test-secrets-{}", std::process::id()));
-            return Self::with_keychain_and_file(
-                memory::keychain(),
-                file::File::new(path.join(".env")),
-            );
+            return Self::with_keychain_and_file(memory::keychain(), file);
         }
-        Self::with_keychain_and_file(
-            Arc::new(Keychain),
-            file::File::new(crate::config::env::env_file_path(
-                &crate::paths::default_config_path(),
-            )),
-        )
+        Self::with_keychain_and_file(Arc::new(Keychain), file)
     }
 
     fn with_keychain_and_file(keychain: Arc<dyn SecretStore>, file: file::File) -> Self {
