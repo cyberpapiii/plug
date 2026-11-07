@@ -122,18 +122,50 @@ fn initialize_refused_with(error: &rmcp::service::ClientInitializeError) -> Opti
 /// Whether a streamable-HTTP upstream refused `initialize` in a way that asks
 /// for a new sign-in. See [`crate::transport::refusal_needs_sign_in`].
 fn initialize_needs_sign_in(error: &rmcp::service::ClientInitializeError) -> bool {
-    initialize_http_error(error).is_some_and(|error| {
-        refused_with(error).is_some_and(|status| {
-            crate::transport::refusal_needs_sign_in(status, error.auth_challenge())
-        })
-    })
+    initialize_http_error(error)
+        .and_then(http_refusal_needs_sign_in)
+        .unwrap_or(false)
+}
+
+/// [`crate::transport::refusal_needs_sign_in`] on a streamable-HTTP refusal;
+/// `None` when `error` is not one.
+fn http_refusal_needs_sign_in(error: &StreamableHttpError<reqwest::Error>) -> Option<bool> {
+    let status = refused_with(error)?;
+    Some(crate::transport::refusal_needs_sign_in(
+        status,
+        error.auth_challenge(),
+    ))
+}
+
+/// [`crate::transport::refusal_needs_sign_in`] on a cause that carries the
+/// HTTP status it was refused with; `None` for any other cause.
+fn status_refusal_needs_sign_in(cause: &(dyn std::error::Error + 'static)) -> Option<bool> {
+    use crate::transport::sse_client::LegacySseError;
+    if let Some(error) = cause.downcast_ref::<rmcp::service::ClientInitializeError>() {
+        return initialize_http_error(error).and_then(http_refusal_needs_sign_in);
+    }
+    match cause.downcast_ref::<LegacySseError>()? {
+        error @ LegacySseError::UnexpectedStatus { .. } => Some(error.refuses_credentials()),
+        _ => None,
+    }
+}
+
+/// Whether `error` means the server refused Plug's credentials. A refusal
+/// that carries its HTTP status is judged by that status; only an error
+/// without one has its words read, as [`crate::oauth::is_auth_rejection`]
+/// does for rmcp's text-only OAuth failures.
+fn refuses_credentials(error: &anyhow::Error) -> bool {
+    match error.chain().find_map(status_refusal_needs_sign_in) {
+        Some(needs_sign_in) => needs_sign_in,
+        None => crate::oauth::is_auth_rejection(error),
+    }
 }
 
 /// Whether `error`, from starting `config`, means its owner has to sign in
 /// again: the server signs in with OAuth and refused the credentials. Any
 /// other failure is retried.
 pub(crate) fn start_needs_sign_in(config: &ServerConfig, error: &anyhow::Error) -> bool {
-    config.is_oauth() && crate::oauth::is_auth_rejection(error)
+    config.is_oauth() && refuses_credentials(error)
 }
 
 /// Whether a legacy-mode HTTP upstream that refused `initialize` is an old
@@ -1498,7 +1530,7 @@ impl ServerManager {
                 let text = format!("{error:#}");
                 if secrets.iter().any(|secret| text.contains(secret.as_str())) {
                     let redacted = failure::redact(&text, &secrets);
-                    Err(if crate::oauth::is_auth_rejection(&error) {
+                    Err(if refuses_credentials(&error) {
                         anyhow::Error::new(crate::oauth::AuthRejected(redacted))
                     } else {
                         anyhow::anyhow!(redacted)
@@ -2903,21 +2935,71 @@ mod tests {
         assert_eq!(metadata.icons, None);
     }
 
+    /// A streamable-HTTP `initialize` that failed with `error`.
+    fn initialize_failed(
+        error: StreamableHttpError<reqwest::Error>,
+    ) -> rmcp::service::ClientInitializeError {
+        rmcp::service::ClientInitializeError::TransportError {
+            error: rmcp::transport::DynamicTransportError::from_parts(
+                "test",
+                std::any::TypeId::of::<()>(),
+                Box::new(error),
+            ),
+            context: "send initialize request".into(),
+        }
+    }
+
+    #[test]
+    fn a_403_asking_for_more_scope_needs_sign_in_and_others_do_not() {
+        let forbidden = |challenge: &str| {
+            initialize_failed(StreamableHttpError::InsufficientScope(
+                rmcp::transport::streamable_http_client::InsufficientScopeError::new(
+                    challenge.to_string(),
+                    None,
+                ),
+            ))
+        };
+        assert!(initialize_needs_sign_in(&forbidden(
+            r#"Bearer error="insufficient_scope", scope="files:write""#
+        )));
+        assert!(!initialize_needs_sign_in(&forbidden(
+            r#"Bearer realm="files""#
+        )));
+    }
+
+    #[test]
+    fn a_refusal_with_a_status_is_judged_by_it_not_by_its_words() {
+        let mut oauth = test_server_config();
+        oauth.auth = Some("oauth".to_string());
+        let http = anyhow::Error::new(initialize_failed(
+            StreamableHttpError::UnexpectedServerResponse(
+                "HTTP 403 Forbidden: Unauthorized (401)".into(),
+            ),
+        ))
+        .context("failed to connect to HTTP upstream");
+        assert!(!start_needs_sign_in(&oauth, &http), "{http:#}");
+        let sse = anyhow::Error::new(
+            crate::transport::sse_client::LegacySseError::UnexpectedStatus {
+                status: reqwest::StatusCode::FORBIDDEN,
+                challenge: None,
+                body: "Unauthorized".into(),
+            },
+        )
+        .context("failed to connect to legacy SSE upstream");
+        assert!(!start_needs_sign_in(&oauth, &sse), "{sse:#}");
+        // rmcp reports its OAuth failures only as text.
+        let text = anyhow::anyhow!("OAuth authorization required");
+        assert!(start_needs_sign_in(&oauth, &text));
+        assert!(!start_needs_sign_in(&test_server_config(), &text));
+    }
+
     #[test]
     fn only_a_405_to_a_legacy_mode_initialize_falls_back_to_sse() {
-        let refused =
-            |message: &'static str| rmcp::service::ClientInitializeError::TransportError {
-                error: rmcp::transport::DynamicTransportError::from_parts(
-                    "test",
-                    std::any::TypeId::of::<()>(),
-                    Box::new(
-                        StreamableHttpError::<reqwest::Error>::UnexpectedServerResponse(
-                            message.into(),
-                        ),
-                    ),
-                ),
-                context: "send initialize request".into(),
-            };
+        let refused = |message: &'static str| {
+            initialize_failed(StreamableHttpError::UnexpectedServerResponse(
+                message.into(),
+            ))
+        };
         let method_not_allowed = refused("HTTP 405 Method Not Allowed: ");
         assert!(should_fallback_to_legacy_sse(
             UpstreamProtocolMode::Legacy,
