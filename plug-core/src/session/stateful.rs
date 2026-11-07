@@ -549,18 +549,22 @@ impl SessionStore {
         {
             return Err(SessionError::NotFound);
         }
+        if self
+            .left_grants
+            .lock()
+            .expect("left grants mutex poisoned")
+            .iter()
+            .any(|(id, left_grant)| id == session_id && grant != Some(left_grant.as_str()))
         {
-            let mut left = self.left_grants.lock().expect("left grants mutex poisoned");
-            if let Some(index) = left.iter().position(|(id, _)| id == session_id) {
-                if grant != Some(left[index].1.as_str()) {
-                    return Err(SessionError::NotFound);
-                }
-                left.remove(index);
-            }
+            return Err(SessionError::NotFound);
         }
         if !self.make_room() {
             return Err(SessionError::TooMany);
         }
+        self.left_grants
+            .lock()
+            .expect("left grants mutex poisoned")
+            .retain(|(id, _)| id != session_id);
         self.insert_new(session_id.to_owned());
         if let Some(mut entry) = self.sessions.get_mut(session_id) {
             entry.reopened = true;
@@ -962,6 +966,26 @@ mod tests {
                 Err(SessionError::NotFound)
             ));
         }
+        assert!(store.reopen_session(&id, Some("client-abc")).unwrap());
+    }
+
+    #[test]
+    fn a_reopen_refused_for_room_keeps_the_session_tied_to_its_grant() {
+        let store = SessionStore::new(60, 1);
+        let id = store.create_session().unwrap();
+        bind(&store, &id, Some(("client-abc", always())));
+        store.backdate_for_tests(&id);
+        let other = store.create_session().unwrap();
+
+        assert!(matches!(
+            store.reopen_session(&id, Some("client-abc")),
+            Err(SessionError::TooMany)
+        ));
+        assert!(store.end(&other, SessionEnd::ClosedByClient));
+        assert!(matches!(
+            store.reopen_session(&id, None),
+            Err(SessionError::NotFound)
+        ));
         assert!(store.reopen_session(&id, Some("client-abc")).unwrap());
     }
 
