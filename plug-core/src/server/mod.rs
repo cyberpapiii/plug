@@ -102,15 +102,31 @@ fn refused_with(error: &StreamableHttpError<reqwest::Error>) -> Option<u16> {
     }
 }
 
-/// [`refused_with`] for a failed `initialize` over streamable HTTP.
-fn initialize_refused_with(error: &rmcp::service::ClientInitializeError) -> Option<u16> {
+/// The streamable-HTTP error behind a failed `initialize`.
+fn initialize_http_error(
+    error: &rmcp::service::ClientInitializeError,
+) -> Option<&StreamableHttpError<reqwest::Error>> {
     let rmcp::service::ClientInitializeError::TransportError { error, .. } = error else {
         return None;
     };
     error
         .error
         .downcast_ref::<StreamableHttpError<reqwest::Error>>()
-        .and_then(refused_with)
+}
+
+/// [`refused_with`] for a failed `initialize` over streamable HTTP.
+fn initialize_refused_with(error: &rmcp::service::ClientInitializeError) -> Option<u16> {
+    initialize_http_error(error).and_then(refused_with)
+}
+
+/// Whether a streamable-HTTP upstream refused `initialize` in a way that asks
+/// for a new sign-in. See [`crate::transport::refusal_needs_sign_in`].
+fn initialize_needs_sign_in(error: &rmcp::service::ClientInitializeError) -> bool {
+    initialize_http_error(error).is_some_and(|error| {
+        refused_with(error).is_some_and(|status| {
+            crate::transport::refusal_needs_sign_in(status, error.auth_challenge())
+        })
+    })
 }
 
 /// Whether `error`, from starting `config`, means its owner has to sign in
@@ -1655,7 +1671,7 @@ impl ServerManager {
                         Err(e) => {
                             let fall_back =
                                 should_fallback_to_legacy_sse(effective_protocol_mode, &e);
-                            let error = if initialize_refused_with(&e) == Some(401) {
+                            let error = if initialize_needs_sign_in(&e) {
                                 anyhow::Error::new(crate::oauth::AuthRejected(e.to_string()))
                             } else {
                                 anyhow::Error::new(e)
@@ -2930,6 +2946,10 @@ mod tests {
             initialize_refused_with(&refused("HTTP 401 Unauthorized: ")),
             Some(401)
         );
+        assert!(initialize_needs_sign_in(&refused(
+            "HTTP 401 Unauthorized: "
+        )));
+        assert!(!initialize_needs_sign_in(&refused("HTTP 403 Forbidden: ")));
     }
 
     #[tokio::test]

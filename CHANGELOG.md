@@ -58,6 +58,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Plug reads a server's refusal the same way over HTTP and legacy SSE, as the MCP spec does: a 401, or a 403 asking for more scope, means you need to sign in again; any other 403 is an error that is retried. A 403 asking for more scope over HTTP used to show as an error, and a plain 403 over SSE used to ask for sign-in.
 - A server that signs in with OAuth and refuses its token when Plug reconnects it now asks you to sign in again. It used to show as down and be redialled every minute, forever, with no sign-in prompt.
 - Connected clients are told their tool list changed whenever it does: after a reload adds or removes a server, when a server that went down comes back, and when a server needs you to sign in again. They used to hear only that a crashed server's tools had gone, and kept a stale list until they asked again. A server saying its tools changed when they did not is no longer passed on.
 - When Plug cannot start, stop or check its service, the app says why in a sentence. The reconcile panel used to show a Swift case name such as `verificationFailed(expectedVersion: "0.9.1", actualVersion: nil)`, and a failed restart or switch showed only an error number.

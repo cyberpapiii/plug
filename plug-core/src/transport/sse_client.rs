@@ -30,7 +30,12 @@ pub enum LegacySseError {
     #[error("invalid endpoint event payload: {0}")]
     InvalidEndpoint(String),
     #[error("unexpected SSE response status {status}: {body}")]
-    UnexpectedStatus { status: StatusCode, body: String },
+    UnexpectedStatus {
+        status: StatusCode,
+        /// The response's `WWW-Authenticate` value.
+        challenge: Option<String>,
+        body: String,
+    },
     #[error("unexpected SSE content type: {0:?}")]
     UnexpectedContentType(Option<String>),
     #[error("transport channel closed")]
@@ -44,8 +49,8 @@ impl LegacySseError {
     pub fn refuses_credentials(&self) -> bool {
         matches!(
             self,
-            Self::UnexpectedStatus { status, .. }
-                if *status == StatusCode::UNAUTHORIZED || *status == StatusCode::FORBIDDEN
+            Self::UnexpectedStatus { status, challenge, .. }
+                if super::refusal_needs_sign_in(status.as_u16(), challenge.as_deref())
         )
     }
 }
@@ -505,8 +510,7 @@ async fn open_sse_stream(
     let response = request.send().await?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(LegacySseError::UnexpectedStatus { status, body });
+        return Err(unexpected_status(response).await);
     }
 
     let content_type = response
@@ -551,8 +555,22 @@ async fn post_message(
         return Ok(());
     }
 
+    Err(unexpected_status(response).await)
+}
+
+async fn unexpected_status(response: reqwest::Response) -> LegacySseError {
+    let status = response.status();
+    let challenge = response
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let body = response.text().await.unwrap_or_default();
-    Err(LegacySseError::UnexpectedStatus { status, body })
+    LegacySseError::UnexpectedStatus {
+        status,
+        challenge,
+        body,
+    }
 }
 
 fn resolve_endpoint(base_url: &str, endpoint: &str) -> Result<Arc<str>, LegacySseError> {
