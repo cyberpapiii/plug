@@ -429,7 +429,9 @@ pub struct ToolRouter {
     /// changes it while clients are connected. A client with no entry gets
     /// everything.
     client_access: ArcSwap<HashMap<String, ClientAccess>>,
-    /// Runtime-owned mutable task state. Intentionally not part of the immutable router snapshot.
+    /// Runtime-owned mutable task state, not part of the router snapshot.
+    /// Reached through `with_task_store`, which finishes the cleanup of the
+    /// records each operation finds expired.
     task_store: Mutex<TaskStore>,
     /// One process-wide admission ledger shared by every downstream transport.
     admission_quotas: crate::protocol::AdmissionQuotas,
