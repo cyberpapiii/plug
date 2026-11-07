@@ -204,6 +204,10 @@ pub struct OffTool {
 pub struct OperatorSnapshot {
     pub runtime_version: String,
     pub uptime_secs: u64,
+    /// Different each time the daemon starts. Activity sequence numbers count
+    /// within one start, so a reader holding calls from another start reads
+    /// again from the beginning.
+    pub started_id: u64,
     /// Changes when the tool catalog could look different to a reader.
     ///
     /// The snapshot is polled every couple of seconds; the tool list is nearly

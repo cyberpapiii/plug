@@ -327,6 +327,9 @@ public struct WatchConfig: Encodable, Equatable, Sendable {
 public struct OperatorSnapshot: Codable, Equatable, Sendable {
     public let runtimeVersion: String
     public var uptimeSecs: UInt64
+    /// Different each time the daemon starts. Activity numbers its calls
+    /// within one start.
+    public let startedId: UInt64
     /// Changes when the daemon's tool list would answer differently. The
     /// snapshot is cheap and polled often; the tool list is nearly a megabyte
     /// and almost never changes between two polls.
@@ -353,7 +356,7 @@ public struct OperatorSnapshot: Codable, Equatable, Sendable {
 
     /// Before the first read nothing is known, so no name is split.
     public static let empty = OperatorSnapshot(
-        runtimeVersion: "", uptimeSecs: 0, toolCatalogRevision: 0, ownership: .unmanaged,
+        runtimeVersion: "", uptimeSecs: 0, startedId: 0, toolCatalogRevision: 0, ownership: .unmanaged,
         configuredServers: [], servers: [], liveSessions: [],
         upstreamAuth: [], downstreamClients: [], prefixDelimiter: ""
     )

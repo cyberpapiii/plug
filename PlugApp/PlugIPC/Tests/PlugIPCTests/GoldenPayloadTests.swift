@@ -188,6 +188,7 @@ final class GoldenPayloadTests: XCTestCase {
         guard case let .snapshot(snapshot) = try response("snapshot") else { return XCTFail() }
         XCTAssertEqual(snapshot.runtimeVersion, "0.9.0")
         XCTAssertEqual(snapshot.prefixDelimiter, ".")
+        XCTAssertEqual(snapshot.startedId, 9_000_000_000)
         XCTAssertEqual(snapshot.toolCatalogRevision, 7)
         XCTAssertEqual(snapshot.ownership, .appManaged)
         XCTAssertEqual(snapshot.configuredServers.map(\.name), ["healthy", "degraded", "failed", "auth-required", "notes"])

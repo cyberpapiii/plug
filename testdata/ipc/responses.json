@@ -316,6 +316,7 @@
     "snapshot": {
       "runtime_version": "0.9.0",
       "uptime_secs": 4000,
+      "started_id": 9000000000,
       "tool_catalog_revision": 7,
       "ownership": "app_managed",
       "configured_servers": [

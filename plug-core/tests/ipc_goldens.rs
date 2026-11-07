@@ -407,6 +407,7 @@ fn snapshot() -> OperatorSnapshot {
     OperatorSnapshot {
         runtime_version: "0.9.0".to_string(),
         uptime_secs: 4_000,
+        started_id: 9_000_000_000,
         tool_catalog_revision: 7,
         ownership: DaemonOwnershipMode::AppManaged,
         configured_servers: every_health()

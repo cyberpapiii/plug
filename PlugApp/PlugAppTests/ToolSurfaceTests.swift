@@ -440,7 +440,7 @@ final class AppRosterTests: XCTestCase {
         )
         // The daemon's own reply, read the way the app reads it.
         let snapshot = try decoder.decode(OperatorSnapshot.self, from: Data(#"""
-        {"runtime_version":"1","uptime_secs":1,"tool_catalog_revision":0,"ownership":"app_managed","prefix_delimiter":"__","configured_servers":[],
+        {"runtime_version":"1","uptime_secs":1,"started_id":1,"tool_catalog_revision":0,"ownership":"app_managed","prefix_delimiter":"__","configured_servers":[],
          "servers":[],"live_sessions":[],"upstream_auth":[],"downstream_clients":[],
          "client_places":[{"key":"claude-code","place":"Work laptop"}]}
         """#.utf8))
@@ -1019,5 +1019,32 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertEqual(SignInFacts.goneIn(expiresAt: 1_001_500, now: now), "gone in 25 min")
         XCTAssertEqual(SignInFacts.goneIn(expiresAt: 1_007_300, now: now), "gone in 2 hr")
         XCTAssertEqual(SignInFacts.day(1_000_000, now: now), "today")
+    }
+}
+
+final class ActivityLogTests: XCTestCase {
+    private func calls(_ sequences: ClosedRange<UInt64>) -> [ActivityEvent] {
+        sequences.map {
+            ActivityEvent(
+                sequence: $0, occurredAtMs: $0, client: nil, method: "tools/call",
+                server: "Figma", tool: "Figma__read", latencyMs: 1, outcome: .success
+            )
+        }
+    }
+
+    /// A daemon that started again numbers its calls from 1, however long the
+    /// old one ran, so the app reads it from the start and drops the old rows.
+    func testCallsFromAnotherDaemonStartReplaceTheOldOnes() {
+        var log = ActivityLog()
+        log.take(calls(1...40), after: log.cursor(startedId: 7), startedId: 7)
+        XCTAssertEqual(log.cursor(startedId: 7), 40)
+        log.take(calls(41...42), after: 40, startedId: 7)
+        XCTAssertEqual(log.events.last?.sequence, 42)
+
+        let cursor = log.cursor(startedId: 8)
+        XCTAssertEqual(cursor, 0)
+        log.take(calls(1...3), after: cursor, startedId: 8)
+        XCTAssertEqual(log.events.map(\.sequence), [1, 2, 3])
+        XCTAssertEqual(log.cursor(startedId: 8), 3)
     }
 }
