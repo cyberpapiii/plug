@@ -99,6 +99,21 @@ pub trait SecretStore: Send + Sync {
     }
 }
 
+/// The values of `server` that may be a reference.
+fn reference_values(server: &ServerConfig) -> impl Iterator<Item = &str> {
+    server
+        .auth_token
+        .iter()
+        .map(|token| token.as_str())
+        .chain(server.env.values().map(String::as_str))
+}
+
+/// Whether a value of `server` names `store` as its store, whether or not
+/// that store exists.
+pub fn names_store(server: &ServerConfig, store: &str) -> bool {
+    reference_values(server).any(|value| value.split_once(':').is_some_and(|(id, _)| id == store))
+}
+
 /// A secret name is safe to print, to pass to a command, and to use as a
 /// Keychain account.
 pub fn valid_name(name: &str) -> bool {
@@ -321,12 +336,7 @@ impl Stores {
     /// Whether `server` refers to any store, so the caller can prepare what
     /// a store needs before the first read.
     pub fn refers(&self, server: &ServerConfig) -> bool {
-        server
-            .auth_token
-            .iter()
-            .map(|token| token.as_str())
-            .chain(server.env.values().map(String::as_str))
-            .any(|value| self.parse(value).is_some())
+        reference_values(server).any(|value| self.parse(value).is_some())
     }
 
     pub fn with(mut self, id: &str, store: Arc<dyn SecretStore>) -> Self {

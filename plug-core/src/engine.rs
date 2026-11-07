@@ -1176,6 +1176,38 @@ mod tests {
         engine.shutdown().await;
     }
 
+    /// A server started before its store existed holds the reference as
+    /// text; the reload that adds the store restarts it.
+    #[tokio::test]
+    async fn a_reload_restarts_a_running_server_whose_store_it_adds() {
+        let mut config = Config::default();
+        let mut server = mock_stdio_server_config("echo", 1);
+        server.env.insert("TOKEN".into(), "vault:token".into());
+        config.servers.insert("vaulted".into(), server);
+        let engine = Engine::new(config.clone());
+        engine.start().await;
+        assert!(engine.server_manager().get_upstream("vaulted").is_some());
+
+        let dir = tempfile::tempdir().unwrap();
+        let read = dir.path().join("read");
+        config.secrets.stores.insert(
+            "vault".into(),
+            crate::config::CommandStoreConfig {
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!("touch '{}'; printf value", read.display()),
+                ],
+                timeout_secs: 5,
+            },
+        );
+        let report = engine.reload_config(config).await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.changed, vec!["vaulted"]);
+        assert!(read.exists(), "the restart followed the reference");
+        engine.shutdown().await;
+    }
+
     #[tokio::test]
     async fn clients_hear_a_reload_add_or_remove_a_servers_tools() {
         let engine = Engine::new(Config::default());
