@@ -364,6 +364,9 @@ async fn serve_router(
     serve_listener(listener, router, http, cancel).await
 }
 
+/// How long open HTTP connections get to finish once the daemon cancels.
+pub(crate) const HTTP_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Serve `router` on a bound listener, over TLS when `http` configures it,
 /// until `cancel` fires; then shut down gracefully.
 async fn serve_listener(
@@ -377,7 +380,7 @@ async fn serve_listener(
     let shutdown_handle = handle.clone();
     tokio::spawn(async move {
         cancel.cancelled().await;
-        shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+        shutdown_handle.graceful_shutdown(Some(HTTP_SHUTDOWN_GRACE));
     });
     let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
 

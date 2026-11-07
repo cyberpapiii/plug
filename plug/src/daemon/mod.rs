@@ -1830,9 +1830,9 @@ fn protocol_parse_error_response(frame: &[u8]) -> Option<IpcResponse> {
 // ──────────────────────── Unix signal handling ───────────────────────────────
 
 /// How long a signalled daemon lets running tool calls finish before it tears
-/// down. The launchd plists set `ExitTimeOut` to twenty seconds, which leaves
-/// room for upstream shutdown after the drain.
-const CALL_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
+/// down. It has to fit inside the plists' `ExitTimeOut`, which a service test
+/// checks.
+pub(crate) const CALL_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// When `stop` resolves, let running tool calls finish, then cancel. Clients
 /// and transports stay up while the calls drain, so an update or a stop does
