@@ -163,8 +163,10 @@ impl Layout {
         }
     }
 
-    /// `existing` with Plug's entry put in, replacing any it had.
-    pub fn link(&self, existing: &str, entry: &Value) -> anyhow::Result<String> {
+    /// `existing` with Plug's entry put in, replacing every entry it had
+    /// that [`is_plug_itself`].
+    pub fn link(&self, existing: &str, entry: &Value, plug: &HttpConfig) -> anyhow::Result<String> {
+        let is_plug = self.plug_names(existing, plug);
         match self.format {
             FileFormat::Json => {
                 let mut document = read_json(existing)?;
@@ -192,19 +194,20 @@ impl Layout {
                 Ok(pretty_json(&document))
             }
             FileFormat::Toml => {
-                let mut text = self.unlink_toml(existing);
+                let mut text = self.unlink_toml(existing, &is_plug);
                 if !text.is_empty() && !text.ends_with('\n') {
                     text.push('\n');
                 }
                 text.push_str(&self.snippet(entry));
                 Ok(text)
             }
-            FileFormat::Yaml => self.link_yaml(existing, entry),
+            FileFormat::Yaml => self.link_yaml(existing, entry, &is_plug),
         }
     }
 
-    /// `existing` without Plug's entry, and otherwise as it was.
-    pub fn unlink(&self, existing: &str) -> anyhow::Result<String> {
+    /// `existing` without the entries that are Plug, and otherwise as it was.
+    pub fn unlink(&self, existing: &str, plug: &HttpConfig) -> anyhow::Result<String> {
+        let is_plug = self.plug_names(existing, plug);
         match self.format {
             FileFormat::Json => {
                 let mut document = read_json(existing)?;
@@ -215,18 +218,42 @@ impl Layout {
                 }
                 Ok(pretty_json(&document))
             }
-            FileFormat::Toml => Ok(self.unlink_toml(existing)),
-            FileFormat::Yaml => Ok(unlink_yaml(existing, self.yaml_key())),
+            FileFormat::Toml => Ok(self.unlink_toml(existing, &is_plug)),
+            FileFormat::Yaml => Ok(unlink_yaml(existing, self.yaml_key(), &is_plug)),
         }
     }
 
-    /// Plug's entry, if the file has one.
-    pub fn read_plug(&self, content: &str) -> Option<ServerEntry> {
+    /// Plug's entry, if the file has one: the one named as Plug's entry is,
+    /// else the first that is Plug itself under another name.
+    pub fn read_plug(&self, content: &str, plug: &HttpConfig) -> Option<ServerEntry> {
+        self.find_plug(content, plug).map(|(_, entry)| entry)
+    }
+
+    /// [`Self::read_plug`], with the entry's name.
+    fn find_plug(&self, content: &str, plug: &HttpConfig) -> Option<(String, ServerEntry)> {
         let servers = self.servers(content).ok()??;
-        servers
+        let named = servers
             .iter()
             .find(|(name, _)| is_plug(name))
-            .and_then(|(_, entry)| read_entry(entry))
+            .and_then(|(name, entry)| Some((name.clone(), read_entry(entry)?)));
+        named.or_else(|| {
+            self.entries(content)
+                .ok()?
+                .into_iter()
+                .find(|(name, entry)| is_plug_itself(name, entry, plug))
+        })
+    }
+
+    /// Whether a server name in `content` is one of Plug's entries.
+    fn plug_names(&self, content: &str, plug: &HttpConfig) -> impl Fn(&str) -> bool + use<> {
+        let renamed: Vec<String> = self
+            .entries(content)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(name, entry)| is_plug_itself(name, entry, plug))
+            .map(|(name, _)| name)
+            .collect();
+        move |name: &str| is_plug(name) || renamed.iter().any(|plug| plug == name)
     }
 
     /// Every server in the file but Plug itself, which serves at `plug`.
@@ -247,7 +274,7 @@ impl Layout {
         // A file Plug was linked into twice has two `[mcp_servers.plug]`
         // tables, which no TOML parser accepts.
         let content = match self.format {
-            FileFormat::Toml => self.unlink_toml(content),
+            FileFormat::Toml => self.unlink_toml(content, &is_plug),
             _ => content.to_string(),
         };
         Ok(self
@@ -278,11 +305,14 @@ impl Layout {
             }),
             FileFormat::Toml => content
                 .lines()
-                .filter(|line| self.toml_plug_header(line.trim()) == Some(TomlHeader::Entry))
+                .filter(|line| {
+                    self.toml_server_header(line.trim())
+                        .is_some_and(|(name, header)| header == TomlHeader::Entry && is_plug(&name))
+                })
                 .count(),
             FileFormat::Yaml => {
                 let lines: Vec<String> = content.lines().map(str::to_string).collect();
-                yaml_plug_lines(&lines, self.yaml_key()).len()
+                yaml_entry_lines(&lines, self.yaml_key(), &is_plug).len()
             }
         }
     }
@@ -302,14 +332,19 @@ impl Layout {
         }
     }
 
-    /// `content` with Plug's stdio entry running `command` with `args`, and
-    /// every other field and line left as it was.
+    /// `content` with the entry [`Self::read_plug`] reads running `command`
+    /// with `args`, and every other field and line left as it was.
     pub fn set_plug_command(
         &self,
         content: &str,
+        plug: &HttpConfig,
         command: &str,
         args: &[&str],
     ) -> anyhow::Result<String> {
+        let (entry_name, _) = self
+            .find_plug(content, plug)
+            .ok_or_else(|| anyhow::anyhow!("missing Plug entry"))?;
+        let is_entry = |name: &str| name == entry_name;
         match self.format {
             FileFormat::Json => {
                 let mut document: Value = serde_json::from_str(content)?;
@@ -318,7 +353,7 @@ impl Layout {
                     .find_map(|path| {
                         navigate(&document, path)?
                             .keys()
-                            .find(|name| is_plug(name))
+                            .find(|name| is_entry(name))
                             .map(|name| (path, name.clone()))
                     })
                     .and_then(|(path, name)| navigate_mut(&mut document, path)?.get_mut(&name))
@@ -338,7 +373,12 @@ impl Layout {
                 let mut lines = text_lines(content);
                 let start = lines
                     .iter()
-                    .position(|line| self.toml_plug_header(line.trim()) == Some(TomlHeader::Entry))
+                    .position(|line| {
+                        self.toml_server_header(line.trim())
+                            .is_some_and(|(name, header)| {
+                                header == TomlHeader::Entry && is_entry(&name)
+                            })
+                    })
                     .ok_or_else(|| {
                         anyhow::anyhow!("missing Plug entry under {}", self.toml_key())
                     })?
@@ -364,7 +404,7 @@ impl Layout {
             FileFormat::Yaml => {
                 let key = self.yaml_key();
                 let mut lines = text_lines(content);
-                let (plug, end) = yaml_plug_block(&lines, key)
+                let (plug, end) = yaml_entry_block(&lines, key, &is_entry)
                     .ok_or_else(|| anyhow::anyhow!("missing Plug entry under {key}"))?;
                 let args = args.iter().map(|arg| yaml_scalar(arg)).collect::<Vec<_>>();
                 replace_assignments(
@@ -432,8 +472,10 @@ impl Layout {
         self.servers_at.join(".")
     }
 
-    fn toml_plug_header(&self, line: &str) -> Option<TomlHeader> {
-        let name = line
+    /// The server a table header such as `[mcp_servers.<name>]` or
+    /// `[mcp_servers."<name>".env]` belongs to, and which of its tables it is.
+    fn toml_server_header(&self, line: &str) -> Option<(String, TomlHeader)> {
+        let header = line
             .strip_prefix("[[")
             .and_then(|rest| rest.strip_suffix("]]"))
             .or_else(|| {
@@ -441,26 +483,36 @@ impl Layout {
                     .and_then(|rest| rest.strip_suffix(']'))
             })?;
         let key = self.toml_key();
-        let rest = name.trim().strip_prefix(key.as_str())?.strip_prefix('.')?;
-        let rest = rest
-            .strip_prefix("\"plug\"")
-            .or_else(|| rest.strip_prefix("plug"))?;
+        let rest = header
+            .trim()
+            .strip_prefix(key.as_str())?
+            .strip_prefix('.')?;
+        let (name, rest) = match rest.chars().next()? {
+            quote @ ('"' | '\'') => {
+                let quoted = &rest[1..];
+                let end = quoted.find(quote)?;
+                (&quoted[..end], &quoted[end + 1..])
+            }
+            _ => rest.split_at(rest.find('.').unwrap_or(rest.len())),
+        };
         match rest {
-            "" => Some(TomlHeader::Entry),
-            _ if rest.starts_with('.') => Some(TomlHeader::Inside),
+            "" => Some((name.to_string(), TomlHeader::Entry)),
+            _ if rest.starts_with('.') => Some((name.to_string(), TomlHeader::Inside)),
             _ => None,
         }
     }
 
-    /// `content` without Plug's tables: its own and any below it, such as
-    /// `[mcp_servers.plug.env]`.
-    fn unlink_toml(&self, content: &str) -> String {
+    /// `content` without the tables of the servers `is_plug` names: each
+    /// one's own and any below it, such as `[mcp_servers.plug.env]`.
+    fn unlink_toml(&self, content: &str, is_plug: &dyn Fn(&str) -> bool) -> String {
         let mut output = Vec::new();
         let mut skipping = false;
         for line in content.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with('[') {
-                skipping = self.toml_plug_header(trimmed).is_some();
+                skipping = self
+                    .toml_server_header(trimmed)
+                    .is_some_and(|(name, _)| is_plug(&name));
             }
             if !skipping {
                 output.push(line);
@@ -471,7 +523,12 @@ impl Layout {
 
     /// Put Plug's entry into a YAML file as text, so comments, key order, and
     /// every other line stay exactly as they were.
-    fn link_yaml(&self, existing: &str, entry: &Value) -> anyhow::Result<String> {
+    fn link_yaml(
+        &self,
+        existing: &str,
+        entry: &Value,
+        is_plug: &dyn Fn(&str) -> bool,
+    ) -> anyhow::Result<String> {
         let refused = |detail: &str| {
             anyhow::anyhow!(
                 "the client's config file {detail}, so Plug left it alone; fix or move the file and try again"
@@ -487,7 +544,7 @@ impl Layout {
         let heading = format!("{key}:");
         let snippet = self.snippet(entry);
         let entry_lines = snippet.lines().skip(1).map(str::to_string);
-        let mut lines = text_lines(&unlink_yaml(existing, key));
+        let mut lines = text_lines(&unlink_yaml(existing, key, is_plug));
         match lines.iter().position(|line| line.trim_end() == heading) {
             Some(parent) => {
                 // Match the indentation the file's other servers already use.
@@ -651,8 +708,8 @@ fn indentation(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
-/// The `plug:` lines directly under `key:`.
-fn yaml_plug_lines(lines: &[String], key: &str) -> Vec<usize> {
+/// The lines directly under `key:` that start an entry `is_plug` names.
+fn yaml_entry_lines(lines: &[String], key: &str, is_plug: &dyn Fn(&str) -> bool) -> Vec<usize> {
     let heading = format!("{key}:");
     let Some(parent) = lines.iter().position(|line| line.trim_end() == heading) else {
         return Vec::new();
@@ -671,15 +728,23 @@ fn yaml_plug_lines(lines: &[String], key: &str) -> Vec<usize> {
     (parent + 1..section_end)
         .filter(|&index| {
             indentation(&lines[index]) == child_indent
-                && lines[index].trim().strip_suffix(':').is_some_and(is_plug)
+                && lines[index]
+                    .trim()
+                    .strip_suffix(':')
+                    .map(|name| name.trim_matches(|c| c == '"' || c == '\''))
+                    .is_some_and(is_plug)
         })
         .collect()
 }
 
-/// The lines of the Plug entry under `key`: the `plug:` line and one past
-/// the entry's last line.
-fn yaml_plug_block(lines: &[String], key: &str) -> Option<(usize, usize)> {
-    let plug = *yaml_plug_lines(lines, key).first()?;
+/// The lines of the first entry under `key` that `is_plug` names: its
+/// `<name>:` line and one past the entry's last line.
+fn yaml_entry_block(
+    lines: &[String],
+    key: &str,
+    is_plug: &dyn Fn(&str) -> bool,
+) -> Option<(usize, usize)> {
+    let plug = *yaml_entry_lines(lines, key, is_plug).first()?;
     let plug_indent = indentation(&lines[plug]);
     let end = (plug + 1..lines.len())
         .find(|&index| !lines[index].trim().is_empty() && indentation(&lines[index]) <= plug_indent)
@@ -687,10 +752,10 @@ fn yaml_plug_block(lines: &[String], key: &str) -> Option<(usize, usize)> {
     Some((plug, end))
 }
 
-/// Remove the Plug entries under `key`, and nothing else.
-fn unlink_yaml(existing: &str, key: &str) -> String {
+/// Remove the entries under `key` that `is_plug` names, and nothing else.
+fn unlink_yaml(existing: &str, key: &str, is_plug: &dyn Fn(&str) -> bool) -> String {
     let mut lines = text_lines(existing);
-    while let Some((plug, mut end)) = yaml_plug_block(&lines, key) {
+    while let Some((plug, mut end)) = yaml_entry_block(&lines, key, is_plug) {
         // Blank lines after the entry belong to whatever follows it.
         while end > plug + 1 && lines[end - 1].trim().is_empty() {
             end -= 1;
@@ -843,9 +908,9 @@ mod tests {
             let layout = target.layout();
             for transport in [LinkTransport::Stdio, LinkTransport::Http] {
                 let entry = target.plug_entry(transport, "/usr/local/bin/plug", URL);
-                let written = layout.link("", &entry).unwrap();
+                let written = layout.link("", &entry, &HttpConfig::default()).unwrap();
                 let plug = layout
-                    .read_plug(&written)
+                    .read_plug(&written, &HttpConfig::default())
                     .unwrap_or_else(|| panic!("{target:?} lost its {transport:?} link: {written}"));
                 match transport {
                     LinkTransport::Stdio => {
@@ -900,11 +965,15 @@ mod tests {
                 };
                 assert_eq!(imported[0].1, expected, "{target:?}");
 
-                let relinked = layout.link(&written, &entry).unwrap();
+                let relinked = layout
+                    .link(&written, &entry, &HttpConfig::default())
+                    .unwrap();
                 assert_eq!(layout.plug_entry_count(&relinked, &own), 1, "{target:?}");
-                let unlinked = layout.unlink(&relinked).unwrap();
+                let unlinked = layout.unlink(&relinked, &HttpConfig::default()).unwrap();
                 assert!(
-                    layout.read_plug(&unlinked).is_none(),
+                    layout
+                        .read_plug(&unlinked, &HttpConfig::default())
+                        .is_none(),
                     "{target:?}: {unlinked}"
                 );
             }
@@ -942,17 +1011,25 @@ mod tests {
         ] {
             let layout = target.layout();
             let entry = target.plug_entry(LinkTransport::Stdio, "plug", URL);
-            let linked = layout.link(existing, &entry).unwrap();
+            let linked = layout
+                .link(existing, &entry, &HttpConfig::default())
+                .unwrap();
             let value: Value = serde_json::from_str(&linked).unwrap();
             assert!(value.pointer(other).is_some(), "{target:?}: {linked}");
-            let unlinked: Value = serde_json::from_str(&layout.unlink(&linked).unwrap()).unwrap();
+            let unlinked: Value =
+                serde_json::from_str(&layout.unlink(&linked, &HttpConfig::default()).unwrap())
+                    .unwrap();
             assert_eq!(unlinked, serde_json::from_str::<Value>(existing).unwrap());
         }
         // OpenCode refuses a key it does not know.
         let opencode = ClientTarget::OpenCode;
         let linked = opencode
             .layout()
-            .link("", &opencode.plug_entry(LinkTransport::Http, "plug", URL))
+            .link(
+                "",
+                &opencode.plug_entry(LinkTransport::Http, "plug", URL),
+                &HttpConfig::default(),
+            )
             .unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&linked).unwrap(),
@@ -964,18 +1041,28 @@ mod tests {
     fn a_json_file_with_comments_is_left_alone() {
         let layout = ClientTarget::Amp.layout();
         let commented = "{\n  // my servers\n  \"amp.mcpServers\": {}\n}\n";
-        assert!(layout.link(commented, &json!({})).is_err());
-        assert!(layout.unlink(commented).is_err());
+        assert!(
+            layout
+                .link(commented, &json!({}), &HttpConfig::default())
+                .is_err()
+        );
+        assert!(layout.unlink(commented, &HttpConfig::default()).is_err());
     }
 
     #[test]
     fn muse_code_gets_a_schema_version_and_keeps_its_own() {
         let layout = ClientTarget::MuseCode.layout();
         let entry = ClientTarget::MuseCode.plug_entry(LinkTransport::Stdio, "plug", URL);
-        let fresh: Value = serde_json::from_str(&layout.link("", &entry).unwrap()).unwrap();
+        let fresh: Value =
+            serde_json::from_str(&layout.link("", &entry, &HttpConfig::default()).unwrap())
+                .unwrap();
         assert_eq!(fresh["schema_version"], json!(1));
-        let kept: Value =
-            serde_json::from_str(&layout.link(r#"{"schema_version":2}"#, &entry).unwrap()).unwrap();
+        let kept: Value = serde_json::from_str(
+            &layout
+                .link(r#"{"schema_version":2}"#, &entry, &HttpConfig::default())
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(kept["schema_version"], json!(2));
     }
 
@@ -984,7 +1071,9 @@ mod tests {
         let layout = ClientTarget::CodexCli.layout();
         let command = r#"/Applications/Plug "1".app\Contents/plug"#;
         let entry = ClientTarget::CodexCli.plug_entry(LinkTransport::Stdio, command, URL);
-        let linked = layout.link("model = \"o3\"\n", &entry).unwrap();
+        let linked = layout
+            .link("model = \"o3\"\n", &entry, &HttpConfig::default())
+            .unwrap();
         let parsed: toml::Table = toml::from_str(&linked).unwrap();
         assert_eq!(
             parsed["mcp_servers"]["plug"]["command"].as_str(),
@@ -998,7 +1087,7 @@ mod tests {
         let layout = ClientTarget::CodexCli.layout();
         let content = "[mcp_servers.plug]\ncommand = \"plug\"\n\n[mcp_servers.plug.env]\nA = \"1\"\n\n[mcp_servers.plugin]\ncommand = \"plugin\"\n\n[mcp_servers.\"plug\"]\ncommand = \"again\"\n";
         assert_eq!(layout.plug_entry_count(content, &HttpConfig::default()), 2);
-        let unlinked = layout.unlink(content).unwrap();
+        let unlinked = layout.unlink(content, &HttpConfig::default()).unwrap();
         assert_eq!(unlinked, "[mcp_servers.plugin]\ncommand = \"plugin\"\n\n");
     }
 
@@ -1011,27 +1100,45 @@ mod tests {
             "/Applications/Plug.app/Contents/Resources/plug",
             URL,
         );
-        let linked = layout.link(existing, &entry).unwrap();
-        assert!(layout.read_plug(&linked).is_some());
+        let linked = layout
+            .link(existing, &entry, &HttpConfig::default())
+            .unwrap();
+        assert!(layout.read_plug(&linked, &HttpConfig::default()).is_some());
         // Linking twice leaves one entry, and unlinking gives the file back.
-        assert_eq!(layout.link(&linked, &entry).unwrap(), linked);
-        assert_eq!(layout.unlink(&linked).unwrap(), existing);
+        assert_eq!(
+            layout
+                .link(&linked, &entry, &HttpConfig::default())
+                .unwrap(),
+            linked
+        );
+        assert_eq!(
+            layout.unlink(&linked, &HttpConfig::default()).unwrap(),
+            existing
+        );
 
         // A file with no servers yet gains the section at its end.
-        let fresh = layout.link("model:\n  default: x\n", &entry).unwrap();
+        let fresh = layout
+            .link("model:\n  default: x\n", &entry, &HttpConfig::default())
+            .unwrap();
         assert!(fresh.starts_with("model:\n  default: x\nmcp_servers:\n  plug:\n"));
-        assert!(layout.link("mcp_servers: {}\n", &entry).is_err());
+        assert!(
+            layout
+                .link("mcp_servers: {}\n", &entry, &HttpConfig::default())
+                .is_err()
+        );
     }
 
     #[test]
     fn a_hermes_link_written_by_hand_is_read_and_replaced() {
         let layout = ClientTarget::Hermes.layout();
         let existing = "mcp_servers:\n  Plug:\n    command: /Users/rob/.local/bin/plug\n    args:\n      - connect\n    env: {}\nknown:\n  cli:\n    - spotify\n";
-        let plug = layout.read_plug(existing).unwrap();
+        let plug = layout.read_plug(existing, &HttpConfig::default()).unwrap();
         assert_eq!(plug.args.as_deref(), Some(&["connect".to_string()][..]));
         let entry = ClientTarget::Hermes.plug_entry(LinkTransport::Http, "plug", URL);
         assert_eq!(
-            layout.link(existing, &entry).unwrap(),
+            layout
+                .link(existing, &entry, &HttpConfig::default())
+                .unwrap(),
             format!("mcp_servers:\n  plug:\n    url: {URL}\nknown:\n  cli:\n    - spotify\n")
         );
     }
@@ -1041,13 +1148,68 @@ mod tests {
         let layout = ClientTarget::Goose.layout();
         let entry = ClientTarget::Goose.plug_entry(LinkTransport::Stdio, "plug", URL);
         for broken in ["extensions: [unclosed\n", "- a\n- list\n", "just text"] {
-            let error = layout.link(broken, &entry).unwrap_err();
+            let error = layout
+                .link(broken, &entry, &HttpConfig::default())
+                .unwrap_err();
             assert!(error.to_string().contains("left it alone"), "{error}");
         }
         let goose = "extensions:\n  github:\n    type: stdio\n    command: npx # mine\n";
-        let linked = layout.link(goose, &entry).unwrap();
+        let linked = layout.link(goose, &entry, &HttpConfig::default()).unwrap();
         assert!(linked.contains("command: npx # mine"));
-        assert_eq!(layout.unlink(&linked).unwrap(), goose);
+        assert_eq!(
+            layout.unlink(&linked, &HttpConfig::default()).unwrap(),
+            goose
+        );
+    }
+
+    /// A link saved under another name is Plug's link to every command:
+    /// it is read as the link, replaced by a new one, and taken out.
+    #[test]
+    fn a_link_under_another_name_is_plugs_link() {
+        let plug = HttpConfig::default();
+        let own = "http://localhost:3282/mcp";
+        for (target, content) in [
+            (
+                ClientTarget::Cursor,
+                r#"{"mcpServers":{"plug-local":{"command":"/usr/local/bin/plug","args":["connect"]},"other":{"command":"x"}}}"#.to_string(),
+            ),
+            (
+                ClientTarget::CodexCli,
+                format!("[mcp_servers.\"plug http\"]\nurl = \"{own}\"\n\n[mcp_servers.other]\ncommand = \"x\"\n"),
+            ),
+            (
+                ClientTarget::Hermes,
+                "mcp_servers:\n  local-plug:\n    command: plug\n    args: [connect]\n  other:\n    command: x\n".to_string(),
+            ),
+        ] {
+            let layout = target.layout();
+            assert!(layout.read_plug(&content, &plug).is_some(), "{target:?}");
+            let entry = target.plug_entry(LinkTransport::Stdio, "/new/plug", URL);
+            let linked = layout.link(&content, &entry, &plug).unwrap();
+            assert_eq!(layout.plug_entry_count(&linked, &plug), 1, "{target:?}: {linked}");
+            assert_eq!(
+                layout.read_plug(&linked, &plug).unwrap().command.as_deref(),
+                Some("/new/plug")
+            );
+            let unlinked = layout.unlink(&content, &plug).unwrap();
+            assert!(layout.read_plug(&unlinked, &plug).is_none(), "{target:?}: {unlinked}");
+            let servers = layout.read_servers(&unlinked, &plug).unwrap();
+            assert_eq!(servers.len(), 1, "{target:?}: {unlinked}");
+            assert_eq!(servers[0].0, "other");
+
+            // Only a command is repaired.
+            if target == ClientTarget::CodexCli {
+                continue;
+            }
+            let repaired = layout
+                .set_plug_command(&content, &plug, "/new/plug", &target.connect_args())
+                .unwrap();
+            assert_eq!(
+                layout.read_plug(&repaired, &plug).unwrap().command.as_deref(),
+                Some("/new/plug"),
+                "{target:?}: {repaired}"
+            );
+        }
     }
 
     #[test]
@@ -1100,7 +1262,12 @@ mod tests {
         for (target, content) in fixtures {
             let layout = target.layout();
             let updated = layout
-                .set_plug_command(content, "/new/plug", &target.connect_args())
+                .set_plug_command(
+                    content,
+                    &HttpConfig::default(),
+                    "/new/plug",
+                    &target.connect_args(),
+                )
                 .unwrap();
             for kept in [
                 "# doc",
@@ -1111,7 +1278,7 @@ mod tests {
             ] {
                 assert!(updated.contains(kept), "{target:?} lost {kept}: {updated}");
             }
-            let plug = layout.read_plug(&updated).unwrap();
+            let plug = layout.read_plug(&updated, &HttpConfig::default()).unwrap();
             assert_eq!(plug.command.as_deref(), Some("/new/plug"));
             assert_eq!(plug.args.unwrap(), target.connect_args());
             assert_eq!(
@@ -1128,11 +1295,17 @@ mod tests {
             .link(
                 "",
                 &opencode.plug_entry(LinkTransport::Stdio, "/old/plug", URL),
+                &HttpConfig::default(),
             )
             .unwrap();
         let moved = opencode
             .layout()
-            .set_plug_command(&linked, "/new/plug", &opencode.connect_args())
+            .set_plug_command(
+                &linked,
+                &HttpConfig::default(),
+                "/new/plug",
+                &opencode.connect_args(),
+            )
             .unwrap();
         let value: Value = serde_json::from_str(&moved).unwrap();
         assert_eq!(value["mcp"]["plug"]["command"][0], "/new/plug");
@@ -1143,7 +1316,10 @@ mod tests {
     fn arguments_that_are_not_all_strings_are_not_read_as_a_link() {
         let plug = ClientTarget::Cursor
             .layout()
-            .read_plug(r#"{"mcpServers":{"plug":{"command":"plug","args":["connect",7]}}}"#)
+            .read_plug(
+                r#"{"mcpServers":{"plug":{"command":"plug","args":["connect",7]}}}"#,
+                &HttpConfig::default(),
+            )
             .unwrap();
         assert_eq!(plug.args, None);
     }

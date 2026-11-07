@@ -75,6 +75,18 @@ impl LinkTransport {
     }
 }
 
+impl std::fmt::Display for LinkTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl serde::Serialize for LinkTransport {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 /// Which of a client's settings files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {

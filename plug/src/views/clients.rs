@@ -20,7 +20,7 @@ fn configured_client_state_text(client: &crate::commands::clients::ClientView) -
 }
 
 fn configured_client_link_text(client: &crate::commands::clients::ClientView) -> Option<String> {
-    let transport = client.linked_transport.as_deref()?;
+    let transport = client.linked_transport?;
     let mut detail = format!("linked via {transport}");
     if let Some(endpoint) = client.linked_endpoint.as_deref() {
         detail.push_str(" -> ");
@@ -159,7 +159,7 @@ async fn prompt_client_actions(config_path: Option<&std::path::PathBuf>) -> anyh
             Ok(true)
         }
         Some(2) => {
-            cmd_unlink(Vec::new(), false, false, &OutputFormat::Text)?;
+            cmd_unlink(config_path, Vec::new(), false, false, &OutputFormat::Text)?;
             Ok(true)
         }
         Some(3) => {
@@ -190,16 +190,20 @@ fn client_and_place(client: &str, place: Option<&str>) -> String {
     }
 }
 
+fn transport_label(transport: plug_core::ipc::LiveSessionTransport) -> &'static str {
+    match transport {
+        plug_core::ipc::LiveSessionTransport::DaemonProxy => "local",
+        plug_core::ipc::LiveSessionTransport::Http => "http",
+    }
+}
+
 /// Busiest client first, then by name.
 fn live_session_groups(
     sessions: &[crate::commands::clients::LiveSessionView],
 ) -> Vec<LiveSessionGroup<'_>> {
     let mut groups: Vec<LiveSessionGroup<'_>> = Vec::new();
     for session in sessions {
-        let transport = match session.transport.as_str() {
-            "daemon_proxy" => "local",
-            other => other,
-        };
+        let transport = transport_label(session.transport);
         match groups.iter_mut().find(|group| {
             group.client == session.label() && group.place == session.place.as_deref()
         }) {
@@ -247,7 +251,7 @@ fn print_live_session_rows(sessions: &[crate::commands::clients::LiveSessionView
             "  {:<18} {:<14} {:<12} {:<10} {:<10} {}",
             &session.session_id[..session.session_id.len().min(18)],
             client_and_place(session.label(), session.place.as_deref()),
-            session.transport,
+            transport_label(session.transport),
             crate::ui::format_duration(session.connected_secs),
             idle,
             session.key.as_deref().unwrap_or("-"),
@@ -462,12 +466,12 @@ mod tests {
             name: "Claude".to_string(),
             target: "claude-desktop".to_string(),
             linked: true,
-            linked_transport: Some("http".to_string()),
+            linked_transport: Some(plug_core::clients::LinkTransport::Http),
             linked_endpoint: Some("https://plug.example.com/mcp".to_string()),
             detected: true,
             live: true,
             live_sessions: 1,
-            live_transports: vec!["http".to_string()],
+            live_transports: vec![plug_core::ipc::LiveSessionTransport::Http],
             lazy_tool_mode: "bridge".to_string(),
             lazy_tool_mode_origin: "auto_default".to_string(),
             lazy_tool_mode_reason: "client benefits from plug-owned search bridge discovery"
@@ -477,7 +481,7 @@ mod tests {
             session_id: "session-1".to_string(),
             client_type: "claude_desktop".to_string(),
             target: None,
-            transport: "http".to_string(),
+            transport: plug_core::ipc::LiveSessionTransport::Http,
             client_id: None,
             client_info: Some("Claude Desktop".to_string()),
             host: None,
@@ -519,12 +523,12 @@ mod tests {
             name: "Codex CLI".to_string(),
             target: "codex-cli".to_string(),
             linked: true,
-            linked_transport: Some("stdio".to_string()),
+            linked_transport: Some(plug_core::clients::LinkTransport::Stdio),
             linked_endpoint: None,
             detected: true,
             live: true,
             live_sessions: 2,
-            live_transports: vec!["daemon_proxy".to_string()],
+            live_transports: vec![plug_core::ipc::LiveSessionTransport::DaemonProxy],
             lazy_tool_mode: "native".to_string(),
             lazy_tool_mode_origin: "auto_default".to_string(),
             lazy_tool_mode_reason: "client has its own native lazy/deferred tool discovery"
@@ -542,7 +546,7 @@ mod tests {
             name: "Claude Code".to_string(),
             target: "claude-code".to_string(),
             linked: true,
-            linked_transport: Some("http".to_string()),
+            linked_transport: Some(plug_core::clients::LinkTransport::Http),
             linked_endpoint: Some("https://plug.example.com/mcp".to_string()),
             detected: false,
             live: false,
@@ -565,7 +569,7 @@ mod tests {
             name: "OpenCode".to_string(),
             target: "opencode".to_string(),
             linked: true,
-            linked_transport: Some("stdio".to_string()),
+            linked_transport: Some(plug_core::clients::LinkTransport::Stdio),
             linked_endpoint: None,
             detected: true,
             live: false,
@@ -582,12 +586,20 @@ mod tests {
         );
     }
 
-    fn session(client_type: &str, transport: &str, connected_secs: u64) -> LiveSessionView {
+    const LOCAL: plug_core::ipc::LiveSessionTransport =
+        plug_core::ipc::LiveSessionTransport::DaemonProxy;
+    const HTTP: plug_core::ipc::LiveSessionTransport = plug_core::ipc::LiveSessionTransport::Http;
+
+    fn session(
+        client_type: &str,
+        transport: plug_core::ipc::LiveSessionTransport,
+        connected_secs: u64,
+    ) -> LiveSessionView {
         LiveSessionView {
             session_id: format!("{client_type}-{connected_secs}"),
             client_type: client_type.to_string(),
             target: None,
-            transport: transport.to_string(),
+            transport,
             client_id: None,
             client_info: None,
             host: None,
@@ -603,8 +615,8 @@ mod tests {
 
     #[test]
     fn one_client_in_two_places_is_two_groups_each_saying_where() {
-        let here = session("Claude Code", "daemon_proxy", 30);
-        let mut there = session("Claude Code", "http", 10);
+        let here = session("Claude Code", LOCAL, 30);
+        let mut there = session("Claude Code", HTTP, 10);
         there.place = Some("Work laptop".to_string());
         let sessions = [here, there];
 
@@ -618,16 +630,16 @@ mod tests {
 
     #[test]
     fn an_unrecognised_session_is_grouped_under_the_program_that_started_it() {
-        let mut hosted = session("Unknown", "daemon_proxy", 30);
+        let mut hosted = session("Unknown", LOCAL, 30);
         hosted.host = Some(plug_core::downstream_identity::ClientHost {
             name: "Hermes".to_string(),
             executable: "/Applications/Hermes.app/Contents/MacOS/Hermes".to_string(),
             app: Some("/Applications/Hermes.app".to_string()),
             script: None,
         });
-        let mut named = session("Cursor", "daemon_proxy", 10);
+        let mut named = session("Cursor", LOCAL, 10);
         named.host = hosted.host.clone();
-        let sessions = [hosted, named, session("Unknown", "daemon_proxy", 5)];
+        let sessions = [hosted, named, session("Unknown", LOCAL, 5)];
 
         let groups = live_session_groups(&sessions);
         let clients = groups.iter().map(|group| group.client).collect::<Vec<_>>();
@@ -636,7 +648,7 @@ mod tests {
 
     #[test]
     fn a_session_whose_link_names_its_client_shows_under_that_client() {
-        let mut linked = session("Unknown", "daemon_proxy", 30);
+        let mut linked = session("Unknown", LOCAL, 30);
         linked.host = Some(plug_core::downstream_identity::ClientHost {
             name: "node".to_string(),
             executable: "/opt/homebrew/bin/node".to_string(),
@@ -661,10 +673,10 @@ mod tests {
 
         // A remote session on the shared token shows under what it reports,
         // but its requests are the shared key's.
-        let mut shared = session("Cursor", "http", 30);
+        let mut shared = session("Cursor", HTTP, 30);
         shared.key = Some("cursor".to_string());
         shared.access_key = Some("remote:shared".to_string());
-        let mut local = session("Unknown", "daemon_proxy", 10);
+        let mut local = session("Unknown", LOCAL, 10);
         local.key = Some("pi".to_string());
         local.access_key = Some("pi".to_string());
         let sessions = [shared, local];
@@ -694,7 +706,7 @@ mod tests {
     #[test]
     fn a_client_to_rename_is_found_by_the_name_it_shows_under() {
         use crate::commands::clients::resolve_client_key;
-        let mut hermes = session("Unknown", "daemon_proxy", 30);
+        let mut hermes = session("Unknown", LOCAL, 30);
         hermes.host = Some(plug_core::downstream_identity::ClientHost {
             name: "python3".to_string(),
             executable: "/opt/hermes/bin/python3".to_string(),
@@ -704,7 +716,7 @@ mod tests {
         hermes.key = Some("host:/opt/hermes/bin/python3".to_string());
         let mut renamed = hermes.clone();
         renamed.name = Some("Hermes".to_string());
-        let nameless = session("Unknown", "daemon_proxy", 5);
+        let nameless = session("Unknown", LOCAL, 5);
 
         let key = |wanted, sessions: &[LiveSessionView]| {
             resolve_client_key(wanted, sessions).map_err(|error| error.to_string())
@@ -749,11 +761,11 @@ mod tests {
     #[test]
     fn live_sessions_group_by_client_busiest_first() {
         let sessions = vec![
-            session("Claude Code", "daemon_proxy", 60),
-            session("Codex CLI", "daemon_proxy", 30),
-            session("Codex CLI", "daemon_proxy", 7_200),
-            session("Codex CLI", "http", 10),
-            session("Cursor", "http", 5),
+            session("Claude Code", LOCAL, 60),
+            session("Codex CLI", LOCAL, 30),
+            session("Codex CLI", LOCAL, 7_200),
+            session("Codex CLI", HTTP, 10),
+            session("Cursor", HTTP, 5),
         ];
         assert_eq!(
             live_session_groups(&sessions),
