@@ -776,6 +776,10 @@ public enum OperatorRequest: Encodable, Equatable, Sendable {
 /// One change to the config file, which the daemon saves and applies.
 public enum OperatorMutation: Encodable, Equatable, Sendable {
     case addServer(name: String, server: ServerConfig)
+    /// Add servers found in other clients' settings, all or none. A name
+    /// already taken goes in with its client's slug after it, as
+    /// `plug import` names it.
+    case importServers([ImportedServer])
     case updateServer(name: String, server: ServerConfig)
     case removeServer(name: String)
     /// Add a configured server again as `<server>-<account>`.
@@ -796,7 +800,7 @@ public enum OperatorMutation: Encodable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case type, name, server, enabled, tool, key, kind, target, blocked, place, watch, event
-        case account, from, to
+        case account, from, to, servers
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -805,6 +809,8 @@ public enum OperatorMutation: Encodable, Equatable, Sendable {
         case let .addServer(name, server):
             try c.encode("AddServer", forKey: .type)
             try c.encode(name, forKey: .name); try c.encode(server, forKey: .server)
+        case let .importServers(servers):
+            try c.encode("ImportServers", forKey: .type); try c.encode(servers, forKey: .servers)
         case let .updateServer(name, server):
             try c.encode("UpdateServer", forKey: .type)
             try c.encode(name, forKey: .name); try c.encode(server, forKey: .server)
@@ -840,6 +846,20 @@ public enum OperatorMutation: Encodable, Equatable, Sendable {
     }
 }
 
+/// A server found in another client's settings, on its way into the config.
+public struct ImportedServer: Encodable, Equatable, Sendable {
+    public var name: String
+    /// The slug of the client it was found in.
+    public var sourceTarget: String
+    public var server: ServerConfig
+
+    public init(name: String, sourceTarget: String, server: ServerConfig) {
+        self.name = name
+        self.sourceTarget = sourceTarget
+        self.server = server
+    }
+}
+
 /// What a per-client block names.
 public enum ClientBlockKind: String, Encodable, Sendable {
     case server
@@ -860,7 +880,8 @@ public enum IPCResponse: Decodable, Sendable {
     case tools([ToolInfo])
     case validated
     case apiDescribed(APISummary)
-    case mutation
+    /// The names the servers of an import went in under; empty for any other change.
+    case mutation(imported: [String])
     case revoked(String)
     case reloaded
     case ok
@@ -868,7 +889,7 @@ public enum IPCResponse: Decodable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case type, handshake, snapshot, events, tools, clientId, code, message, name, server
-        case api, servers
+        case api, servers, result
     }
 
     public init(from decoder: Decoder) throws {
@@ -886,7 +907,13 @@ public enum IPCResponse: Decodable, Sendable {
         case "Tools": self = .tools(try c.decode([ToolInfo].self, forKey: .tools))
         case "ServerValidated": self = .validated
         case "ApiDescribed": self = .apiDescribed(try c.decode(APISummary.self, forKey: .api))
-        case "OperatorMutation": self = .mutation
+        case "OperatorMutation":
+            struct Result: Decodable {
+                struct Imported: Decodable { let name: String }
+                let imported: [Imported]?
+            }
+            let result = try c.decodeIfPresent(Result.self, forKey: .result)
+            self = .mutation(imported: result?.imported?.map(\.name) ?? [])
         case "DownstreamClientRevoked": self = .revoked(try c.decode(String.self, forKey: .clientId))
         case "Reloaded": self = .reloaded
         case "Ok": self = .ok

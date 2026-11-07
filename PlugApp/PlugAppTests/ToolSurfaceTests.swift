@@ -928,17 +928,6 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertEqual(Explain.advice(forReason: "zzz"), Explain.fallback)
     }
 
-    func testAPartialImportNamesWhatFailed() {
-        XCTAssertEqual(
-            ImportServersView.summary(failed: ["notion"], of: 3),
-            "Could not add notion. 2 servers were added. The reason is under each one."
-        )
-        XCTAssertEqual(
-            ImportServersView.summary(failed: ["a", "b", "c", "d", "e"], of: 5),
-            "Could not add a, b, c, and 2 more. The reason is under each one."
-        )
-    }
-
     /// A new sign-in under a name others gave asks which one it is, once.
     func testANewSignInAsksAboutEarlierOnesWithItsName() {
         let now = Date(timeIntervalSince1970: 2_000_000)

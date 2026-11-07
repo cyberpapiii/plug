@@ -80,6 +80,11 @@ final class GoldenPayloadTests: XCTestCase {
             "add_server": op(.mutate(.addServer(name: "workspace", server: stdioServer), secretStore: "file")),
             "add_remote_server": mutate(.addServer(name: "notes", server: remoteServer)),
             "update_server": mutate(.updateServer(name: "pets", server: apiServer)),
+            "import_servers": mutate(.importServers([ImportedServer(
+                name: "github",
+                sourceTarget: "cursor",
+                server: .command("npx", args: ["-y", "github-mcp"])
+            )])),
             "remove_server": mutate(.removeServer(name: "workspace")),
             "add_account": mutate(.addAccount(server: "workspace", account: "work")),
             "set_server_enabled": mutate(.setServerEnabled(name: "workspace", enabled: false)),
@@ -331,7 +336,11 @@ final class GoldenPayloadTests: XCTestCase {
 
     func testSmallReplies() throws {
         guard case .validated = try response("server_validated") else { return XCTFail() }
-        guard case .mutation = try response("mutation") else { return XCTFail() }
+        guard case let .mutation(none) = try response("mutation") else { return XCTFail() }
+        XCTAssertEqual(none, [])
+        // An import says the name each server went in under.
+        guard case let .mutation(imported) = try response("imported") else { return XCTFail() }
+        XCTAssertEqual(imported, ["github-cursor"])
         guard case let .revoked(id) = try response("revoked") else { return XCTFail() }
         XCTAssertEqual(id, "abc")
         guard case .reloaded = try response("reloaded") else { return XCTFail() }
