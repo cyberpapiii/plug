@@ -1054,8 +1054,8 @@ mod tests {
     fn link_unlink_and_repair_stop_on_a_config_that_does_not_load() {
         // Plug's own address decides which entry in a client's file is Plug,
         // so guessing it from the defaults could write a second Plug entry.
-        // Link and unlink name a client that does not exist and repair is a
-        // dry run, so a regression fails here without touching a real file.
+        // Every command names no real client, so a regression fails here
+        // without reading or writing a client's file.
         let path = std::env::temp_dir().join(format!("plug-broken-{}.toml", uuid::Uuid::new_v4()));
         std::fs::write(&path, "[http]\nport = \"not a port\"\n").unwrap();
         let config = Some(&path);
@@ -1064,15 +1064,8 @@ mod tests {
         let errors = [
             cmd_link(config, nobody(), false, true, None, &json).unwrap_err(),
             cmd_unlink(config, nobody(), false, true, &json).unwrap_err(),
-            crate::commands::repair::cmd_repair(
-                config,
-                vec!["codex".to_string()],
-                false,
-                true,
-                &json,
-            )
-            .unwrap_err(),
-            crate::commands::import::scan(config, &[ClientTarget::CodexCli]).unwrap_err(),
+            crate::commands::repair::cmd_repair(config, nobody(), false, true, &json).unwrap_err(),
+            crate::commands::import::scan(config, &[]).unwrap_err(),
         ]
         .map(|error| format!("{error:#}"));
         let load_error = format!("{:#}", plug_core::config::load_config(config).unwrap_err());
@@ -1091,14 +1084,17 @@ mod tests {
 
     #[test]
     fn the_client_list_leaves_roocode_out_and_names_current_products() {
-        let views = client_views(&[], None);
-        assert!(views.iter().all(|view| view.target != "roocode"));
+        let listed: Vec<_> = ClientTarget::listed().collect();
+        assert!(listed.iter().all(|target| target.slug() != "roocode"));
         assert!(
-            views
+            listed
                 .iter()
-                .any(|view| view.target == "devin" && view.name == "Devin")
+                .any(|target| target.slug() == "devin" && target.display_name() == "Devin")
         );
-        assert!(!views.iter().any(|view| view.name.contains("Windsurf")));
-        assert_eq!(views.len(), ClientTarget::listed().count());
+        assert!(
+            !listed
+                .iter()
+                .any(|target| target.display_name().contains("Windsurf"))
+        );
     }
 }

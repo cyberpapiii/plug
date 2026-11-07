@@ -83,25 +83,22 @@ fn selected_protocol_for_log(
     }
 }
 
-/// Test-only override for `READ_WATCHDOG` so the suite can exercise watchdog
-/// expiry without a real 120s wait. Zero means "no override, use the real
-/// constant." This must never grow into a runtime/config knob. Tests install
-/// it via `tests::ReadWatchdogTestOverride`, which all run under
-/// `plug_core::paths::test::isolate` so the single global value is never
-/// contended across tests.
+// Test-only override for `READ_WATCHDOG` so the suite can exercise watchdog
+// expiry without a real 120s wait. This must never grow into a runtime/config
+// knob. It is per thread, like `plug_core::paths::test`, so a test's override
+// reaches the proxy it drives and no other test.
 #[cfg(test)]
-static READ_WATCHDOG_TEST_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    static READ_WATCHDOG_TEST_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// Effective read-watchdog duration: the real constant, unless a test has
 /// installed a shorter override.
 fn read_watchdog() -> Duration {
     #[cfg(test)]
-    {
-        let override_ms = READ_WATCHDOG_TEST_OVERRIDE_MS.load(std::sync::atomic::Ordering::SeqCst);
-        if override_ms != 0 {
-            return Duration::from_millis(override_ms);
-        }
+    if let Some(duration) = READ_WATCHDOG_TEST_OVERRIDE.get() {
+        return duration;
     }
     READ_WATCHDOG
 }
@@ -1695,30 +1692,20 @@ mod tests {
         );
     }
 
-    /// RAII guard that installs a short `READ_WATCHDOG` override for the
-    /// life of a test (see `READ_WATCHDOG_TEST_OVERRIDE_MS`), restoring the
-    /// "no override" state on drop — including on panic/unwind, so a failed
-    /// assertion never leaks a short watchdog into a later test. The
-    /// override is a single process-global value, so every test that
-    /// installs one must hold `plug_core::paths::test::isolate` for its
-    /// entire body (all fake-daemon tests in this module already do), and
-    /// this guard must be declared AFTER that guard so it drops (and resets
-    /// the override) BEFORE the lock is released.
+    /// A short `READ_WATCHDOG` for this test's thread, cleared on drop,
+    /// including on panic.
     struct ReadWatchdogTestOverride;
 
     impl ReadWatchdogTestOverride {
         fn install(duration: Duration) -> Self {
-            READ_WATCHDOG_TEST_OVERRIDE_MS.store(
-                duration.as_millis() as u64,
-                std::sync::atomic::Ordering::SeqCst,
-            );
+            READ_WATCHDOG_TEST_OVERRIDE.set(Some(duration));
             Self
         }
     }
 
     impl Drop for ReadWatchdogTestOverride {
         fn drop(&mut self) {
-            READ_WATCHDOG_TEST_OVERRIDE_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+            READ_WATCHDOG_TEST_OVERRIDE.set(None);
         }
     }
 
@@ -1812,7 +1799,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -1952,7 +1939,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2107,7 +2094,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2213,7 +2200,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2349,7 +2336,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2442,7 +2429,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2512,7 +2499,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2585,7 +2572,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2692,7 +2679,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2841,12 +2828,17 @@ mod tests {
         ipc::send_chunked_response_with_id(writer, ipc_id, response).await
     }
 
-    /// The per-request ceiling fake daemons register with.
-    static FAKE_REQUEST_CEILING_MS: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(600_000);
+    const FAKE_REQUEST_CEILING_MS: u64 = 600_000;
+
+    thread_local! {
+        /// The per-request ceiling fake daemons on this test's thread
+        /// register with.
+        static FAKE_REQUEST_CEILING: std::cell::Cell<u64> =
+            const { std::cell::Cell::new(FAKE_REQUEST_CEILING_MS) };
+    }
 
     fn fake_request_ceiling_ms() -> u64 {
-        FAKE_REQUEST_CEILING_MS.load(std::sync::atomic::Ordering::SeqCst)
+        FAKE_REQUEST_CEILING.get()
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -2902,7 +2894,7 @@ mod tests {
     #[tokio::test]
     async fn session_setup_rejects_a_registration_for_another_client() {
         let temp = unique_temp_dir("register-mismatch");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -2956,7 +2948,7 @@ mod tests {
     #[tokio::test]
     async fn a_resource_update_during_setup_is_kept_for_the_host() {
         let temp = unique_temp_dir("setup-push");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -3163,7 +3155,7 @@ mod tests {
     #[tokio::test]
     async fn modern_daemon_proxy_starts_with_discover_without_initialize() {
         let temp = unique_temp_dir("modern-discover");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let mut delegated_capabilities = ServerCapabilities::builder()
             .enable_tools()
@@ -3313,7 +3305,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_uses_auxiliary_socket_while_primary_request_is_locked() {
         let temp = unique_temp_dir("oob-cancel");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let request_id =
@@ -3377,7 +3369,7 @@ mod tests {
     #[tokio::test]
     async fn daemon_gate_push_disables_modern_on_existing_proxy() {
         let temp = unique_temp_dir("gate-push");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -3432,7 +3424,7 @@ mod tests {
     #[tokio::test]
     async fn reconnect_publishes_disabled_gate_before_new_session() {
         let temp = unique_temp_dir("reconnect-gate");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -3497,7 +3489,7 @@ mod tests {
     #[tokio::test]
     async fn reconnect_replays_client_capabilities() {
         let temp = unique_temp_dir("reconnect-caps");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         // A non-default capabilities value so the "replayed == negotiated"
         // assertion below can't trivially pass by matching two empty structs.
@@ -3599,7 +3591,7 @@ mod tests {
     #[tokio::test]
     async fn reconnect_replays_subscriptions() {
         let temp = unique_temp_dir("reconnect-subs");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -3671,7 +3663,7 @@ mod tests {
     #[tokio::test]
     async fn reconnect_replay_failure_does_not_fail_session() {
         let temp = unique_temp_dir("reconnect-replay-fail");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -3769,7 +3761,7 @@ mod tests {
     #[tokio::test]
     async fn unsubscribe_removes_from_replay_set() {
         let temp = unique_temp_dir("unsub-replay");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -3924,7 +3916,7 @@ mod tests {
     #[tokio::test]
     async fn retry_policy_safe_rebuilds_against_new_session() {
         let temp = unique_temp_dir("retry-safe");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -3976,7 +3968,7 @@ mod tests {
     #[tokio::test]
     async fn a_call_that_was_never_sent_is_sent_after_the_reconnect() {
         let temp = unique_temp_dir("retry-never-sent");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -4027,7 +4019,7 @@ mod tests {
     #[tokio::test]
     async fn retry_policy_unsafe_surfaces_retry_error() {
         let temp = unique_temp_dir("retry-unsafe");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -4082,7 +4074,7 @@ mod tests {
     #[tokio::test]
     async fn notifications_interleaved_before_response_are_forwarded() {
         let temp = unique_temp_dir("interleave");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -4179,7 +4171,7 @@ mod tests {
     #[tokio::test]
     async fn chunked_response_reassembly() {
         let temp = unique_temp_dir("chunked");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -4255,7 +4247,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_frame_is_reconnectable_failure() {
         let temp = unique_temp_dir("malformed");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -4458,7 +4450,7 @@ mod tests {
         // Real Unix socket reads don't complete under tokio::time::pause, so
         // use the test-only override instead of paused time.
         let temp = unique_temp_dir("stall");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
         let _watchdog = ReadWatchdogTestOverride::install(Duration::from_millis(150));
 
         let listener = bind_fake_daemon_socket();
@@ -4601,7 +4593,7 @@ mod tests {
     #[tokio::test]
     async fn watchdog_resets_on_interleaved_frames() {
         let temp = unique_temp_dir("watchdog-reset");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
         let _watchdog = ReadWatchdogTestOverride::install(Duration::from_millis(150));
 
         let listener = bind_fake_daemon_socket();
@@ -4752,7 +4744,7 @@ mod tests {
     #[tokio::test]
     async fn tool_result_with_an_envelope_key_is_not_mistaken_for_an_envelope() {
         let temp = unique_temp_dir("envelope-key");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let payload = serde_json::to_value(CallToolResult::structured(
             serde_json::json!({ "envelope": "sealed" }),
@@ -4782,7 +4774,7 @@ mod tests {
     #[tokio::test]
     async fn a_tool_call_carries_the_progress_token_to_the_daemon() {
         let temp = unique_temp_dir("progress-token");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let payload = serde_json::to_value(CallToolResult::success(Vec::new()))
             .expect("serialize call result");
@@ -4815,7 +4807,7 @@ mod tests {
     #[tokio::test]
     async fn upstream_error_for_resources_read_reaches_the_client_as_that_error() {
         let temp = unique_temp_dir("read-error");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let payload = serde_json::to_value(McpError::resource_not_found(
             "no such resource: file:///missing",
@@ -4845,7 +4837,7 @@ mod tests {
     #[tokio::test]
     async fn update_roots_consumes_its_reply_past_a_gate_push() {
         let temp = unique_temp_dir("roots-gate");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -5022,7 +5014,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_calls_complete_out_of_order_and_notifications_still_arrive() {
         let temp = unique_temp_dir("concurrent-calls");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let (release_slow, slow_released) = tokio::sync::oneshot::channel::<()>();
@@ -5118,7 +5110,7 @@ mod tests {
     #[tokio::test]
     async fn chunked_reply_and_small_reply_route_to_their_own_requests() {
         let temp = unique_temp_dir("concurrent-chunked");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -5178,7 +5170,7 @@ mod tests {
     #[tokio::test]
     async fn connection_drop_resolves_every_in_flight_request_with_one_reconnect() {
         let temp = unique_temp_dir("concurrent-drop");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -5241,17 +5233,14 @@ mod tests {
 
     impl RequestCeilingTestOverride {
         fn install(duration: Duration) -> Self {
-            FAKE_REQUEST_CEILING_MS.store(
-                duration.as_millis() as u64,
-                std::sync::atomic::Ordering::SeqCst,
-            );
+            FAKE_REQUEST_CEILING.set(duration.as_millis() as u64);
             Self
         }
     }
 
     impl Drop for RequestCeilingTestOverride {
         fn drop(&mut self) {
-            FAKE_REQUEST_CEILING_MS.store(600_000, std::sync::atomic::Ordering::SeqCst);
+            FAKE_REQUEST_CEILING.set(FAKE_REQUEST_CEILING_MS);
         }
     }
 
@@ -5261,7 +5250,7 @@ mod tests {
     async fn a_request_the_daemon_never_answers_fails_at_the_ceiling() {
         let _ceiling = RequestCeilingTestOverride::install(Duration::from_millis(500));
         let temp = unique_temp_dir("request-ceiling");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {

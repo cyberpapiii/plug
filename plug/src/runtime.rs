@@ -697,7 +697,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let config_path = runtime_root.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
@@ -746,7 +746,7 @@ mod tests {
                 "pst-{}",
                 &uuid::Uuid::new_v4().simple().to_string()[..8]
             ));
-            let _paths = plug_core::paths::test::isolate(&temp).await;
+            let _paths = plug_core::paths::test::isolate(&temp);
             std::fs::create_dir_all(plug_core::paths::dir()).expect("create runtime dir");
             let mut config = plug_core::config::Config::default();
             let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve HTTP port");

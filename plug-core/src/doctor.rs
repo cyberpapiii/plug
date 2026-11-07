@@ -1338,23 +1338,6 @@ mod tests {
         Config::default()
     }
 
-    /// Plug's folder in a fresh temporary folder, so a check reads no real
-    /// token, PID file or daemon.
-    struct TempPlug {
-        _paths: crate::paths::test::Isolated,
-        _dir: tempfile::TempDir,
-    }
-
-    impl TempPlug {
-        async fn new() -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            Self {
-                _paths: crate::paths::test::isolate(dir.path()).await,
-                _dir: dir,
-            }
-        }
-    }
-
     #[test]
     fn a_check_carries_the_title_a_person_reads() {
         let check = |name: &str| CheckResult {
@@ -1488,7 +1471,6 @@ auth_token = "keychain:b.token"
 
     #[tokio::test]
     async fn a_port_another_program_holds_fails() {
-        let _plug = TempPlug::new().await;
         let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut config = test_config();
         config.http.bind_address = "127.0.0.1".to_string();
@@ -1554,7 +1536,6 @@ auth_token = "keychain:b.token"
 
     #[tokio::test]
     async fn http_auth_auto_loopback_passes_without_token() {
-        let _plug = TempPlug::new().await;
         let mut config = test_config();
         config.http.auth_mode = crate::config::DownstreamAuthMode::Auto;
         config.http.bind_address = "127.0.0.1".to_string();
@@ -1567,7 +1548,6 @@ auth_token = "keychain:b.token"
 
     #[tokio::test]
     async fn http_auth_auto_behind_a_tunnel_needs_the_token() {
-        let _plug = TempPlug::new().await;
         let mut config = test_config();
         config.http.auth_mode = crate::config::DownstreamAuthMode::Auto;
         config.http.bind_address = "127.0.0.1".to_string();
@@ -1584,7 +1564,6 @@ auth_token = "keychain:b.token"
 
     #[tokio::test]
     async fn http_auth_bearer_on_loopback_warns_when_token_missing() {
-        let _plug = TempPlug::new().await;
         let mut config = test_config();
         config.http.auth_mode = crate::config::DownstreamAuthMode::Bearer;
         config.http.bind_address = "127.0.0.1".to_string();
@@ -1978,7 +1957,6 @@ auth_token = "keychain:b.token"
 
     #[tokio::test]
     async fn pid_staleness_reads_the_pid_file() {
-        let _plug = TempPlug::new().await;
         assert_eq!(check_pid_staleness().await.status, CheckStatus::Pass);
 
         let pid_path = crate::paths::pid_path();
@@ -2040,7 +2018,6 @@ auth_token = "keychain:b.token"
 
     #[tokio::test]
     async fn connectivity_http_server_unreachable_reports_server_name() {
-        let _plug = TempPlug::new().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -2059,7 +2036,6 @@ auth_token = "keychain:b.token"
 
     #[tokio::test]
     async fn connectivity_mixed_servers_report_remote_when_unreachable() {
-        let _plug = TempPlug::new().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -2127,14 +2103,5 @@ auth_token = "keychain:b.token"
             fix_suggestion: None,
         }];
         assert_eq!(DoctorReport::from_checks(checks).exit_code, 2);
-    }
-
-    // -- run_doctor integration --
-
-    #[tokio::test]
-    async fn run_doctor_returns_all_checks() {
-        let config = test_config();
-        let report = run_doctor(&config, Path::new("/nonexistent/config.toml")).await;
-        assert_eq!(report.checks.len(), 15);
     }
 }

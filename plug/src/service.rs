@@ -431,8 +431,7 @@ pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> 
     if crate::ipc_client::daemon_running().await {
         return Ok(false);
     }
-    #[cfg(test)]
-    if plug_core::paths::test::active() {
+    if cfg!(test) {
         anyhow::bail!("test daemon unavailable; refusing to mutate launchd");
     }
     // A held runtime lock with no socket means a daemon claimed the singleton
@@ -969,7 +968,7 @@ arguments = {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&root).expect("create runtime root");
-        let _paths = plug_core::paths::test::isolate(&root).await;
+        let _paths = plug_core::paths::test::isolate(&root);
 
         let started = std::time::Instant::now();
         let error = wait_for_daemon_socket(false, true)
@@ -998,7 +997,7 @@ arguments = {
             std::process::id(),
             uuid::Uuid::new_v4().as_fields().0
         ));
-        let _paths = plug_core::paths::test::isolate(&root).await;
+        let _paths = plug_core::paths::test::isolate(&root);
         let socket = plug_core::paths::socket_path();
         std::fs::create_dir_all(socket.parent().expect("socket has a parent"))
             .expect("create runtime dir");
@@ -1024,11 +1023,7 @@ arguments = {
     }
 
     #[tokio::test]
-    async fn redirected_test_runtime_never_mutates_launchd() {
-        let temp =
-            std::env::temp_dir().join(format!("plug-service-launchd-guard-{}", std::process::id()));
-        let _paths = plug_core::paths::test::isolate(&temp).await;
-
+    async fn a_test_never_mutates_launchd() {
         let result = ensure_started(None).await;
         let error = result.expect_err("test startup must fail closed");
         assert!(
