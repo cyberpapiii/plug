@@ -80,6 +80,11 @@ final class GoldenPayloadTests: XCTestCase {
             "add_server": op(.mutate(.addServer(name: "workspace", server: stdioServer), secretStore: "file")),
             "add_remote_server": mutate(.addServer(name: "notes", server: remoteServer)),
             "update_server": mutate(.updateServer(name: "pets", server: apiServer)),
+            "import_servers": mutate(.importServers([ImportedServer(
+                name: "github",
+                sourceTarget: "cursor",
+                server: .command("npx", args: ["-y", "github-mcp"])
+            )])),
             "remove_server": mutate(.removeServer(name: "workspace")),
             "add_account": mutate(.addAccount(server: "workspace", account: "work")),
             "set_server_enabled": mutate(.setServerEnabled(name: "workspace", enabled: false)),
@@ -258,6 +263,35 @@ final class GoldenPayloadTests: XCTestCase {
         XCTAssertEqual(remote, try asTheDaemonKeepsIt(Self.remoteServer))
     }
 
+    /// Every setting the daemon's `ServerConfig` has is a field here. A
+    /// setting added to the daemon fails this until the app models it.
+    func testTheAppModelsEveryServerSetting() throws {
+        let server = try decoder.decode(ServerConfig.self, from: golden("server_config_every_field.json"))
+        XCTAssertEqual(server.unmodeled, [:], "the app's ServerConfig has no field for these")
+        let sent = try JSONSerialization.jsonObject(with: PlugIPCClient.makeEncoder().encode(server))
+        XCTAssertEqual(
+            sent as? NSDictionary,
+            try JSONSerialization.jsonObject(with: golden("server_config_every_field.json")) as? NSDictionary
+        )
+    }
+
+    /// A setting the app has no field for goes back to the daemon as it
+    /// came, so editing a server in an older app keeps it.
+    func testASettingTheAppDoesNotModelSurvivesASave() throws {
+        var json = try goldens("server_config_default.json")
+        json["future_setting"] = ["max_items": 3, "names": ["a"], "on": true]
+        var server = try decoder.decode(ServerConfig.self, from: JSONSerialization.data(withJSONObject: json))
+        server.args = ["--edited"]
+        let sent = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: PlugIPCClient.makeEncoder().encode(server)) as? [String: Any]
+        )
+        XCTAssertEqual(
+            sent["future_setting"] as? NSDictionary,
+            ["max_items": 3, "names": ["a"], "on": true] as NSDictionary
+        )
+        XCTAssertEqual(sent["args"] as? [String], ["--edited"])
+    }
+
     /// A server the app sent, read back once the daemon has filled in what
     /// the app left out.
     private func asTheDaemonKeepsIt(_ server: ServerConfig) throws -> ServerConfig {
@@ -302,7 +336,11 @@ final class GoldenPayloadTests: XCTestCase {
 
     func testSmallReplies() throws {
         guard case .validated = try response("server_validated") else { return XCTFail() }
-        guard case .mutation = try response("mutation") else { return XCTFail() }
+        guard case let .mutation(none) = try response("mutation") else { return XCTFail() }
+        XCTAssertEqual(none, [])
+        // An import says the name each server went in under.
+        guard case let .mutation(imported) = try response("imported") else { return XCTFail() }
+        XCTAssertEqual(imported, ["github-cursor"])
         guard case let .revoked(id) = try response("revoked") else { return XCTFail() }
         XCTAssertEqual(id, "abc")
         guard case .reloaded = try response("reloaded") else { return XCTFail() }

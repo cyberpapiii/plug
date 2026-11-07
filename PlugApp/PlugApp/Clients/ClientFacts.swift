@@ -65,6 +65,13 @@ extension LiveSession {
     /// The session reached Plug over the network rather than from this Mac.
     var isRemote: Bool { transport == "http" }
 
+    /// The key the daemon keeps this client under: the one its requests
+    /// carry, which its calls in Activity carry too. Its name and its place
+    /// are looked up and set under it. A remote session with no grant has
+    /// the key every such session shares, not the key of the app it says it
+    /// is, so it is never taken for that app on this Mac.
+    var key: String? { accessKey ?? clientKey }
+
     /// The key server choices for this session are stored under: the one its
     /// requests carry, when that key is the client's own. A remote session
     /// with no grant shares its key with every other such session, so it has
@@ -169,13 +176,13 @@ struct ClientNames: Equatable {
     /// Plug does not know takes the name on its grant, which the owner
     /// approved, ahead of whatever the session says about itself.
     func displayName(_ session: LiveSession) -> String {
-        name(forKey: session.clientKey) ?? originalName(session)
+        name(forKey: session.key) ?? originalName(session)
     }
 
     /// What a session is called before the owner names it.
     func originalName(_ session: LiveSession) -> String {
         session.knownName
-            ?? grantName(forKey: session.clientKey)
+            ?? grantName(forKey: session.key)
             ?? session.displayName
     }
 
@@ -194,7 +201,7 @@ struct ClientNames: Equatable {
 
     /// The target whose icon a session shows. A call is pictured the same way.
     func target(of session: LiveSession) -> String {
-        let key = session.clientKey
+        let key = session.key
         return ClientIdentity.resolve(
             ownerName: name(forKey: key), daemonTarget: session.target,
             reported: session.clientType, grantName: grantName(forKey: key)
@@ -202,17 +209,16 @@ struct ClientNames: Equatable {
     }
 
     /// The client a session is a connection of. Every count of connected
-    /// clients counts these. A sign-in over the network is a client of its
-    /// own, whatever it reports. A client Plug knows is one client on this
-    /// Mac and one over the network, however it is keyed. Any other is told
-    /// apart by its key.
+    /// clients counts these. Over the network a client is its key: a
+    /// sign-in's own, or the one every session without a sign-in shares,
+    /// since the daemon cannot tell those apart. On this Mac a client Plug
+    /// knows is one client however it is keyed, and any other is told apart
+    /// by its key.
     func client(of session: LiveSession) -> String {
-        if session.isRemote, let own = session.ownAccessKey { return own }
+        if session.isRemote { return session.key ?? session.sessionId }
         let target = target(of: session)
-        if ClientIdentity.displayName(forTarget: target) != nil {
-            return session.isRemote ? "remote:\(target)" : target
-        }
-        return session.ownAccessKey ?? session.sessionId
+        if ClientIdentity.displayName(forTarget: target) != nil { return target }
+        return session.key ?? session.sessionId
     }
 
     /// The distinct clients behind a set of open sessions, first seen first,

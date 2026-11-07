@@ -5,8 +5,15 @@
 //! files. Each file is written here from the types the commands print, so a
 //! renamed field fails this test. When the change is meant, rerun with
 //! `PLUG_REGENERATE_GOLDENS=1` and change the app to match.
+//!
+//! `commands.json` is the other half: every command line the app runs, or
+//! writes into a client's settings, which the app's tests hold its services
+//! to and this parses with the CLI's own parser.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+use clap::Parser;
 
 use plug_core::clients::ClientTarget;
 use plug_core::config::{ServerConfig, TransportType};
@@ -253,6 +260,7 @@ fn the_cli_goldens_are_what_the_commands_print() {
         files,
         [
             "clients.json",
+            "commands.json",
             "doctor.json",
             "import.json",
             "repair_clean.json",
@@ -260,4 +268,25 @@ fn the_cli_goldens_are_what_the_commands_print() {
         ],
         "testdata/cli holds a file nothing checks"
     );
+}
+
+/// A flag or subcommand the app uses, renamed or removed here, fails this.
+#[test]
+fn every_command_the_app_runs_parses() {
+    let commands: BTreeMap<String, Vec<String>> = serde_json::from_str(
+        &std::fs::read_to_string(dir().join("commands.json")).expect("read commands.json"),
+    )
+    .expect("commands.json is a map of argument lists");
+    assert!(!commands.is_empty());
+    for (name, arguments) in commands {
+        let argv = std::iter::once("plug".to_string()).chain(arguments.iter().cloned());
+        match crate::Cli::try_parse_from(argv) {
+            Ok(_) => {}
+            Err(error) if error.kind() == clap::error::ErrorKind::DisplayVersion => {}
+            Err(error) => panic!(
+                "{name}: `plug {}` does not parse: {error}",
+                arguments.join(" ")
+            ),
+        }
+    }
 }

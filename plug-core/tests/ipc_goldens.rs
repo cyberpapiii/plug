@@ -118,6 +118,48 @@ fn api_server() -> ServerConfig {
     }
 }
 
+/// A server with every field set to something other than its default. The
+/// literal names every field, so a field added to `ServerConfig` does not
+/// compile here until it is given a value, and then shows in
+/// `server_config_every_field.json`, which the app's tests require its own
+/// `ServerConfig` to model.
+fn every_field_server() -> ServerConfig {
+    ServerConfig {
+        command: Some("uvx".to_string()),
+        args: vec!["workspace-mcp".to_string()],
+        env: [("TOKEN".to_string(), "$TOKEN".to_string())].into(),
+        enabled: false,
+        transport: TransportType::Http,
+        protocol_mode: plug_core::config::UpstreamProtocolMode::Auto,
+        url: Some("https://example.com/mcp".to_string()),
+        auth_token: Some(plug_core::config::REDACTED_SECRET.to_string().into()),
+        auth: Some("oauth".to_string()),
+        oauth_client_id: Some("plug".to_string()),
+        oauth_scopes: Some(vec!["read".to_string()]),
+        timeout_secs: 45,
+        call_timeout_secs: 600,
+        max_concurrent: 2,
+        health_check_interval_secs: 120,
+        circuit_breaker_enabled: false,
+        tool_renames: [("search".to_string(), "find".to_string())].into(),
+        tool_groups: vec![ToolGroupRule {
+            prefix: "Gmail".to_string(),
+            contains: vec!["gmail".to_string()],
+            strip: vec!["gmail".to_string()],
+        }],
+        sandbox: Some(StdioSandboxConfig {
+            enabled: true,
+            allow_network: true,
+            allow_read: vec!["/Users/me/notes".into()],
+            allow_write: vec!["/tmp".into()],
+            profile_path: Some("/Users/me/plug.sb".into()),
+        }),
+        spec: Some("https://example.com/openapi.json".to_string()),
+        operations: vec!["listPets".to_string()],
+        token_in: Some("header:X-Api-Key".to_string()),
+    }
+}
+
 fn requests() -> BTreeMap<&'static str, IpcRequest> {
     BTreeMap::from([
         (
@@ -184,6 +226,20 @@ fn requests() -> BTreeMap<&'static str, IpcRequest> {
             "remove_server",
             mutate(OperatorMutation::RemoveServer {
                 name: "workspace".to_string(),
+            }),
+        ),
+        (
+            "import_servers",
+            mutate(OperatorMutation::ImportServers {
+                servers: vec![plug_core::import::ImportedServer {
+                    name: "github".to_string(),
+                    source_target: "cursor".to_string(),
+                    server: ServerConfig {
+                        command: Some("npx".to_string()),
+                        args: vec!["-y".to_string(), "github-mcp".to_string()],
+                        ..Default::default()
+                    },
+                }],
             }),
         ),
         (
@@ -683,6 +739,20 @@ fn responses() -> BTreeMap<&'static str, IpcResponse> {
             },
         ),
         (
+            "imported",
+            IpcResponse::OperatorMutation {
+                result: OperatorMutationResult {
+                    server: None,
+                    disabled_tools: None,
+                    imported: Some(vec![OperatorServerSummary::from_config(
+                        "github-cursor".to_string(),
+                        &ServerConfig::default(),
+                    )]),
+                },
+                reload: reload_report(),
+            },
+        ),
+        (
             "revoked",
             IpcResponse::DownstreamClientRevoked {
                 client_id: "abc".to_string(),
@@ -748,6 +818,10 @@ fn the_goldens_are_what_the_daemon_writes() {
         "server_config_default.json",
         pretty(&ServerConfig::default()),
     );
+    check(
+        "server_config_every_field.json",
+        pretty(&every_field_server()),
+    );
 
     let mut files: Vec<String> = std::fs::read_dir(dir())
         .expect("testdata/ipc")
@@ -760,7 +834,8 @@ fn the_goldens_are_what_the_daemon_writes() {
             "chunked_response.json",
             "requests.json",
             "responses.json",
-            "server_config_default.json"
+            "server_config_default.json",
+            "server_config_every_field.json"
         ],
         "testdata/ipc holds a file nothing checks"
     );
@@ -802,7 +877,7 @@ const NOT_SENT_BY_THE_APP: &[&str] = &[
 ];
 
 /// Changes only the command line asks for.
-const MUTATIONS_NOT_SENT_BY_THE_APP: &[&str] = &["ImportServers", "SetLazyTools"];
+const MUTATIONS_NOT_SENT_BY_THE_APP: &[&str] = &["SetLazyTools"];
 
 /// Replies the app never reads: they answer `plug connect`, the command line,
 /// or a request the app does not send.
@@ -900,6 +975,21 @@ fn every_request_has_a_golden() {
             .collect(),
         "ClientBlockKind"
     );
+}
+
+/// Every field of the every-field server is written, and none with its
+/// default, so the app's test of it covers every setting.
+#[test]
+fn the_every_field_server_sets_every_field() {
+    let every = serde_json::to_value(every_field_server()).unwrap();
+    let default = serde_json::to_value(ServerConfig::default()).unwrap();
+    let every = every.as_object().unwrap();
+    for (key, value) in default.as_object().unwrap() {
+        assert_ne!(every.get(key), Some(value), "{key} is left at its default");
+    }
+    for key in ["spec", "operations", "token_in"] {
+        assert!(every.contains_key(key), "{key} is not written");
+    }
 }
 
 /// A reply added to the wire without a golden in `responses.json` fails

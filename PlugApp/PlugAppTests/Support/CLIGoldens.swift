@@ -7,6 +7,12 @@ func cliGolden(_ name: String, filePath: String = #filePath) throws -> Data {
     try Data(contentsOf: testdata(filePath).appending(path: "cli/\(name)"))
 }
 
+/// The command lines the app runs, by name, from `testdata/cli/commands.json`,
+/// which `plug/src/cli_goldens.rs` parses with the CLI's own parser.
+func cliCommands(filePath: String = #filePath) throws -> [String: [String]] {
+    try JSONDecoder().decode([String: [String]].self, from: cliGolden("commands.json", filePath: filePath))
+}
+
 /// The daemon's replies from `testdata/ipc/responses.json`, by the name
 /// `plug-core/tests/ipc_goldens.rs` files each under.
 func ipcResponseGoldens(filePath: String = #filePath) throws -> [String: [String: Any]] {

@@ -8,7 +8,7 @@ struct AppSignatureEvidence: Equatable, Sendable {
     let teamID: String
 }
 
-enum AppInstallationError: LocalizedError, Equatable {
+enum AppInstallationError: LocalizedError, AdvisedError, Equatable {
     case invalidSignature
     case wrongBundleIdentifier(String)
     case untrustedTeam(String)
@@ -34,6 +34,11 @@ enum AppInstallationError: LocalizedError, Equatable {
         case let .versionMismatch(app, embedded):
             "This copy of Plug is version \(app), and the service inside it is \(embedded). Download Plug again and replace this copy."
         }
+    }
+
+    var advice: String {
+        if case let .embeddedVersionFailure(detail) = self { return Explain.advice(forOutside: detail) }
+        return Explain.fallback
     }
 }
 

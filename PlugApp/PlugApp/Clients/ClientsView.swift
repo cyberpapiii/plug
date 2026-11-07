@@ -27,7 +27,7 @@ struct ClientsView: View {
     private func roster(of apps: [LinkableApp]) -> AppRoster {
         let names = self.names
         return AppRoster(apps: apps, sessions: sessions) {
-            names.knownTarget(named: names.name(forKey: $0.clientKey))
+            names.knownTarget(named: names.name(forKey: $0.key))
         }
     }
     /// Kept by the model and built once per snapshot. Every row asks it
@@ -49,7 +49,7 @@ struct ClientsView: View {
         var result: [(id: String, sessions: [LiveSession])] = []
         var index: [String: Int] = [:]
         for session in roster.other {
-            if let key = session.clientKey, grantKeys.contains(key) { continue }
+            if let key = session.key, grantKeys.contains(key) { continue }
             let id = "session:\(names.client(of: session))"
             if let at = index[id] {
                 result[at].sessions.append(session)
@@ -259,7 +259,7 @@ struct ClientsView: View {
             .map { appEntry($0, sessions: []) }
         let granted = grants.map { grant in
             let target = names.target(ofGrant: grant)
-            var own = sessions.filter { $0.clientKey == grant.clientKey }
+            var own = sessions.filter { $0.key == grant.clientKey }
             // A uniquely identified grant can show its still-open local
             // sessions too. Multiple grants remain separate identities.
             if represented.contains(target), model.snapshot.downstreamClients.filter({
@@ -273,7 +273,7 @@ struct ClientsView: View {
         // its own above. Its last call puts it here.
         let shown = Set((apps + idle + others + granted).flatMap { [$0.renameKey, $0.placeKey].compactMap { $0 } })
             .union(allApps.map(\.target))
-            .union(sessions.compactMap(\.clientKey))
+            .union(sessions.compactMap(\.key))
         let recent = RecentCallers.latest(model.activities, excluding: shown)
             .map(recentEntry)
             .filter { matches($0.name) }
@@ -342,7 +342,7 @@ struct ClientsView: View {
             id: id,
             group: first.isRemote ? .network : .onThisMac,
             place: ClientPlaces.place(
-                owners: names.place(forKey: first.clientKey),
+                owners: names.place(forKey: first.key),
                 group: first.isRemote ? .network : .onThisMac
             ),
             name: name,
@@ -360,8 +360,8 @@ struct ClientsView: View {
             setOn: { _ in },
             about: "Plug does not recognize this client, so it has no switch. It shows here while it is connected.",
             access: choices,
-            renameKey: first.clientKey,
-            placeKey: first.clientKey,
+            renameKey: first.key,
+            placeKey: first.key,
             disambiguator: String(first.sessionId.prefix(4))
         )
     }
@@ -396,8 +396,10 @@ struct ClientsView: View {
             setOn: { _ in },
             about: "Not connected now. This client connects when it has something to do and leaves when it is done, so Plug lists it by its last call. It stays here while that call is in Activity.",
             access: choices,
-            renameKey: choices == nil ? nil : key,
-            placeKey: choices == nil ? nil : key
+            // Named and placed under the key its calls carry, as the row of
+            // the same client is while it is connected.
+            renameKey: key,
+            placeKey: key
         )
     }
 

@@ -354,10 +354,26 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(overNetwork.connected[0].sessions.map(\.sessionId), ["l1", "r2"])
         XCTAssertEqual(overNetwork.other.map(\.sessionId), ["r1"])
 
-        // The window and the menu bar count the same three clients.
+        // The window and the menu bar count the same three clients. The one
+        // with no sign-in is the daemon's shared key, which its calls carry.
         let names = ClientNames(names: [])
-        XCTAssertEqual(live.map(names.client(of:)), ["cursor", "oauth:abc", "remote:cursor"])
+        XCTAssertEqual(live.map(names.client(of:)), ["cursor", "oauth:abc", "remote:shared"])
         XCTAssertEqual(names.connectedClients(live + live).count, 3)
+        XCTAssertEqual(live.map(\.key), ["cursor", "oauth:abc", "remote:shared"])
+
+        // A name given to the local app is not the network client's, and one
+        // given to the network client is the name its calls show.
+        let named = ClientNames(names: try JSONDecoder().decode(
+            [ClientName].self,
+            from: Data(#"[{"key":"cursor","name":"Desk"},{"key":"remote:shared","name":"Token"}]"#.utf8)
+        ))
+        XCTAssertEqual(live.map(named.displayName), ["Desk", "Cursor", "Token"])
+        let call = ActivityEvent(
+            sequence: 1, occurredAtMs: 0, client: "r2", method: "tools/call", server: nil,
+            clientType: "Cursor", clientKey: ActivityEvent.sharedRemoteKey, target: "cursor",
+            remote: true, latencyMs: 1, outcome: .success
+        )
+        XCTAssertEqual(named.call(call, delimiter: "__").caller, "Token")
     }
 
     func testASessionFromNoKnownAppIsKeptApart() throws {
@@ -928,15 +944,22 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertEqual(Explain.advice(forReason: "zzz"), Explain.fallback)
     }
 
-    func testAPartialImportNamesWhatFailed() {
-        XCTAssertEqual(
-            ImportServersView.summary(failed: ["notion"], of: 3),
-            "Could not add notion. 2 servers were added. The reason is under each one."
-        )
-        XCTAssertEqual(
-            ImportServersView.summary(failed: ["a", "b", "c", "d", "e"], of: 5),
-            "Could not add a, b, c, and 2 more. The reason is under each one."
-        )
+    /// The app's own errors carry their advice. Their words are the app's,
+    /// so "deadline" or "unexpected" in one is not read as a slow server or
+    /// a bad entry; text from outside the app inside one still is.
+    func testTheAppsOwnErrorsCarryTheirAdvice() {
+        XCTAssertEqual(Explain.advice(for: PlugIPCError.timedOut), Explain.fallback)
+        XCTAssertEqual(Explain.advice(for: PlugIPCError.unexpectedResponse("Tools")), Explain.fallback)
+        XCTAssertEqual(Explain.advice(for: PlugIPCError.disconnected), Explain.starting)
+        XCTAssertEqual(Explain.advice(for: DaemonServiceError.registrationDisabled), Explain.fallback)
+        XCTAssertEqual(Explain.advice(for: DaemonServiceError.commandFailed("")), Explain.fallback)
+
+        XCTAssertTrue(Explain.advice(for: PlugIPCError.daemon("E", "token expired")).contains("Sign in"))
+        XCTAssertTrue(Explain.advice(for: AppLinkError.commandFailed("Permission denied")).contains("access"))
+        XCTAssertTrue(Explain.advice(for: ClientRepairError.commandFailed(status: 1, stderr: "os error 2")).contains("command"))
+
+        let outside = NSError(domain: "x", code: 1, userInfo: [NSLocalizedDescriptionKey: "connection refused"])
+        XCTAssertTrue(Explain.advice(for: outside).contains("address"))
     }
 
     /// A new sign-in under a name others gave asks which one it is, once.

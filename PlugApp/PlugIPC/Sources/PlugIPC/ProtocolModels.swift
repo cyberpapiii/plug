@@ -238,8 +238,9 @@ public struct EventStatus: Codable, Identifiable, Equatable, Sendable {
 
 }
 
-/// Any JSON value, for the arguments a watched tool is called with.
-public enum JSONValue: Encodable, Equatable, Sendable {
+/// Any JSON value: the arguments a watched tool is called with, and the
+/// server settings the app has no field for.
+public enum JSONValue: Codable, Equatable, Sendable {
     case null
     case bool(Bool)
     case number(Double)
@@ -270,6 +271,24 @@ public enum JSONValue: Encodable, Equatable, Sendable {
             }
             self = .object(values)
         default: return nil
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else if let value = try? container.decode(Bool.self) {
+            self = .bool(value)
+        } else if let value = try? container.decode(Double.self) {
+            self = .number(value)
+        } else if let value = try? container.decode(String.self) {
+            self = .string(value)
+        } else if let values = try? container.decode([JSONValue].self) {
+            self = .array(values)
+        } else {
+            // A dictionary keeps its keys as written, as on the way out.
+            self = .object(try container.decode([String: JSONValue].self))
         }
     }
 
@@ -523,6 +542,11 @@ public struct ServerConfig: Codable, Equatable, Sendable {
     public var operations: [String] = []
     /// Where an API server sends its token; the app carries it unchanged.
     public var tokenIn: String?
+    /// Settings the daemon sent that this type has no field for, sent back
+    /// as they came. The daemon stores the server it is sent whole, so
+    /// without them a save from an app older than the daemon would erase
+    /// them.
+    public var unmodeled: [String: JSONValue] = [:]
 
     public static func command(_ command: String, args: [String]) -> Self {
         Self(command: command, args: args, transport: "stdio")
@@ -573,6 +597,10 @@ extension ServerConfig {
         spec = try c.decodeIfPresent(String.self, forKey: .spec)
         operations = try c.decodeIfPresent([String].self, forKey: .operations) ?? []
         tokenIn = try c.decodeIfPresent(String.self, forKey: .tokenIn)
+        let all = try decoder.container(keyedBy: AnyKey.self)
+        for key in all.allKeys where CodingKeys(stringValue: key.stringValue) == nil {
+            unmodeled[key.stringValue] = try all.decode(JSONValue.self, forKey: key)
+        }
     }
 
     /// Leaves out what is nil and an empty `operations`.
@@ -600,7 +628,22 @@ extension ServerConfig {
         try c.encodeIfPresent(spec, forKey: .spec)
         if !operations.isEmpty { try c.encode(operations, forKey: .operations) }
         try c.encodeIfPresent(tokenIn, forKey: .tokenIn)
+        // Each key is the one the decoder handed over, which the encoder's
+        // key strategy turns back into the daemon's spelling.
+        var rest = encoder.container(keyedBy: AnyKey.self)
+        for (key, value) in unmodeled {
+            try rest.encode(value, forKey: AnyKey(stringValue: key))
+        }
     }
+}
+
+/// A key known only when it is read.
+private struct AnyKey: CodingKey {
+    let stringValue: String
+    var intValue: Int? { nil }
+
+    init(stringValue: String) { self.stringValue = stringValue }
+    init?(intValue: Int) { nil }
 }
 
 public struct ToolGroupRule: Codable, Equatable, Sendable {
@@ -733,6 +776,10 @@ public enum OperatorRequest: Encodable, Equatable, Sendable {
 /// One change to the config file, which the daemon saves and applies.
 public enum OperatorMutation: Encodable, Equatable, Sendable {
     case addServer(name: String, server: ServerConfig)
+    /// Add servers found in other clients' settings, all or none. A name
+    /// already taken goes in with its client's slug after it, as
+    /// `plug import` names it.
+    case importServers([ImportedServer])
     case updateServer(name: String, server: ServerConfig)
     case removeServer(name: String)
     /// Add a configured server again as `<server>-<account>`.
@@ -753,7 +800,7 @@ public enum OperatorMutation: Encodable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case type, name, server, enabled, tool, key, kind, target, blocked, place, watch, event
-        case account, from, to
+        case account, from, to, servers
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -762,6 +809,8 @@ public enum OperatorMutation: Encodable, Equatable, Sendable {
         case let .addServer(name, server):
             try c.encode("AddServer", forKey: .type)
             try c.encode(name, forKey: .name); try c.encode(server, forKey: .server)
+        case let .importServers(servers):
+            try c.encode("ImportServers", forKey: .type); try c.encode(servers, forKey: .servers)
         case let .updateServer(name, server):
             try c.encode("UpdateServer", forKey: .type)
             try c.encode(name, forKey: .name); try c.encode(server, forKey: .server)
@@ -797,6 +846,20 @@ public enum OperatorMutation: Encodable, Equatable, Sendable {
     }
 }
 
+/// A server found in another client's settings, on its way into the config.
+public struct ImportedServer: Encodable, Equatable, Sendable {
+    public var name: String
+    /// The slug of the client it was found in.
+    public var sourceTarget: String
+    public var server: ServerConfig
+
+    public init(name: String, sourceTarget: String, server: ServerConfig) {
+        self.name = name
+        self.sourceTarget = sourceTarget
+        self.server = server
+    }
+}
+
 /// What a per-client block names.
 public enum ClientBlockKind: String, Encodable, Sendable {
     case server
@@ -817,7 +880,8 @@ public enum IPCResponse: Decodable, Sendable {
     case tools([ToolInfo])
     case validated
     case apiDescribed(APISummary)
-    case mutation
+    /// The names the servers of an import went in under; empty for any other change.
+    case mutation(imported: [String])
     case revoked(String)
     case reloaded
     case ok
@@ -825,7 +889,7 @@ public enum IPCResponse: Decodable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case type, handshake, snapshot, events, tools, clientId, code, message, name, server
-        case api, servers
+        case api, servers, result
     }
 
     public init(from decoder: Decoder) throws {
@@ -843,7 +907,13 @@ public enum IPCResponse: Decodable, Sendable {
         case "Tools": self = .tools(try c.decode([ToolInfo].self, forKey: .tools))
         case "ServerValidated": self = .validated
         case "ApiDescribed": self = .apiDescribed(try c.decode(APISummary.self, forKey: .api))
-        case "OperatorMutation": self = .mutation
+        case "OperatorMutation":
+            struct Result: Decodable {
+                struct Imported: Decodable { let name: String }
+                let imported: [Imported]?
+            }
+            let result = try c.decodeIfPresent(Result.self, forKey: .result)
+            self = .mutation(imported: result?.imported?.map(\.name) ?? [])
         case "DownstreamClientRevoked": self = .revoked(try c.decode(String.self, forKey: .clientId))
         case "Reloaded": self = .reloaded
         case "Ok": self = .ok

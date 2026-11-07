@@ -68,20 +68,21 @@ final class PlugActions {
         }
     }
 
-    /// Adds each server in turn. Returns why each one that failed did, by
-    /// its id; the rest went in.
-    func importServers(_ servers: [DiscoveredServer]) async throws -> [String: String] {
-        var failed: [String: String] = [:]
+    /// Adds the servers in one change, all or none, the way `plug import`
+    /// does. Returns the names they went in under: a name already taken gets
+    /// the client's slug after it.
+    func importServers(_ servers: [DiscoveredServer]) async throws -> [String] {
+        var names: [String] = []
         try await change { daemon in
-            for server in servers {
-                do {
-                    _ = try await daemon.send(.mutate(.addServer(name: server.name, server: server.config)))
-                } catch {
-                    failed[server.id] = error.localizedDescription
-                }
+            let imported = servers.map {
+                ImportedServer(name: $0.name, sourceTarget: $0.source, server: $0.config)
             }
+            guard case let .mutation(settled) = try await daemon.send(.mutate(.importServers(imported))) else {
+                throw PlugIPCError.unexpectedResponse("OperatorMutation")
+            }
+            names = settled
         }
-        return failed
+        return names
     }
 
     func addAccount(server: String, label: String) async throws {
@@ -253,8 +254,10 @@ struct ActionError: Identifiable, Equatable {
     let advice: String
 }
 
-private struct RuntimeUnavailableError: LocalizedError {
+private struct RuntimeUnavailableError: LocalizedError, AdvisedError {
     var errorDescription: String? {
         "Plug is starting. Try again in a moment."
     }
+
+    var advice: String { Explain.starting }
 }

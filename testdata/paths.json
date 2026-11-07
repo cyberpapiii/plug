@@ -15,5 +15,6 @@
   "app_executable": "Contents/MacOS/Plug",
   "daemon_args": ["serve", "--daemon"],
   "keychain_service": "plug",
-  "command_link": ".local/bin/plug"
+  "command_link": ".local/bin/plug",
+  "startup_budget_secs": 90
 }

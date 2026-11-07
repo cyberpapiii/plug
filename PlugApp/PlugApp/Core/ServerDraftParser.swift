@@ -105,7 +105,7 @@ enum ServerDraftParser {
             guard let draft = draft(named: name, from: container) else {
                 return .unreadable("That block has no command or address, so there is nothing to connect to.")
             }
-            return .draft(draft)
+            return isPlugItself(draft) ? .unreadable(plugItself) : .draft(draft)
         }
 
         let entries = container.compactMap { key, value -> ServerDraft? in
@@ -114,10 +114,28 @@ enum ServerDraftParser {
         }
         .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
 
-        guard let first = entries.first else {
-            return .unreadable("That block has no server in it. Paste the one with a command or address inside.")
+        guard let first = entries.first(where: { !isPlugItself($0) }) else {
+            return .unreadable(
+                entries.isEmpty
+                    ? "That block has no server in it. Paste the one with a command or address inside."
+                    : plugItself
+            )
         }
         return .draft(first)
+    }
+
+    private static let plugItself = "That is Plug's own entry. Adding it would connect Plug to itself."
+
+    /// An entry that is Plug, by the rule `plug import` skips it by
+    /// (`is_plug_itself` in `plug-core/src/clients/layout.rs`): named `plug`,
+    /// or running `plug connect` or `plug serve` under any name.
+    /// `testdata/server_entries.json` holds both to the same entries.
+    private static func isPlugItself(_ draft: ServerDraft) -> Bool {
+        if draft.name.lowercased() == "plug" { return true }
+        guard let command = draft.config.command,
+              URL(fileURLWithPath: command).lastPathComponent == "plug"
+        else { return false }
+        return draft.config.args.contains("connect") || draft.config.args.contains("serve")
     }
 
     private static func looksLikeServerBody(_ body: [String: Any]) -> Bool {
