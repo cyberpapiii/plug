@@ -1149,13 +1149,11 @@ mod tests {
 
     #[test]
     fn set_upstream_request_replays_a_cancel_that_arrived_before_it() {
-        // Regression guard for the task-cancellation window: if a task is
-        // cancelled before dispatch has recorded an upstream request ref,
-        // `mark_cancelled` has no ref to forward `notify_cancelled` to and
-        // used to drop the cancellation on the floor — the upstream would
-        // run the call to completion for a result nobody wants. The fix
-        // stashes a pending-cancel reason on the record and replays it via
-        // `set_upstream_request`'s return value once the ref lands.
+        // A task cancelled before dispatch has recorded an upstream request
+        // ref leaves `mark_cancelled` no ref to forward `notify_cancelled`
+        // to. The record keeps a pending-cancel reason, and
+        // `set_upstream_request`'s return value replays it once the ref
+        // lands, so the upstream does not run a call nobody wants.
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("ipc:a"));
         let task = store

@@ -3968,7 +3968,7 @@ async fn setup_refresh_parked_pre_publish() -> (
     (sm, router, old_state, new_state, gate_y, refresh)
 }
 
-/// Defect arm 1 (classify owner/route drift): a FIRST subscriber for x
+/// Owner/route drift: a FIRST subscriber for x
 /// lands entirely inside the parked pass's pre-publish window, resolves
 /// the OLD snapshot, and binds to the old owner. The pass classified
 /// before the entry existed, so pure old-vs-new route diffing would
@@ -4047,7 +4047,7 @@ async fn first_subscribe_during_refresh_window_heals_in_same_refresh() {
     }
 }
 
-/// Defect arm 2 (post-subscribe self-check): the first subscriber for x
+/// Post-subscribe self-check: the first subscriber for x
 /// resolves the OLD snapshot pre-publish, but its upstream subscribe call
 /// is still parked on the old server when the refresh publishes the new
 /// snapshot (x -> "new"). When the call lands, the entry's owner is
@@ -4184,7 +4184,7 @@ async fn setup_two_owner_router() -> (
     (sm, router, old_state, new_state)
 }
 
-/// Defect arm (caller cancellation): the heal must not ride the caller's
+/// Caller cancellation: the heal must not ride the caller's
 /// cancellable request future. A subscribe whose upstream confirmation is
 /// still parked when a refresh publish moves the URI — and whose
 /// downstream caller is then aborted — has no self-check left to run. The
@@ -4255,7 +4255,7 @@ async fn caller_cancelled_subscribe_still_heals_via_post_confirm_hook() {
     );
 }
 
-/// Defect arm (retry doesn't heal): a retry/second subscriber against an
+/// A retry or second subscriber against an
 /// already-skewed entry resolves the NEW route, so a self-check comparing
 /// the caller-resolved server against the published route sees nothing
 /// wrong. The self-check must compare the entry's RECORDED owner instead
@@ -4311,11 +4311,11 @@ async fn retry_subscribe_heals_stale_recorded_owner() {
     );
 }
 
-/// Defect arm (silent success on failed migration): the self-check heal
+/// A failed migration is not a silent success: the self-check heal
 /// unsubscribes the stale owner and, when the new owner's subscribe fails,
-/// the transition prunes the entry — the old contract returned Ok with no
-/// live subscription anywhere. The caller must now get an error, and a
-/// fresh subscribe afterwards must succeed cleanly against the new owner.
+/// the transition prunes the entry, leaving no live subscription anywhere.
+/// The caller must get an error, and a fresh subscribe afterwards must
+/// succeed cleanly against the new owner.
 #[tokio::test]
 async fn failed_heal_migration_propagates_error_to_subscriber() {
     let (_sm, router, old_state, new_state) = setup_two_owner_router().await;

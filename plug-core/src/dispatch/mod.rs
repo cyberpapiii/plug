@@ -5,7 +5,9 @@
 //! [`DownstreamContext`]. This module owns everything per method: the era's
 //! method set, authorization, task admission, routing to the [`ToolRouter`],
 //! capability projection, and the era's result vocabulary. A new MCP method is
-//! added here and nowhere else.
+//! added here, except the MCP Events methods (`events/list`,
+//! `events/subscribe`, `events/unsubscribe`), which only HTTP serves, in
+//! `http::server`.
 
 use std::sync::Arc;
 
