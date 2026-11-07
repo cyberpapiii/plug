@@ -1,15 +1,19 @@
 //! Daemon-owned operator mutations and atomic configuration persistence.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use figment::Figment;
-use figment::providers::{Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, ServerConfig, ToolBlock, TransportType, validate_config};
-use crate::proxy::is_disabled_tool;
+use crate::config::{
+    Config, ServerConfig, ToolBlock, TransportType, load_editable_config, validate_as_written,
+};
+use crate::tool_patterns::is_disabled_tool;
 
-#[derive(Debug, Clone)]
+/// One change to the config file. The daemon applies it for the command
+/// line and the app, which send it in [`crate::ipc::OperatorRequest::Mutate`];
+/// the command line applies it itself to a file named with `--config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum OperatorMutation {
     AddServer {
         name: String,
@@ -21,6 +25,11 @@ pub enum OperatorMutation {
     },
     RemoveServer {
         name: String,
+    },
+    /// Add servers found in other clients' settings, all or none, under the
+    /// names [`crate::import::settle_names`] gives them.
+    ImportServers {
+        servers: Vec<crate::import::ImportedServer>,
     },
     /// Add a configured server again as `<server>-<account>`, for a second
     /// account. See `account_copy`.
@@ -35,6 +44,12 @@ pub enum OperatorMutation {
     SetToolEnabled {
         tool: String,
         enabled: bool,
+    },
+    /// How a client is given its tools, by any name `plug link` takes for
+    /// it. `auto` removes the client's own setting.
+    SetLazyTools {
+        client: String,
+        setting: crate::types::LazyToolSetting,
     },
     /// Give a client a name of the owner's choosing. An empty name removes it.
     RenameClient {
@@ -60,9 +75,6 @@ pub enum OperatorMutation {
         target: String,
         blocked: bool,
     },
-    /// Nothing of its own: the file is saved with every tool block that can
-    /// be stored by server and tool stored that way.
-    PinToolBlocks,
     /// Watch a tool for change. See `crate::events`.
     AddWatch {
         watch: crate::events::WatchConfig,
@@ -112,7 +124,7 @@ impl OperatorServerSummary {
             name,
             enabled: server.enabled,
             transport: server.transport.clone(),
-            oauth: server.auth.as_deref() == Some("oauth"),
+            oauth: server.is_oauth(),
         }
     }
 }
@@ -123,6 +135,9 @@ pub struct OperatorMutationResult {
     /// Disabled-tool patterns after the mutation, for `SetToolEnabled`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_tools: Option<Vec<String>>,
+    /// The servers `ImportServers` added, under the names they went in as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported: Option<Vec<OperatorServerSummary>>,
 }
 
 impl OperatorMutationResult {
@@ -130,47 +145,83 @@ impl OperatorMutationResult {
         Self {
             server: summary,
             disabled_tools: None,
+            imported: None,
         }
     }
-}
-
-#[allow(clippy::result_large_err)]
-pub fn load_editable_config(path: &Path) -> Result<Config, figment::Error> {
-    if !path.exists() {
-        return Ok(Config::default());
-    }
-    Figment::new()
-        .merge(Serialized::defaults(Config::default()))
-        .merge(Toml::file(path))
-        .extract()
 }
 
 pub fn apply_operator_mutation(
     path: &Path,
     mutation: OperatorMutation,
 ) -> anyhow::Result<(Config, OperatorMutationResult)> {
-    apply_operator_mutation_knowing(path, mutation, &|_| None)
+    apply_operator_mutation_knowing(path, mutation, &Offline)
 }
 
-/// The server and the server's own name behind a name Plug lists a tool
-/// under, when a tool is listed under it.
-pub type ToolBehind<'a> = &'a dyn Fn(&str) -> Option<(String, String)>;
+/// A server by this name is in the config already.
+#[derive(Debug, thiserror::Error)]
+#[error("server `{0}` already exists")]
+pub struct NameTaken(pub String);
 
-/// [`apply_operator_mutation`] by a caller that knows the tools: a tool block
-/// is stored by server and tool, and blocks written by listed name before
-/// that was possible are stored that way too.
+impl NameTaken {
+    /// The IPC error code the daemon refuses a taken name with, so the app
+    /// can tell it apart without reading the message.
+    pub const CODE: &'static str = "SERVER_NAME_TAKEN";
+
+    /// Refuse `name` when `config` already has a server by it.
+    pub fn check(config: &Config, name: &str) -> Result<(), Self> {
+        if config.servers.contains_key(name) {
+            Err(Self(name.to_string()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// [`Self::CODE`] when `error` is a taken name, else `otherwise`.
+    pub fn code_or<'a>(error: &anyhow::Error, otherwise: &'a str) -> &'a str {
+        if error.chain().any(|cause| cause.is::<Self>()) {
+            Self::CODE
+        } else {
+            otherwise
+        }
+    }
+}
+
+/// What the running servers tell a change to the config.
+pub trait Live {
+    /// The server and the server's own name behind a name Plug lists a tool
+    /// under, when a tool is listed under it.
+    fn tool_behind(&self, listed: &str) -> Option<(String, String)>;
+    /// The name `server` reports for itself, once it has connected.
+    fn reported_name(&self, server: &str) -> Option<String>;
+}
+
+/// No server is running.
+pub struct Offline;
+
+impl Live for Offline {
+    fn tool_behind(&self, _listed: &str) -> Option<(String, String)> {
+        None
+    }
+    fn reported_name(&self, _server: &str) -> Option<String> {
+        None
+    }
+}
+
+/// [`apply_operator_mutation`] by a caller that knows the servers: a tool
+/// block is stored by server and tool, blocks written by listed name before
+/// that was possible are stored that way too, and a second account of a
+/// server gets the tool groups the server is known by.
 pub fn apply_operator_mutation_knowing(
     path: &Path,
     mutation: OperatorMutation,
-    tool_behind: ToolBehind<'_>,
+    live: &dyn Live,
 ) -> anyhow::Result<(Config, OperatorMutationResult)> {
     let mut config = load_editable_config(path)?;
-    pin_tool_blocks(&mut config, tool_behind);
+    pin_tool_blocks(&mut config, live);
     let result = match mutation {
         OperatorMutation::AddServer { name, mut server } => {
-            if config.servers.contains_key(&name) {
-                anyhow::bail!("server `{name}` already exists");
-            }
+            NameTaken::check(&config, &name)?;
+            config.http.refuse_plug_itself(&name, &server)?;
             // A new server has nothing stored behind a placeholder, so this only
             // drops one that came back from a redacted read of another server.
             server.restore_redacted_secrets(None);
@@ -185,6 +236,7 @@ pub fn apply_operator_mutation_knowing(
             // Clients read this server redacted, so untouched secrets arrive as
             // placeholders. Put the stored values back before they are written.
             server.restore_redacted_secrets(Some(stored));
+            config.http.refuse_plug_itself(&name, &server)?;
             let summary = OperatorServerSummary::from_config(name.clone(), &server);
             config.servers.insert(name, server);
             OperatorMutationResult::server(Some(summary))
@@ -203,8 +255,28 @@ pub fn apply_operator_mutation_knowing(
             }
             OperatorMutationResult::server(None)
         }
+        OperatorMutation::ImportServers { mut servers } => {
+            for imported in &mut servers {
+                imported.server.restore_redacted_secrets(None);
+                config
+                    .http
+                    .refuse_plug_itself(&imported.name, &imported.server)?;
+            }
+            let imported = crate::import::add_to_config(&mut config, servers)
+                .into_iter()
+                .map(|name| {
+                    let server = &config.servers[&name];
+                    OperatorServerSummary::from_config(name, server)
+                })
+                .collect();
+            OperatorMutationResult {
+                imported: Some(imported),
+                ..OperatorMutationResult::server(None)
+            }
+        }
         OperatorMutation::AddAccount { server, account } => {
-            let (name, copy) = account_copy(&config, &server, &account)?;
+            let reported = live.reported_name(&server);
+            let (name, copy) = account_copy(&config, &server, reported.as_deref(), &account)?;
             let summary = OperatorServerSummary::from_config(name.clone(), &copy);
             config.servers.insert(name, copy);
             OperatorMutationResult::server(Some(summary))
@@ -220,9 +292,13 @@ pub fn apply_operator_mutation_knowing(
         OperatorMutation::SetToolEnabled { tool, enabled } => {
             set_tool_enabled(&mut config, &tool, enabled)?;
             OperatorMutationResult {
-                server: None,
                 disabled_tools: Some(config.disabled_tools.clone()),
+                ..OperatorMutationResult::server(None)
             }
+        }
+        OperatorMutation::SetLazyTools { client, setting } => {
+            set_lazy_tools(&mut config, &client, setting)?;
+            OperatorMutationResult::server(None)
         }
         OperatorMutation::RenameClient { key, name } => {
             label_client(&mut config, &key, &name, ClientLabel::Name)?;
@@ -242,10 +318,9 @@ pub fn apply_operator_mutation_knowing(
             target,
             blocked,
         } => {
-            set_client_block(&mut config, &key, kind, &target, blocked, tool_behind)?;
+            set_client_block(&mut config, &key, kind, &target, blocked, live)?;
             OperatorMutationResult::server(None)
         }
-        OperatorMutation::PinToolBlocks => OperatorMutationResult::server(None),
         OperatorMutation::AddWatch { watch } => {
             config.events.watch.push(watch);
             // Only the event rules: the rest of the file was already accepted.
@@ -274,6 +349,15 @@ pub fn apply_operator_mutation_knowing(
     Ok((config, result))
 }
 
+/// Save the file with every tool block that can be stored by server and
+/// tool stored that way, and nothing else changed.
+pub fn pin_tool_blocks_in_file(path: &Path, live: &dyn Live) -> anyhow::Result<Config> {
+    let mut config = load_editable_config(path)?;
+    pin_tool_blocks(&mut config, live);
+    persist_config_atomic(path, &config)?;
+    Ok(config)
+}
+
 /// The longest account label. It becomes part of every tool name.
 const MAX_ACCOUNT_LABEL: usize = 24;
 
@@ -283,10 +367,12 @@ const MAX_ACCOUNT_LABEL: usize = 24;
 /// only this side can read them. OAuth sign-ins are stored by server name, so
 /// the copy starts signed out and signs in on its own. Tool groups keep their
 /// shape with the account added, so `Gmail` becomes `GmailPersonal` and the
-/// two accounts never share a tool name.
+/// two accounts never share a tool name. A server with no groups of its own
+/// starts from the ones Plug gives it, known by `reported`, its own name.
 fn account_copy(
     config: &Config,
     server: &str,
+    reported: Option<&str>,
     account: &str,
 ) -> anyhow::Result<(String, ServerConfig)> {
     let source = config
@@ -306,15 +392,10 @@ fn account_copy(
         );
     }
     let name = format!("{server}-{label}");
-    if config.servers.contains_key(&name) {
-        anyhow::bail!("server `{name}` already exists");
-    }
+    NameTaken::check(config, &name)?;
 
     let mut copy = source.clone();
-    let mut groups = source.tool_groups.clone();
-    if groups.is_empty() && server == "workspace" {
-        groups = crate::tool_naming::default_workspace_rules();
-    }
+    let mut groups = crate::tool_naming::group_rules(server, source, reported).unwrap_or_default();
     let suffix = crate::tool_naming::format_server_prefix(label);
     for group in &mut groups {
         group.prefix.push_str(&suffix);
@@ -357,8 +438,30 @@ fn set_tool_enabled(config: &mut Config, tool: &str, enabled: bool) -> anyhow::R
     Ok(())
 }
 
-/// The longest name a client can be given. Long enough for any product name,
-/// short enough to fit a row.
+/// Store `setting` for `client` under its slug, replacing an entry under
+/// any of its other names, which would otherwise still apply.
+fn set_lazy_tools(
+    config: &mut Config,
+    client: &str,
+    setting: crate::types::LazyToolSetting,
+) -> anyhow::Result<()> {
+    use crate::clients::ClientTarget;
+    let target: ClientTarget = client
+        .parse()
+        .map_err(|error: String| anyhow::anyhow!(error))?;
+    config
+        .lazy_tools
+        .clients
+        .retain(|name, _| name.parse::<ClientTarget>().ok() != Some(target));
+    if setting != crate::types::LazyToolSetting::Auto {
+        config
+            .lazy_tools
+            .clients
+            .insert(target.slug().to_string(), setting);
+    }
+    Ok(())
+}
+
 fn move_client_settings(config: &mut Config, from: &str, to: &str) -> anyhow::Result<()> {
     let (from, to) = (from.trim(), to.trim());
     if from.is_empty() || to.is_empty() {
@@ -379,12 +482,10 @@ fn move_client_settings(config: &mut Config, from: &str, to: &str) -> anyhow::Re
     Ok(())
 }
 
+/// The longest name a client can be given. Long enough for any product name,
+/// short enough to fit a row.
 const CLIENT_NAME_MAX_CHARS: usize = 60;
 
-/// Name a client, or with an empty name go back to the one Plug works out.
-///
-/// The key is not checked against connected clients: a name is set once and
-/// has to hold while its client is closed.
 /// The two things the owner types about a client.
 #[derive(Clone, Copy)]
 enum ClientLabel {
@@ -392,6 +493,10 @@ enum ClientLabel {
     Place,
 }
 
+/// Name a client, or with an empty name go back to the one Plug works out.
+///
+/// The key is not checked against connected clients: a name is set once and
+/// has to hold while its client is closed.
 fn label_client(
     config: &mut Config,
     key: &str,
@@ -445,7 +550,7 @@ fn set_client_block(
     kind: ClientBlockKind,
     target: &str,
     blocked: bool,
-    tool_behind: ToolBehind<'_>,
+    live: &dyn Live,
 ) -> anyhow::Result<()> {
     let key = key.trim();
     let target = target.trim();
@@ -479,7 +584,7 @@ fn set_client_block(
         }
         ClientBlockKind::Tool => {
             let named = ToolBlock::Named(target.to_string());
-            let block = pinned(&named, tool_behind).unwrap_or_else(|| named.clone());
+            let block = pinned(&named, live).unwrap_or_else(|| named.clone());
             // Either way of writing it goes, so unblocking a tool clears a
             // block written before it was stored by server.
             let list = &mut settings.blocked_tools;
@@ -536,7 +641,7 @@ fn set_client_block(
             // An allow list is exact, so a tool goes on it only once Plug
             // knows which server's tool it is. One already on it can be
             // taken off by the same name or as `server/tool`.
-            let found = tool_behind(target).or_else(|| {
+            let found = live.tool_behind(target).or_else(|| {
                 target
                     .split_once('/')
                     .map(|(server, tool)| (server.to_string(), tool.to_string()))
@@ -566,25 +671,25 @@ fn set_client_block(
 
 /// `block` by server and tool, when it is a plain listed name and a tool is
 /// listed under it. A rule with `*` in it stays a rule.
-fn pinned(block: &ToolBlock, tool_behind: ToolBehind<'_>) -> Option<ToolBlock> {
+fn pinned(block: &ToolBlock, live: &dyn Live) -> Option<ToolBlock> {
     let ToolBlock::Named(name) = block else {
         return None;
     };
     if name.contains('*') {
         return None;
     }
-    let (server, tool) = tool_behind(name)?;
+    let (server, tool) = live.tool_behind(name)?;
     Some(ToolBlock::Of { server, tool })
 }
 
 /// Store by server and tool every block that was written by listed name and
 /// names a tool Plug lists. One it lists no tool under is left as written,
 /// and still holds by that name.
-fn pin_tool_blocks(config: &mut Config, tool_behind: ToolBehind<'_>) {
+fn pin_tool_blocks(config: &mut Config, live: &dyn Live) {
     for settings in config.clients.values_mut() {
         let mut changed = false;
         for block in &mut settings.blocked_tools {
-            if let Some(by_server) = pinned(block, tool_behind) {
+            if let Some(by_server) = pinned(block, live) {
                 *block = by_server;
                 changed = true;
             }
@@ -604,50 +709,29 @@ fn pin_tool_blocks(config: &mut Config, tool_behind: ToolBehind<'_>) {
 /// round-trip. `toml_edit` is not a workspace dependency; do not add a second
 /// TOML stack here just to keep comments.
 pub fn persist_config_atomic(path: &Path, config: &Config) -> anyhow::Result<()> {
-    let errors = validate_config(config);
+    let errors = validate_as_written(config, path);
     if !errors.is_empty() {
         anyhow::bail!(errors.join("; "));
     }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let temp = PathBuf::from(format!(
-        "{}.{}.tmp",
-        path.display(),
-        uuid::Uuid::new_v4().simple()
-    ));
     let contents = toml::to_string_pretty(config)?;
-
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    std::fs::write(&temp, contents)?;
-
-    if let Err(error) = std::fs::rename(&temp, path) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(error.into());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        std::fs::File::open(parent)?.sync_all()?;
-    }
+    crate::fs_perm::write_private_atomic(path, contents.as_bytes())?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// A test's tool lookup, with no server reporting a name.
+    impl<F: Fn(&str) -> Option<(String, String)>> Live for F {
+        fn tool_behind(&self, listed: &str) -> Option<(String, String)> {
+            self(listed)
+        }
+        fn reported_name(&self, _server: &str) -> Option<String> {
+            None
+        }
+    }
 
     #[test]
     fn a_client_that_signs_in_again_takes_over_its_old_settings() {
@@ -676,7 +760,7 @@ mod tests {
     }
 
     fn fixture_path() -> PathBuf {
-        tempfile::tempdir().unwrap().keep().join("config.toml")
+        crate::paths::test::scratch("operator").join("config.toml")
     }
 
     fn server_with_secrets() -> ServerConfig {
@@ -760,6 +844,68 @@ API_KEY = "sk-live-123"
     }
 
     #[test]
+    fn a_taken_name_is_refused_with_its_own_code() {
+        let path = fixture_path();
+        let add = || {
+            apply_operator_mutation(
+                &path,
+                OperatorMutation::AddServer {
+                    name: "workspace".into(),
+                    server: server_with_secrets(),
+                },
+            )
+        };
+        add().unwrap();
+        let error = add().unwrap_err().context("mutation failed");
+        assert_eq!(
+            error.root_cause().to_string(),
+            "server `workspace` already exists"
+        );
+        assert_eq!(NameTaken::code_or(&error, "OTHER"), NameTaken::CODE);
+        let other = anyhow::anyhow!("server `workspace` already exists");
+        assert_eq!(NameTaken::code_or(&other, "OTHER"), "OTHER");
+    }
+
+    #[test]
+    fn plug_itself_is_refused_as_a_new_or_edited_server_but_others_still_save() {
+        let path = fixture_path();
+        let plug_itself = || ServerConfig {
+            transport: crate::config::TransportType::Http,
+            url: Some("http://localhost:3282/mcp".into()),
+            ..Default::default()
+        };
+        let add = |name: &str, server| {
+            apply_operator_mutation(
+                &path,
+                OperatorMutation::AddServer {
+                    name: name.into(),
+                    server,
+                },
+            )
+        };
+        assert!(add("loop", plug_itself()).is_err());
+        assert!(!path.exists(), "a refused add must not write the config");
+
+        add("workspace", server_with_secrets()).unwrap();
+        let edit = apply_operator_mutation(
+            &path,
+            OperatorMutation::UpdateServer {
+                name: "workspace".into(),
+                server: plug_itself(),
+            },
+        );
+        assert!(edit.is_err());
+
+        std::fs::write(
+            &path,
+            "[servers.loop]\ntransport = \"http\"\nurl = \"http://localhost:3282/mcp\"\n",
+        )
+        .unwrap();
+        let (config, _) = add("workspace", server_with_secrets()).unwrap();
+        assert!(config.servers.contains_key("loop"));
+    }
+
+    #[test]
     fn a_second_account_is_the_same_server_under_another_name() {
         let path = fixture_path();
         apply_operator_mutation(
@@ -796,6 +942,48 @@ API_KEY = "sk-live-123"
                 .iter()
                 .all(|g| g.prefix.ends_with("Personal"))
         );
+    }
+
+    #[test]
+    fn a_second_account_of_workspace_under_any_name_gets_its_groups() {
+        struct Reports(&'static str);
+        impl Live for Reports {
+            fn tool_behind(&self, _listed: &str) -> Option<(String, String)> {
+                None
+            }
+            fn reported_name(&self, _server: &str) -> Option<String> {
+                Some(self.0.to_string())
+            }
+        }
+        let path = fixture_path();
+        apply_operator_mutation(
+            &path,
+            OperatorMutation::AddServer {
+                name: "google".into(),
+                server: server_with_secrets(),
+            },
+        )
+        .unwrap();
+        let add = || OperatorMutation::AddAccount {
+            server: "google".into(),
+            account: "work".into(),
+        };
+
+        let (config, _) =
+            apply_operator_mutation_knowing(&path, add(), &Reports("google_workspace")).unwrap();
+        let copy = &config.servers["google-work"];
+        assert!(copy.tool_groups.iter().any(|g| g.prefix == "GmailWork"));
+
+        apply_operator_mutation(
+            &path,
+            OperatorMutation::RemoveServer {
+                name: "google-work".into(),
+            },
+        )
+        .unwrap();
+        let (config, _) =
+            apply_operator_mutation_knowing(&path, add(), &Reports("another server")).unwrap();
+        assert!(config.servers["google-work"].tool_groups.is_empty());
     }
 
     #[test]
@@ -891,6 +1079,115 @@ API_KEY = "sk-live-123"
         assert!(config.disabled_tools.is_empty());
     }
 
+    fn imported(name: &str, source_target: &str, command: &str) -> crate::import::ImportedServer {
+        crate::import::ImportedServer {
+            name: name.to_string(),
+            source_target: source_target.to_string(),
+            server: ServerConfig {
+                command: Some(command.to_string()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Imported servers go in together, a taken name renamed, and the
+    /// result names each as it went in. One the config cannot hold keeps
+    /// them all out.
+    #[test]
+    fn imported_servers_go_in_together_under_free_names() {
+        let path = fixture_path();
+        apply_operator_mutation(
+            &path,
+            OperatorMutation::AddServer {
+                name: "github".into(),
+                server: ServerConfig {
+                    command: Some("gh-mcp".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+
+        let (config, result) = apply_operator_mutation(
+            &path,
+            OperatorMutation::ImportServers {
+                servers: vec![
+                    imported("github", "cursor", "npx"),
+                    imported("github", "cursor", "uvx"),
+                    imported("notes", "cursor", "notes-mcp"),
+                ],
+            },
+        )
+        .unwrap();
+        let names: Vec<String> = result
+            .imported
+            .unwrap()
+            .into_iter()
+            .map(|summary| summary.name)
+            .collect();
+        assert_eq!(names, ["github-cursor", "github-cursor-2", "notes"]);
+        assert_eq!(
+            config.servers["github"].command.as_deref(),
+            Some("gh-mcp"),
+            "a taken name is never written over"
+        );
+
+        let refused = apply_operator_mutation(
+            &path,
+            OperatorMutation::ImportServers {
+                servers: vec![
+                    imported("calendar", "cursor", "cal-mcp"),
+                    crate::import::ImportedServer {
+                        server: ServerConfig::default(),
+                        ..imported("broken", "cursor", "")
+                    },
+                ],
+            },
+        );
+        assert!(refused.is_err());
+        let config = load_editable_config(&path).unwrap();
+        assert!(!config.servers.contains_key("calendar"));
+    }
+
+    /// A client's lazy-tool setting is stored under its slug, replacing one
+    /// under an alias, and `auto` removes it.
+    #[test]
+    fn a_lazy_tool_setting_is_stored_once_per_client() {
+        use crate::types::LazyToolSetting;
+        let path = fixture_path();
+        let mut config = Config::default();
+        config
+            .lazy_tools
+            .clients
+            .insert("codex".into(), LazyToolSetting::Native);
+        persist_config_atomic(&path, &config).unwrap();
+        let set = |setting| {
+            apply_operator_mutation(
+                &path,
+                OperatorMutation::SetLazyTools {
+                    client: "codex-cli".into(),
+                    setting,
+                },
+            )
+            .map(|(config, _)| config.lazy_tools.clients)
+        };
+
+        let clients = set(LazyToolSetting::Bridge).unwrap();
+        assert_eq!(
+            clients.into_iter().collect::<Vec<_>>(),
+            [("codex-cli".to_string(), LazyToolSetting::Bridge)]
+        );
+        assert!(set(LazyToolSetting::Auto).unwrap().is_empty());
+        let unknown = apply_operator_mutation(
+            &path,
+            OperatorMutation::SetLazyTools {
+                client: "nope".into(),
+                setting: LazyToolSetting::Bridge,
+            },
+        );
+        assert!(unknown.is_err());
+    }
+
     #[test]
     fn disabling_a_tool_twice_does_not_duplicate_the_pattern() {
         let path = fixture_path();
@@ -934,7 +1231,7 @@ API_KEY = "sk-live-123"
     }
 
     #[test]
-    fn validate_server_does_not_write_and_mutation_is_atomic_owner_only() {
+    fn a_saved_config_is_owner_only_and_leaves_no_temporary_file() {
         let path = fixture_path();
         let server: ServerConfig = serde_json::from_value(serde_json::json!({
             "command": "echo"
@@ -950,15 +1247,16 @@ API_KEY = "sk-live-123"
         .unwrap();
         assert!(config.servers.contains_key("search"));
         assert_eq!(result.server.unwrap().name, "search");
-        assert!(!PathBuf::from(format!("{}.tmp", path.display())).exists());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
+        let left: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["config.toml"]);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -1171,7 +1469,7 @@ API_KEY = "sk-live-123"
             OperatorMutation::RemoveServer {
                 name: "git".to_string(),
             },
-            &|_| None,
+            &Offline,
         )
         .unwrap();
         // A server added later under the same name is not one it gets, and
@@ -1233,9 +1531,7 @@ blocked_tools = ["code__push", "Code__push"]
         assert_eq!(loaded.clients["pi"].blocked_tools[0], "Code__push".into());
 
         // Saving anything brings the old blocks over.
-        let (config, _) =
-            apply_operator_mutation_knowing(&path, OperatorMutation::PinToolBlocks, &tool_behind)
-                .unwrap();
+        let config = pin_tool_blocks_in_file(&path, &tool_behind).unwrap();
         assert_eq!(
             config.clients["pi"].blocked_tools,
             [
@@ -1249,8 +1545,7 @@ blocked_tools = ["code__push", "Code__push"]
         let reloaded = crate::config::load_config(Some(&path)).unwrap();
         assert_eq!(reloaded.clients, config.clients);
         // Without the tools known, nothing is touched.
-        let (unknowing, _) =
-            apply_operator_mutation(&path, OperatorMutation::PinToolBlocks).unwrap();
+        let unknowing = pin_tool_blocks_in_file(&path, &Offline).unwrap();
         assert_eq!(unknowing.clients, config.clients);
 
         // A new block lands in the same form, whatever name the tool goes

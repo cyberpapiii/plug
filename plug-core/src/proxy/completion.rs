@@ -30,14 +30,6 @@ impl super::ToolRouter {
 
         let snapshot = self.cache.load();
         let server_id = resolve_resource_route(&snapshot.resource_routes, uri)
-            .or_else(|| {
-                // A skill's files need not be listed: its server's name in
-                // the URI is the route.
-                skills::named_server(uri)
-                    .filter(|server| self.server_manager.get_upstream(server).is_some())
-                    .map(str::to_string)
-            })
-            .or_else(|| skills::only_server(&snapshot.resource_routes, uri))
             .filter(|server_id| self.client_may_use_all_of_server(client_key, server_id))
             .ok_or_else(|| {
                 McpError::from(ProtocolError::InvalidRequest {
@@ -56,9 +48,8 @@ impl super::ToolRouter {
             })?;
 
         let mut result = self
-            .bounded_read(
-                &server_id,
-                upstream.config.call_timeout_secs,
+            .bounded_request(
+                &upstream,
                 upstream
                     .client
                     .peer()
@@ -73,30 +64,6 @@ impl super::ToolRouter {
             admit_resource_contents_meta(contents);
         }
         Ok(result)
-    }
-
-    /// Wait for a read from a server no longer than a tool call may take, and
-    /// reconnect the server when its connection turns out to be gone. Reads
-    /// used to wait with no limit, so a server that took the request and
-    /// never answered held the client forever.
-    async fn bounded_read<T>(
-        &self,
-        server_id: &str,
-        timeout_secs: u64,
-        read: impl std::future::Future<Output = Result<T, rmcp::service::ServiceError>>,
-    ) -> Result<T, McpError> {
-        let timeout = std::time::Duration::from_secs(timeout_secs);
-        match tokio::time::timeout(timeout, read).await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(rmcp::service::ServiceError::McpError(error))) => Err(error),
-            Ok(Err(error)) => {
-                if matches!(error, rmcp::service::ServiceError::TransportClosed) {
-                    self.reconnect_server_in_background(server_id.to_string());
-                }
-                Err(McpError::internal_error(error.to_string(), None))
-            }
-            Err(_) => Err(McpError::from(ProtocolError::Timeout { duration: timeout })),
-        }
     }
 
     pub async fn get_prompt(
@@ -133,11 +100,7 @@ impl super::ToolRouter {
         }
 
         let mut result = self
-            .bounded_read(
-                &server_id,
-                upstream.config.call_timeout_secs,
-                upstream.client.peer().get_prompt(request),
-            )
+            .bounded_request(&upstream, upstream.client.peer().get_prompt(request))
             .await?;
         admit_catalog_meta(&mut result.meta, "prompt-result");
         for message in &mut result.messages {
@@ -173,13 +136,7 @@ impl super::ToolRouter {
                 sid
             }
             Reference::Resource(resource_ref) => {
-                let sid = snapshot
-                    .resource_routes
-                    .get(&resource_ref.uri)
-                    .cloned()
-                    .or_else(|| {
-                        resolve_resource_route(&snapshot.resource_routes, &resource_ref.uri)
-                    })
+                let sid = resolve_resource_route(&snapshot.resource_routes, &resource_ref.uri)
                     .filter(|server_id| self.client_may_use_all_of_server(client_key, server_id))
                     .ok_or_else(|| {
                         McpError::from(ProtocolError::InvalidRequest {
@@ -209,34 +166,41 @@ impl super::ToolRouter {
                 })
             })?;
 
-        let mut result =
-            upstream
-                .client
-                .peer()
-                .complete(params)
-                .await
-                .map_err(|error| match error {
-                    rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
-                    other => McpError::internal_error(other.to_string(), None),
-                })?;
+        let mut result = self
+            .bounded_request(&upstream, upstream.client.peer().complete(params))
+            .await?;
         admit_catalog_meta(&mut result.meta, "completion-result");
         Ok(result)
     }
 }
 
-/// Resolve a concrete resource URI against exact routes first and advertised
-/// URI templates second. The matcher deliberately implements the useful MCP
-/// subset of RFC 6570 without accepting arbitrary cross-server fallbacks:
-/// simple variables stay within one path segment, while reserved (`+`) and
-/// fragment (`#`) expansions may contain slashes.
-fn resolve_resource_route(
+/// The server a resource URI belongs to, for reading, completing and
+/// subscribing alike: the server that lists it, else the one server whose
+/// advertised template matches it, else for a skill the server its URI
+/// names, else the one server that lists it under its own name.
+pub(super) fn resolve_resource_route(
     routes: &std::collections::HashMap<String, String>,
     uri: &str,
 ) -> Option<String> {
     if let Some(server) = routes.get(uri) {
         return Some(server.clone());
     }
+    template_route(routes, uri)
+        .or_else(|| {
+            // A skill's files need not be listed: its server's name in the
+            // URI is the route.
+            skills::named_server(uri)
+                .filter(|server| routes.values().any(|listed| listed == server))
+                .map(str::to_string)
+        })
+        .or_else(|| skills::only_server(routes, uri))
+}
 
+/// The one server whose advertised template matches `uri`. The matcher
+/// implements the useful MCP subset of RFC 6570 without accepting
+/// cross-server fallbacks: simple variables stay within one path segment,
+/// while reserved (`+`) and fragment (`#`) expansions may contain slashes.
+fn template_route(routes: &std::collections::HashMap<String, String>, uri: &str) -> Option<String> {
     let mut matches = routes
         .iter()
         .filter(|(template, _)| template.contains('{') && uri_template_matches(template, uri))

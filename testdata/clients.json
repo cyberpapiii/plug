@@ -1,0 +1,200 @@
+[
+  {
+    "slug": "claude-desktop",
+    "name": "Claude Desktop",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "claude-code",
+    "name": "Claude Code",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "cursor",
+    "name": "Cursor",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "devin",
+    "name": "Devin",
+    "aliases": [
+      "windsurf"
+    ],
+    "listed": true
+  },
+  {
+    "slug": "vscode",
+    "name": "VS Code Copilot",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "copilot-cli",
+    "name": "GitHub Copilot CLI",
+    "aliases": [
+      "copilot"
+    ],
+    "listed": true
+  },
+  {
+    "slug": "gemini-cli",
+    "name": "Gemini CLI",
+    "aliases": [
+      "gemini"
+    ],
+    "listed": true
+  },
+  {
+    "slug": "codex-cli",
+    "name": "Codex CLI",
+    "aliases": [
+      "codex"
+    ],
+    "listed": true
+  },
+  {
+    "slug": "grok-build",
+    "name": "Grok Build",
+    "aliases": [
+      "grok"
+    ],
+    "listed": true
+  },
+  {
+    "slug": "opencode",
+    "name": "OpenCode",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "zed",
+    "name": "Zed",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "cline",
+    "name": "Cline (VS Code)",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "cline-cli",
+    "name": "Cline CLI",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "roocode",
+    "name": "RooCode",
+    "aliases": [],
+    "listed": false
+  },
+  {
+    "slug": "factory",
+    "name": "Factory",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "nanobot",
+    "name": "Nanobot",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "junie",
+    "name": "JetBrains Junie",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "kilo",
+    "name": "Kilo Code",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "pi",
+    "name": "Pi",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "warp",
+    "name": "Warp",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "kiro",
+    "name": "Kiro",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "kimi-code",
+    "name": "Kimi Code",
+    "aliases": [
+      "kimi"
+    ],
+    "listed": true
+  },
+  {
+    "slug": "qwen-code",
+    "name": "Qwen Code",
+    "aliases": [
+      "qwen"
+    ],
+    "listed": true
+  },
+  {
+    "slug": "antigravity",
+    "name": "Google Antigravity",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "goose",
+    "name": "Goose",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "hermes",
+    "name": "Hermes Agent",
+    "aliases": [
+      "hermes-agent"
+    ],
+    "listed": true
+  },
+  {
+    "slug": "amp",
+    "name": "Amp",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "openclaw",
+    "name": "OpenClaw",
+    "aliases": [],
+    "listed": true
+  },
+  {
+    "slug": "lm-studio",
+    "name": "LM Studio",
+    "aliases": [
+      "lmstudio"
+    ],
+    "listed": true
+  },
+  {
+    "slug": "muse-code",
+    "name": "Muse Code",
+    "aliases": [],
+    "listed": true
+  }
+]

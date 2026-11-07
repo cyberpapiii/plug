@@ -1161,8 +1161,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8cb01cd46b0cf372153850f4c6c272d9cbea2da513e07538405148f95bd789f3"
 dependencies = [
  "atomic",
+ "parking_lot",
  "pear",
  "serde",
+ "tempfile",
  "toml 0.8.23",
  "uncased",
  "version_check",
@@ -2309,6 +2311,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
 
 [[package]]
+name = "parking_lot"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
+dependencies = [
+ "lock_api",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "parking_lot_core"
 version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2490,7 +2502,6 @@ dependencies = [
  "console",
  "dashmap",
  "dialoguer",
- "directories",
  "dirs",
  "figment",
  "fs4",

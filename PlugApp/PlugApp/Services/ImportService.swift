@@ -24,7 +24,7 @@ struct ImportScan: Equatable, Sendable {
     var isEmpty: Bool { servers.isEmpty }
 }
 
-enum ImportError: Error, LocalizedError, Equatable {
+enum ImportError: Error, LocalizedError, AdvisedError, Equatable {
     case missingExecutable
     case failed(String)
 
@@ -33,6 +33,11 @@ enum ImportError: Error, LocalizedError, Equatable {
         case .missingExecutable: "Plug is damaged. Download it again and replace this copy."
         case let .failed(message): message
         }
+    }
+
+    var advice: String {
+        if case let .failed(message) = self { return Explain.advice(forOutside: message) }
+        return Explain.fallback
     }
 }
 
@@ -79,103 +84,57 @@ struct ImportService: ImportScanning {
 // MARK: - Reading the report
 
 extension ImportScan {
-    /// Built by hand rather than by `Decodable` conformance: the report carries
-    /// every field of a server's configuration, and the app only needs the few
-    /// it can actually show and re-create.
+    /// The parts of `plug import --output json` the sheet reads. Each server
+    /// keeps its whole configuration, so what is imported is what was found.
+    fileprivate struct Report: Decodable {
+        struct Scanned: Decodable {
+            let sourceName: String
+            let error: String?
+        }
+
+        struct Found: Decodable {
+            let name: String
+            let sourceTarget: String
+            let sourceName: String
+            let config: ServerConfig
+        }
+
+        let scanned: [Scanned]
+        let newServers: [Found]
+    }
+
     init(json data: Data) throws {
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        guard let report = try? decoder.decode(Report.self, from: data) else {
             throw ImportError.failed("Plug gave an answer it could not read. Try again.")
         }
-
-        var unreadable: [String] = []
-        for scan in root["scanned"] as? [[String: Any]] ?? [] {
-            guard let error = scan["error"] as? String, !error.isEmpty else { continue }
-            unreadable.append(Self.appName(fromSource: scan["source"] as? String ?? ""))
-        }
-
-        let found = root["new_servers"] as? [[String: Any]] ?? []
-        let servers = found.compactMap(Self.server(from:)).filter { !$0.config.isPlugItself }
-
+        let unreadable = report.scanned.filter { !($0.error ?? "").isEmpty }.map(\.sourceName)
+        // `plug import` has already left out Plug's own entries.
+        let servers = report.newServers.compactMap(DiscoveredServer.init)
         self.init(servers: servers, unreadable: unreadable.sorted())
-    }
-
-    private static func server(from raw: [String: Any]) -> DiscoveredServer? {
-        guard let name = raw["name"] as? String, !name.isEmpty,
-              let body = raw["config"] as? [String: Any]
-        else { return nil }
-
-        let source = raw["source"] as? String ?? ""
-        let env = body["env"] as? [String: String] ?? [:]
-
-        var config: ServerConfig
-        var detail: String
-        if let url = body["url"] as? String, !url.isEmpty {
-            config = .remote(url)
-            detail = url
-        } else if let command = body["command"] as? String, !command.isEmpty {
-            let args = body["args"] as? [String] ?? []
-            config = .command(command, args: args)
-            detail = ([command] + args).joined(separator: " ")
-        } else {
-            return nil
-        }
-        config.env = env
-
-        return DiscoveredServer(
-            name: name,
-            source: target(forSource: source),
-            sourceName: appName(fromSource: source),
-            config: config,
-            detail: detail
-        )
-    }
-
-    /// `ClaudeDesktop` in the report is `claude-desktop` everywhere else in the
-    /// app, which is what picks the icon. Spelled out rather than derived,
-    /// because the two names disagree in both directions (`VSCodeCopilot` is
-    /// `vscode`, `OpenCode` is `opencode`).
-    static func target(forSource source: String) -> String {
-        switch source {
-        case "ClaudeDesktop": "claude-desktop"
-        case "ClaudeCode": "claude-code"
-        case "VSCodeCopilot": "vscode"
-        case "GeminiCli": "gemini-cli"
-        case "CodexCli": "codex-cli"
-        case "ClineCli": "cline-cli"
-        case "OpenCode": "opencode"
-        case "RooCode": "roocode"
-        case "GrokBuild": "grok-build"
-        case "CopilotCli": "copilot-cli"
-        default: source.lowercased()
-        }
-    }
-
-    /// The app's name as its own makers write it.
-    static func appName(fromSource source: String) -> String {
-        switch source {
-        case "ClaudeDesktop": "Claude Desktop"
-        case "ClaudeCode": "Claude Code"
-        case "VSCodeCopilot": "VS Code"
-        case "GeminiCli": "Gemini CLI"
-        case "CodexCli": "Codex CLI"
-        case "ClineCli": "Cline CLI"
-        case "OpenCode": "OpenCode"
-        case "RooCode": "Roo Code"
-        case "GrokBuild": "Grok Build"
-        case "CopilotCli": "GitHub Copilot CLI"
-        case "": "Another client"
-        default: source
-        }
     }
 }
 
-extension ServerConfig {
-    /// Plug's own entry in another app's settings. Every linked app has one,
-    /// and importing it would point Plug at itself.
-    var isPlugItself: Bool {
-        if let command, URL(fileURLWithPath: command).lastPathComponent == "plug" {
-            return args.contains("connect") || args.contains("serve")
+private extension DiscoveredServer {
+    /// Nil for an entry with no name, or nothing to run or reach.
+    init?(_ found: ImportScan.Report.Found) {
+        let config = found.config
+        let detail: String
+        if let url = config.url, !url.isEmpty {
+            detail = url
+        } else if let command = config.command, !command.isEmpty {
+            detail = ([command] + config.args).joined(separator: " ")
+        } else {
+            return nil
         }
-        return false
+        guard !found.name.isEmpty else { return nil }
+        self.init(
+            name: found.name,
+            source: found.sourceTarget,
+            sourceName: found.sourceName,
+            config: config,
+            detail: detail
+        )
     }
 }

@@ -10,22 +10,35 @@ public actor PlugIPCClient {
     /// which clears this, so a re-handshake happens exactly when the connection
     /// is new and never on a poll that had one already.
     private var negotiated: OperatorHandshake?
-    private let socketURL: URL
+    public nonisolated let socketURL: URL
     private let clientVersion: String
     private let requestTimeout: TimeInterval
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
     public init(
-        socketURL: URL = PlugIPCClient.defaultSocketURL,
+        socketURL: URL = PlugPaths.socketURL,
         clientVersion: String,
         requestTimeout: TimeInterval = 3
     ) {
         self.socketURL = socketURL
         self.clientVersion = clientVersion
         self.requestTimeout = min(60, max(0.001, requestTimeout))
-        encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
-        decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        encoder = Self.makeEncoder()
+        decoder = Self.makeDecoder()
+    }
+
+    /// The daemon's field names are snake case.
+    static func makeEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        return encoder
+    }
+
+    static func makeDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return decoder
     }
 
     /// A client dropped while connected must not keep its socket. Callers are
@@ -33,23 +46,6 @@ public actor PlugIPCClient {
     /// client is how a long-running app runs out of them.
     deinit {
         if descriptor >= 0 { Darwin.close(descriptor) }
-    }
-
-    // Keep package-level callers source-compatible while app callers pass the
-    // installed bundle version explicitly.
-    public init(
-        socketURL: URL = PlugIPCClient.defaultSocketURL,
-        requestTimeout: TimeInterval = 3
-    ) {
-        self.init(
-            socketURL: socketURL,
-            clientVersion: Self.bundleClientVersion,
-            requestTimeout: requestTimeout
-        )
-    }
-
-    private static var bundleClientVersion: String {
-        clientVersion(from: Bundle.main.infoDictionary ?? [:])
     }
 
     public static func clientVersion(from infoDictionary: [String: Any]) -> String {
@@ -60,26 +56,12 @@ public actor PlugIPCClient {
         return trimmed.isEmpty ? "development" : trimmed
     }
 
-    public static var defaultSocketURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appending(path: "Library/Application Support/plug/plug.sock")
-    }
-
-    public static var defaultTokenURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appending(path: "Library/Application Support/plug/plug.token")
-    }
-
     public func connect() throws -> OperatorHandshake {
         if descriptor >= 0, let negotiated { return negotiated }
         if descriptor < 0 {
             descriptor = try Self.openSocket(path: socketURL.path, requestTimeout: requestTimeout)
         }
-        let response = try request(.handshake(
-            clientVersion: clientVersion,
-            ipcMin: supportedIPCVersions.lowerBound,
-            ipcMax: supportedIPCVersions.upperBound
-        ))
+        let response = try request(.handshake(clientVersion: clientVersion))
         guard case let .handshake(handshake) = response else { throw PlugIPCError.unexpectedResponse("handshake") }
         negotiated = handshake
         return handshake

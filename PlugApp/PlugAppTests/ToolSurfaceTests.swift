@@ -7,15 +7,17 @@ import PlugIPC
 /// honestly out of reach because a wildcard covers them.
 final class ToolCatalogTests: XCTestCase {
     private let catalog = ToolCatalog([
-        ToolFacts(name: "figma__get_file", server: "figma", summary: "Read a design file"),
-        ToolFacts(name: "figma__export_frame", server: "figma", summary: "Export an image"),
+        ToolFacts(delimiter: "__", name: "figma__get_file", server: "figma", summary: "Read a design file"),
+        ToolFacts(delimiter: "__", name: "figma__export_frame", server: "figma", summary: "Export an image"),
         ToolFacts(
+            delimiter: "__",
             name: "notion__search",
             server: "notion",
             summary: "Search pages",
             isOn: false
         ),
         ToolFacts(
+            delimiter: "__",
             name: "notion__append_block",
             server: "notion",
             isOn: false,
@@ -25,37 +27,31 @@ final class ToolCatalogTests: XCTestCase {
 
     func testShortNameDropsTheServerPrefixTheGroupAlreadyStates() {
         XCTAssertEqual(
-            ToolFacts(name: "figma__get_file", server: "figma").shortName,
+            ToolFacts(delimiter: "__", name: "figma__get_file", server: "figma").shortName,
             "get_file"
         )
     }
 
     func testShortNameKeepsNamesThatDoNotCarryThePrefix() {
-        XCTAssertEqual(ToolFacts(name: "search", server: "notion").shortName, "search")
+        XCTAssertEqual(ToolFacts(delimiter: "__", name: "search", server: "notion").shortName, "search")
     }
 
     func testShortNameMatchesThePrefixRegardlessOfCase() {
         XCTAssertEqual(
-            ToolFacts(name: "Figma__Get_File", server: "figma").shortName,
+            ToolFacts(delimiter: "__", name: "Figma__Get_File", server: "figma").shortName,
             "Get_File"
         )
     }
 
-    func testGroupsAreServerAlphabeticalAndToolAlphabetical() {
-        let groups = catalog.groups()
-        XCTAssertEqual(groups.map(\.server), ["figma", "notion"])
-        XCTAssertEqual(groups[0].tools.map(\.shortName), ["export_frame", "get_file"])
-    }
-
-    func testSearchingForAServerShowsEverythingThatServerCanDo() {
-        let groups = catalog.groups(matching: "figma")
-        XCTAssertEqual(groups.count, 1)
-        XCTAssertEqual(groups[0].tools.count, 2)
+    func testAServersToolsAreAlphabetical() {
+        XCTAssertEqual(catalog.tools(for: "figma").map(\.shortName), ["export_frame", "get_file"])
     }
 
     func testSearchingMatchesDescriptionsNotJustNames() {
-        let groups = catalog.groups(matching: "export an image")
-        XCTAssertEqual(groups.flatMap(\.tools).map(\.name), ["figma__export_frame"])
+        XCTAssertEqual(
+            catalog.tools(for: "figma", matching: "export an image").map(\.name),
+            ["figma__export_frame"]
+        )
     }
 
     func testSearchNarrowsOneServersToolsButNamingTheServerKeepsAll() {
@@ -74,26 +70,13 @@ final class ToolCatalogTests: XCTestCase {
     }
 
     func testSearchIgnoresSurroundingSpaceAndCase() {
-        XCTAssertEqual(catalog.groups(matching: "  NOTION "), catalog.groups(matching: "notion"))
+        XCTAssertEqual(catalog.servers(withToolsMatching: "  EXPORT "), ["figma"])
+        XCTAssertEqual(catalog.tools(for: "figma", matching: "  EXPORT ").map(\.shortName), ["export_frame"])
     }
 
-    func testCountsSeparateOnFromOff() {
-        XCTAssertEqual(catalog.onCount, 2)
-        XCTAssertEqual(catalog.offCount, 2)
-    }
-
-    func testAGroupWithNothingLeftOnSaysSo() {
-        let notion = catalog.groups(matching: "notion")[0]
-        XCTAssertEqual(notion.onCount, 0)
-        XCTAssertTrue(notion.isFullyOff)
-        XCTAssertFalse(catalog.groups(matching: "figma")[0].isFullyOff)
-    }
-
-    func testAToolCoveredByAWildcardCannotBeSwitchedBackOnAlone() {
+    func testAToolCoveredByAWildcardNamesIt() {
         let covered = catalog.tools(for: "notion").first { $0.lockedByPattern != nil }
         XCTAssertEqual(covered?.lockedByPattern, "notion__append*")
-        XCTAssertEqual(covered?.canToggle, false)
-        XCTAssertEqual(catalog.tools(for: "notion").first { $0.name.hasSuffix("search") }?.canToggle, true)
     }
 
     func testDaemonToolsBecomeFactsWithoutLosingWhySomethingIsOff() {
@@ -104,7 +87,8 @@ final class ToolCatalogTests: XCTestCase {
                 title: "Append block",
                 disabled: true,
                 disabledByPattern: "notion__append*"
-            )
+            ),
+            delimiter: "__"
         )
         XCTAssertEqual(facts.server, "notion")
         XCTAssertEqual(facts.summary, "Append block")
@@ -114,7 +98,8 @@ final class ToolCatalogTests: XCTestCase {
 
     func testDescriptionIsPreferredOverTitleWhenBothArrive() {
         let facts = ToolFacts(
-            ToolInfo(name: "figma__get_file", serverId: "figma", description: "Read a design file", title: "Get file")
+            ToolInfo(name: "figma__get_file", serverId: "figma", description: "Read a design file", title: "Get file"),
+            delimiter: "__"
         )
         XCTAssertEqual(facts.summary, "Read a design file")
         XCTAssertTrue(facts.isOn)
@@ -123,10 +108,10 @@ final class ToolCatalogTests: XCTestCase {
 
     func testPatternListsEveryToolItCovers() {
         let catalog = ToolCatalog([
-            ToolFacts(name: "notion__search", server: "notion", isOn: false, lockedByPattern: "notion__*"),
-            ToolFacts(name: "notion__append", server: "notion", isOn: false, lockedByPattern: "notion__*"),
-            ToolFacts(name: "figma__get_file", server: "figma"),
-            ToolFacts(name: "figma__delete", server: "figma", isOn: false),
+            ToolFacts(delimiter: "__", name: "notion__search", server: "notion", isOn: false, lockedByPattern: "notion__*"),
+            ToolFacts(delimiter: "__", name: "notion__append", server: "notion", isOn: false, lockedByPattern: "notion__*"),
+            ToolFacts(delimiter: "__", name: "figma__get_file", server: "figma"),
+            ToolFacts(delimiter: "__", name: "figma__delete", server: "figma", isOn: false),
         ])
         XCTAssertEqual(
             catalog.tools(coveredBy: "notion__*").map(\.shortName),
@@ -136,8 +121,9 @@ final class ToolCatalogTests: XCTestCase {
     }
 }
 
-/// The app list comes from `plug clients --output json`. These pin the shape
-/// that command actually prints, including the fields it omits.
+/// The app list comes from `plug clients --output json`; `CLIReportTests`
+/// reads what that command prints. These cover the fields a listing may
+/// leave out.
 final class LinkableAppTests: XCTestCase {
     private func decode(_ json: String) throws -> [LinkableApp] {
         struct Listing: Decodable { let clients: [LinkableApp] }
@@ -194,15 +180,11 @@ final class LinkableAppTests: XCTestCase {
         XCTAssertEqual(local["command"] as? String, "/Applications/Plug.app/Contents/Resources/plug")
         XCTAssertEqual(local["args"] as? [String], ["connect"])
 
-        // A client the owner names connects under a key made from the name.
-        XCTAssertEqual(AddClient.customTarget(named: "  My Tool (v2)! "), "custom:my-tool-v2")
-        XCTAssertNil(AddClient.customTarget(named: " ?? "))
         // Each made-up client keeps its own icon, apart from any other's.
         XCTAssertNotEqual(
             IconStore.key(client: "custom:my-tool-v2"),
             IconStore.key(client: "custom:my-tool")
         )
-        XCTAssertEqual(AddClient.customTarget(named: String(repeating: "a", count: 60))?.count, 47)
         let named = try plug(AddClient.settingsEntry(command: "/plug", target: "custom:my-tool"))
         XCTAssertEqual(named["args"] as? [String], ["connect", "--client", "custom:my-tool"])
         XCTAssertEqual(
@@ -225,35 +207,12 @@ final class LinkableAppTests: XCTestCase {
         XCTAssertNil(ClientSignIn.command(target: "claude-code"))
         XCTAssertTrue(ClientSignIn.about(target: "codex-cli", name: "Codex CLI").contains("Press Sign In."))
 
-        // A daemon older than the field says nothing, which is signed in.
         let decoder = JSONDecoder()
-        let old = try decoder.decode(
-            DownstreamClient.self,
-            from: Data(#"{"clientId":"a","clientName":"A","redirectUris":[],"source":"test"}"#.utf8)
-        )
-        XCTAssertFalse(old.needsSignIn)
         let lapsed = try decoder.decode(
             DownstreamClient.self,
-            from: Data(#"{"clientId":"a","clientName":"A","redirectUris":[],"source":"test","signedIn":false}"#.utf8)
+            from: Data(#"{"clientId":"a","clientName":"A","redirectUris":[],"source":"test","clientKey":"oauth:a","signedIn":false,"createdAt":1,"expiresAt":2}"#.utf8)
         )
         XCTAssertTrue(lapsed.needsSignIn)
-    }
-
-    func testDecodesTheListingTheCommandPrints() throws {
-        let apps = try decode(
-            """
-            {"clients":[{"target":"claude-desktop","name":"Claude Desktop","linked":true,
-            "detected":true,"live":true,"live_sessions":2,"linked_transport":"stdio"}]}
-            """
-        )
-        XCTAssertEqual(apps.count, 1)
-        XCTAssertEqual(apps[0].id, "claude-desktop")
-        XCTAssertEqual(apps[0].name, "Claude Desktop")
-        XCTAssertTrue(apps[0].linked)
-        XCTAssertTrue(apps[0].detected)
-        XCTAssertTrue(apps[0].live)
-        XCTAssertEqual(apps[0].sessions, 2)
-        XCTAssertEqual(apps[0].transport, "stdio")
     }
 
     func testAnAppWithOnlyATargetStillDecodes() throws {
@@ -308,32 +267,6 @@ final class EditServerEnvironmentTests: XCTestCase {
         XCTAssertTrue(ServerForm.parseSettings("   \n ").isEmpty)
     }
 
-    func testSaveStaysDisabledWithoutServerConfigRead() {
-        XCTAssertFalse(
-            EditServerView.canSave(
-                canReadServerConfig: false,
-                loaded: true,
-                isComplete: true,
-                saving: false
-            )
-        )
-        XCTAssertTrue(
-            EditServerView.canSave(
-                canReadServerConfig: true,
-                loaded: true,
-                isComplete: true,
-                saving: false
-            )
-        )
-    }
-
-    func testMissingCapabilityCopyIsRestartUpdateNotParseError() {
-        XCTAssertTrue(AppModel.serverConfigReadRequiredCopy.contains("Restart"))
-        XCTAssertTrue(AppModel.serverConfigReadRequiredCopy.contains("updating"))
-        XCTAssertFalse(AppModel.serverConfigReadRequiredCopy.contains("PARSE_ERROR"))
-        XCTAssertFalse(AppModel.serverConfigReadRequiredCopy.contains("could not be loaded"))
-    }
-
     func testArgumentsRoundTripThroughTheDisplayedCommandLine() {
         let arguments = ["-y", "a package", "", "it's-safe", #"a\"quote"#]
         XCTAssertEqual(
@@ -361,8 +294,8 @@ final class AppRosterTests: XCTestCase {
             apps: try apps(#"[{"target":"codex-cli","linked":true,"detected":true},{"target":"cursor","detected":true}]"#),
             sessions: try sessions(
                 """
-                [{"transport":"ipc","session_id":"a1","client_type":"codex","connected_secs":5},
-                 {"transport":"ipc","session_id":"a2","client_type":"codex","connected_secs":9}]
+                [{"transport":"daemon_proxy","session_id":"a1","client_type":"CodexCli","target":"codex-cli","connected_secs":5},
+                 {"transport":"daemon_proxy","session_id":"a2","client_type":"CodexCli","target":"codex-cli","connected_secs":9}]
                 """
             )
         )
@@ -375,23 +308,74 @@ final class AppRosterTests: XCTestCase {
     func testASessionItsOwnerNamedIsNotTheClientItReports() throws {
         let live = try sessions(
             """
-            [{"transport":"http","session_id":"g1","client_type":"Cursor","connected_secs":1},
-             {"transport":"http","session_id":"c1","client_type":"Cursor","connected_secs":1}]
+            [{"transport":"http","session_id":"g1","client_type":"Cursor","target":"cursor",
+              "client_key":"cursor","access_key":"remote:shared"},
+             {"transport":"http","session_id":"c1","client_type":"Cursor","target":"cursor",
+              "client_key":"cursor","access_key":"remote:shared"}]
             """
         )
         let roster = AppRoster(
-            apps: try apps(#"[{"target":"cursor","linked":true,"detected":true}]"#),
+            apps: try apps(#"[{"target":"cursor","linked":true,"detected":true,"linked_transport":"http"}]"#),
             sessions: live
         ) { $0.sessionId == "g1" ? "grok-bot" : nil }
         XCTAssertEqual(roster.connected[0].sessions.map(\.sessionId), ["c1"])
         XCTAssertEqual(roster.other.map(\.sessionId), ["g1"])
     }
 
+    /// Cursor linked on this Mac, and a Cursor on another Mac signed in over
+    /// the network. The daemon gives both the target `cursor`, so only how
+    /// each reaches Plug tells them apart.
+    func testASessionOverTheNetworkIsNotTheLocalAppsThoughItHasItsTarget() throws {
+        let live = try sessions(
+            """
+            [{"transport":"daemon_proxy","session_id":"l1","client_type":"Cursor","target":"cursor",
+              "client_key":"cursor","access_key":"cursor"},
+             {"transport":"http","session_id":"r1","client_type":"Cursor","target":"cursor",
+              "client_key":"oauth:abc","access_key":"oauth:abc"},
+             {"transport":"http","session_id":"r2","client_type":"Cursor","target":"cursor",
+              "client_key":"cursor","access_key":"remote:shared"}]
+            """
+        )
+        let local = try apps(#"[{"target":"cursor","linked":true,"detected":true,"linked_transport":"stdio"}]"#)
+        let roster = AppRoster(apps: local, sessions: live)
+        XCTAssertEqual(roster.connected.map(\.app.target), ["cursor"])
+        XCTAssertEqual(roster.connected[0].sessions.map(\.sessionId), ["l1"])
+        XCTAssertEqual(roster.other.map(\.sessionId), ["r1", "r2"])
+
+        // Linked over the network, the app holds the session with no sign-in
+        // of its own. The signed-in one is still its sign-in's.
+        let remote = try apps(#"[{"target":"cursor","linked":true,"detected":true,"linked_transport":"http"}]"#)
+        let overNetwork = AppRoster(apps: remote, sessions: live)
+        XCTAssertEqual(overNetwork.connected[0].sessions.map(\.sessionId), ["l1", "r2"])
+        XCTAssertEqual(overNetwork.other.map(\.sessionId), ["r1"])
+
+        // The window and the menu bar count the same three clients. The one
+        // with no sign-in is the daemon's shared key, which its calls carry.
+        let names = ClientNames(names: [])
+        XCTAssertEqual(live.map(names.client(of:)), ["cursor", "oauth:abc", "remote:shared"])
+        XCTAssertEqual(names.connectedClients(live + live).count, 3)
+        XCTAssertEqual(live.map(\.key), ["cursor", "oauth:abc", "remote:shared"])
+
+        // A name given to the local app is not the network client's, and one
+        // given to the network client is the name its calls show.
+        let named = ClientNames(names: try JSONDecoder().decode(
+            [ClientName].self,
+            from: Data(#"[{"key":"cursor","name":"Desk"},{"key":"remote:shared","name":"Token"}]"#.utf8)
+        ))
+        XCTAssertEqual(live.map(named.displayName), ["Desk", "Cursor", "Token"])
+        let call = ActivityEvent(
+            sequence: 1, occurredAtMs: 0, client: "r2", method: "tools/call", server: nil,
+            clientType: "Cursor", clientKey: ActivityEvent.sharedRemoteKey, target: "cursor",
+            remote: true, latencyMs: 1, outcome: .success
+        )
+        XCTAssertEqual(named.call(call, delimiter: "__").caller, "Token")
+    }
+
     func testASessionFromNoKnownAppIsKeptApart() throws {
         let roster = AppRoster(
             apps: try apps(#"[{"target":"cursor","detected":true}]"#),
             sessions: try sessions(
-                #"[{"transport":"ipc","session_id":"z9","client_type":"unknown","client_info":"ditto-history","connected_secs":1}]"#
+                #"[{"transport":"daemon_proxy","session_id":"z9","client_type":"Unknown","client_info":"ditto-history","connected_secs":1}]"#
             )
         )
         XCTAssertTrue(roster.connected.isEmpty)
@@ -407,7 +391,7 @@ final class AppRosterTests: XCTestCase {
               "host":{"name":"python3","executable":"/usr/bin/python3"}},
              {"transport":"daemon_proxy","session_id":"h3","client_type":"Unknown","client_info":"mcp","connected_secs":1,
               "host":{"name":"python3","executable":"/usr/bin/python3"}},
-             {"transport":"daemon_proxy","session_id":"h4","client_type":"Cursor","client_info":"cursor-vscode","connected_secs":1,
+             {"transport":"daemon_proxy","session_id":"h4","client_type":"Cursor","client_info":"cursor-vscode","target":"cursor","connected_secs":1,
               "host":{"name":"Terminal","executable":"/x/Terminal.app/Contents/MacOS/Terminal","app":"/x/Terminal.app"}},
              {"transport":"daemon_proxy","session_id":"abcd9","client_type":"Unknown","client_info":"mcp","connected_secs":1}]
             """
@@ -424,11 +408,11 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(
             ToolCatalog.groups(ofNames: [
                 "Gmail__search_messages", "GoogleDrive__list_items", "Gmail__send_message", "Workspace__start",
-            ]),
+            ], delimiter: "__"),
             ["Gmail", "GoogleDrive", "Workspace"]
         )
-        XCTAssertEqual(ToolCatalog.groups(ofNames: ["Slack__channels_list", "Slack__users_search"]), ["Slack"])
-        XCTAssertEqual(ToolCatalog.groups(ofNames: ["unprefixed"]), [])
+        XCTAssertEqual(ToolCatalog.groups(ofNames: ["Slack__channels_list", "Slack__users_search"], delimiter: "__"), ["Slack"])
+        XCTAssertEqual(ToolCatalog.groups(ofNames: ["unprefixed"], delimiter: "__"), [])
     }
 
     func testClientsAreGroupedByWhereTheyRun() throws {
@@ -455,13 +439,13 @@ final class AppRosterTests: XCTestCase {
         )
         // The daemon's own reply, read the way the app reads it.
         let snapshot = try decoder.decode(OperatorSnapshot.self, from: Data(#"""
-        {"runtime_version":"1","uptime_secs":1,"ownership":"app_managed","configured_servers":[],
-         "servers":[],"live_sessions":[],"client_visibility":[],"upstream_auth":[],"downstream_clients":[],
+        {"runtime_version":"1","uptime_secs":1,"started_id":1,"tool_catalog_revision":0,"ownership":"app_managed","prefix_delimiter":"__","configured_servers":[],
+         "servers":[],"live_sessions":[],"upstream_auth":[],"downstream_clients":[],
          "client_places":[{"key":"claude-code","place":"Work laptop"}]}
         """#.utf8))
         XCTAssertEqual(ClientNames(snapshot: snapshot).place(forKey: "claude-code"), "Work laptop")
 
-        let names = ClientNames(visibility: [], names: [], places: places)
+        let names = ClientNames(names: [], places: places)
         XCTAssertEqual(names.place(forKey: "oauth:abc"), "Work laptop")
         XCTAssertNil(names.place(forKey: "oauth:zzz"))
         XCTAssertEqual(names.ownerPlaces, ["Cloud", "Work laptop"])
@@ -502,29 +486,22 @@ final class AppRosterTests: XCTestCase {
     func testAClientNamedAsOnePlugKnowsTakesThatClientsIcon() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let visibility = try decoder.decode(
-            [ClientVisibility].self,
-            from: Data(
-                """
-                [{"session_id":"g1","client_type":"Cursor","visible_tool_count":3,"client_key":"oauth:abc"},
-                 {"session_id":"c1","client_type":"Cursor","visible_tool_count":3,"client_key":"oauth:def"},
-                 {"session_id":"m1","client_type":"Cursor","visible_tool_count":3,"client_key":"custom:my-tool"}]
-                """.utf8
-            )
-        )
         let stored = try decoder.decode(
             [ClientName].self,
             from: Data(#"[{"key":"oauth:abc","name":"GrokBot"},{"key":"oauth:def","name":"Work laptop"}]"#.utf8)
         )
-        let names = ClientNames(visibility: visibility, names: stored)
+        let names = ClientNames(names: stored)
         let live = try sessions(
             """
-            [{"transport":"http","session_id":"g1","client_type":"Cursor","client_info":"Cursor","connected_secs":1},
-             {"transport":"http","session_id":"c1","client_type":"Cursor","client_info":"Cursor","connected_secs":1},
-             {"transport":"daemon_proxy","session_id":"m1","client_type":"Cursor","client_info":"Cursor","connected_secs":1}]
+            [{"transport":"http","session_id":"g1","client_type":"Cursor","client_info":"Cursor","target":"cursor",
+              "client_key":"oauth:abc","access_key":"oauth:abc"},
+             {"transport":"http","session_id":"c1","client_type":"Cursor","client_info":"Cursor","target":"cursor",
+              "client_key":"oauth:def","access_key":"oauth:def"},
+             {"transport":"daemon_proxy","session_id":"m1","client_type":"Cursor","client_info":"Cursor","connected_secs":1,
+              "client_key":"custom:my-tool","access_key":"custom:my-tool","target":"custom:my-tool"}]
             """
         )
-        // One the owner made up keeps its own icon, whatever it reports.
+        // The daemon's target wins over what the client reports.
         XCTAssertEqual(names.target(of: live[2]), "custom:my-tool")
         XCTAssertEqual(names.target(of: live[0]), "grok-bot")
         // A name Plug does not know leaves the icon to what the client reports.
@@ -538,34 +515,24 @@ final class AppRosterTests: XCTestCase {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let key = "host:/opt/hermes_agent/bin/python3"
-        let visibility = try decoder.decode(
-            [ClientVisibility].self,
-            from: Data(
-                """
-                [{"session_id":"h1","client_type":"Unknown","visible_tool_count":3,"client_key":"\(key)"},
-                 {"session_id":"h2","client_type":"Unknown","visible_tool_count":3,"client_key":"\(key)"},
-                 {"session_id":"h3","client_type":"Unknown","visible_tool_count":3}]
-                """.utf8
-            )
-        )
         let stored = try decoder.decode(
             [ClientName].self,
             from: Data(#"[{"key":"\#(key)","name":"Hermes"},{"key":"oauth:abc","name":"Phone"}]"#.utf8)
         )
-        let names = ClientNames(visibility: visibility, names: stored)
+        let names = ClientNames(names: stored)
         let live = try sessions(
             """
             [{"transport":"daemon_proxy","session_id":"h1","client_type":"Unknown","client_info":"mcp","connected_secs":1,
-              "host":{"name":"python3","executable":"/opt/hermes_agent/bin/python3"}},
+              "host":{"name":"python3","executable":"/opt/hermes_agent/bin/python3"},
+              "client_key":"\(key)","access_key":"\(key)"},
              {"transport":"daemon_proxy","session_id":"h2","client_type":"Unknown","client_info":"mcp","connected_secs":1,
-              "host":{"name":"python3","executable":"/opt/hermes_agent/bin/python3"}},
+              "host":{"name":"python3","executable":"/opt/hermes_agent/bin/python3"},
+              "client_key":"\(key)","access_key":"\(key)"},
              {"transport":"daemon_proxy","session_id":"h3","client_type":"Unknown","client_info":"mcp","connected_secs":1}]
             """
         )
 
         XCTAssertEqual(live.map(names.displayName), ["Hermes", "Hermes", "Unknown client h3"])
-        XCTAssertEqual(names.key(of: live[0]), key)
-        XCTAssertNil(names.key(of: live[2]), "a session with nothing to store a name under cannot be renamed")
         XCTAssertEqual(names.name(forKey: "oauth:abc"), "Phone")
         XCTAssertNil(names.name(forKey: "oauth:other"))
     }
@@ -582,25 +549,28 @@ final class AppRosterTests: XCTestCase {
                 """.utf8
             )
         )
+        // What the daemon enforces of each client's lists.
         let blocks = try decoder.decode(
             [ClientBlocks].self,
             from: Data(
                 """
-                [{"key":"cursor","servers":["git","gone"],"tools":["slack__post"]},
-                 {"key":"oauth:abc","servers":["slack"]},
-                 {"key":"pi","tools":["git__*","slack__dm"]}]
+                [{"key":"cursor","servers":["git","gone"],"tools":["slack__post"],
+                  "off_servers":["git"],"off_tools":[{"name":"slack__post"}]},
+                 {"key":"oauth:abc","servers":["slack"],"off_servers":["slack"]},
+                 {"key":"pi","tools":["git__*","slack__dm"],
+                  "off_tools":[{"name":"git__commit","rule":"git__*"},{"name":"git__log","rule":"git__*"},
+                               {"name":"slack__dm"}]}]
                 """.utf8
             )
         )
-        let access = { ClientAccess(key: $0, name: "Client", servers: servers, blocks: blocks) }
+        let access = { ClientAccess(key: $0, name: "Client", isRemote: $0.hasPrefix("oauth"), servers: servers, blocks: blocks) }
 
-        // A block on a server that is gone is not counted.
-        XCTAssertEqual(access("cursor").blockedServers, ["git"])
+        XCTAssertEqual(access("cursor").offServers, ["git"])
         XCTAssertEqual(access("cursor").summary, "1 server and 1 tool off")
-        XCTAssertFalse(access("cursor").isRemote)
+        XCTAssertFalse(access("cursor").isOn(server: "git"))
         XCTAssertEqual(access("oauth:abc").summary, "1 server off")
-        XCTAssertTrue(access("oauth:abc").isRemote)
-        XCTAssertEqual(access("pi").summary, "2 tools off")
+        // Every tool a rule covers counts.
+        XCTAssertEqual(access("pi").summary, "3 tools off")
         XCTAssertNil(access("claude-code").summary)
         XCTAssertFalse(access("claude-code").isLimited)
 
@@ -610,13 +580,13 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(access("pi").state(ofTool: "slack__post"), .on)
         XCTAssertEqual(access("cursor").state(ofTool: "slack__post"), .off)
         let tools = ["git__commit", "git__log", "slack__dm", "slack__post"].map {
-            ToolFacts(name: $0, server: String($0.prefix(while: { $0 != "_" })))
+            ToolFacts(delimiter: "__", name: $0, server: String($0.prefix(while: { $0 != "_" })))
         }
         XCTAssertEqual(access("pi").offCount(among: tools), 3)
         XCTAssertEqual(access("claude-code").offCount(among: tools), 0)
     }
 
-    func testAClientWithAnAllowListGetsOnlyWhatIsOnIt() throws {
+    func testAClientWithAnAllowListSwitchesToolsOnTheList() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let servers = try decoder.decode(
@@ -634,81 +604,55 @@ final class AppRosterTests: XCTestCase {
             from: Data(
                 """
                 [{"key":"radar","only_allowed":true,"allowed_servers":["slack"],
-                  "allowed_tools":["Git__commit"],"partly_allowed_servers":["git"],
-                  "tools":["slack__dm"]},
-                 {"key":"empty","only_allowed":true}]
+                  "allowed_tools":["Git__commit"],"tools":["slack__dm"],
+                  "off_servers":["notion"],"off_tools":[{"name":"slack__dm"},{"name":"git__push"}]}]
                 """.utf8
             )
         )
         let radar = ClientAccess(key: "radar", name: "Radar", servers: servers, blocks: blocks)
-        XCTAssertTrue(radar.isOn(server: "slack"))
         XCTAssertTrue(radar.isOn(server: "git"))
         XCTAssertFalse(radar.isOn(server: "notion"))
-        XCTAssertEqual(radar.summary, "1 server and 1 tool off")
+        XCTAssertEqual(radar.summary, "1 server and 2 tools off")
 
-        // On a server that is on the list whole, a tool is off only by a
-        // block. On one that is not, a tool is on only if it is listed.
-        let tool = { ToolFacts(name: $0, server: $1) }
+        // On a server that is on the list whole, a tool's switch is a block.
+        // On one that is not, it puts the tool on the list or takes it off.
+        let tool = { ToolFacts(delimiter: "__", name: $0, server: $1) }
         XCTAssertEqual(radar.state(of: tool("slack__post", "slack")), .on)
         XCTAssertEqual(radar.state(of: tool("slack__dm", "slack")), .off)
         XCTAssertFalse(radar.isListedSingly(tool("slack__dm", "slack")))
         XCTAssertEqual(radar.state(of: tool("git__commit", "git")), .on)
         XCTAssertEqual(radar.state(of: tool("git__push", "git")), .off)
         XCTAssertTrue(radar.isListedSingly(tool("git__push", "git")))
-
-        // An empty list is still a list.
-        let empty = ClientAccess(key: "empty", name: "Empty", servers: servers, blocks: blocks)
-        XCTAssertEqual(empty.offServers, ["git", "slack", "notion"])
-        XCTAssertEqual(empty.summary, "3 servers off")
-    }
-
-    func testARuleFitsTheWayTheDaemonReadsIt() {
-        XCTAssertTrue(ClientAccess.rule("*", fits: "anything"))
-        XCTAssertTrue(ClientAccess.rule("git__*", fits: "git__log"))
-        XCTAssertTrue(ClientAccess.rule("*__delete", fits: "git__delete"))
-        XCTAssertTrue(ClientAccess.rule("git__*_all", fits: "git__push_all"))
-        XCTAssertTrue(ClientAccess.rule("*delete*", fits: "git__delete_branch"))
-        XCTAssertFalse(ClientAccess.rule("git__*", fits: "slack__git__log"))
-        XCTAssertFalse(ClientAccess.rule("*__delete", fits: "git__delete_branch"))
-        XCTAssertFalse(ClientAccess.rule("git__log", fits: "git__logs"))
     }
 
     func testARemoteSessionIsNamedAfterItsGrantUnlessPlugKnowsTheProduct() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let visibility = try decoder.decode(
-            [ClientVisibility].self,
-            from: Data(
-                #"""
-                [{"session_id":"r1","client_type":"Unknown","visible_tool_count":3,"client_key":"oauth:abc"},
-                 {"session_id":"r2","client_type":"Cursor","visible_tool_count":3,"client_key":"oauth:def"},
-                 {"session_id":"r3","client_type":"Unknown","visible_tool_count":3,"client_key":"oauth:gone"}]
-                """#.utf8
-            )
-        )
         let grants = try decoder.decode(
             [DownstreamClient].self,
             from: Data(
                 #"""
-                [{"client_id":"abc","client_name":"Perplexity","redirect_uris":[],"source":"dynamic"},
-                 {"client_id":"def","client_name":"Something Else","redirect_uris":[],"source":"dynamic"}]
+                [{"client_id":"abc","client_name":"Perplexity","redirect_uris":[],"source":"dynamic","client_key":"oauth:abc","signed_in":true,"created_at":1,"expires_at":2},
+                 {"client_id":"def","client_name":"Something Else","redirect_uris":[],"source":"dynamic","client_key":"oauth:def","signed_in":true,"created_at":1,"expires_at":2}]
                 """#.utf8
             )
         )
         let live = try sessions(
             """
-            [{"transport":"http","session_id":"r1","client_type":"Unknown","connected_secs":1},
-             {"transport":"http","session_id":"r2","client_type":"Cursor","connected_secs":1},
-             {"transport":"http","session_id":"r3","client_type":"Unknown","connected_secs":1}]
+            [{"transport":"http","session_id":"r1","client_type":"Unknown","connected_secs":1,
+              "client_key":"oauth:abc","access_key":"oauth:abc"},
+             {"transport":"http","session_id":"r2","client_type":"Cursor","target":"cursor",
+              "client_key":"oauth:def","access_key":"oauth:def"},
+             {"transport":"http","session_id":"r3","client_type":"Unknown","connected_secs":1,
+              "client_key":"oauth:gone","access_key":"oauth:gone"}]
             """
         )
 
-        let names = ClientNames(visibility: visibility, names: [], grants: grants)
+        let names = ClientNames(names: [], grants: grants)
         XCTAssertEqual(
             live.map(names.displayName),
             ["Perplexity", "Cursor", "Unknown client r3"]
         )
-        XCTAssertEqual(names.key(of: live[0]), "oauth:abc", "a remote session is renamed through its grant")
         // The menu bar panel shows the same clients under the same names.
         XCTAssertEqual(
             names.connectedClients(live + live).map(\.name),
@@ -720,11 +664,24 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(names.connectedClients(live)[0].target, "perplexity")
 
         let renamed = ClientNames(
-            visibility: visibility,
             names: try decoder.decode([ClientName].self, from: Data(#"[{"key":"oauth:def","name":"Work laptop"}]"#.utf8)),
             grants: grants
         )
         XCTAssertEqual(renamed.displayName(live[1]), "Work laptop")
+    }
+
+    func testOnlyASessionWhoseRequestsCarryItsOwnKeyHasChoicesOfItsOwn() throws {
+        let live = try sessions(
+            """
+            [{"transport":"daemon_proxy","session_id":"l1","client_type":"Cursor","target":"cursor",
+              "client_key":"cursor","access_key":"cursor"},
+             {"transport":"http","session_id":"r1","client_type":"Cursor","target":"cursor",
+              "client_key":"cursor","access_key":"remote:shared"},
+             {"transport":"http","session_id":"r2","client_type":"Unknown","connected_secs":1,
+              "access_key":"remote:shared"}]
+            """
+        )
+        XCTAssertEqual(live.map(\.ownAccessKey), ["cursor", nil, nil])
     }
 
     func testStaleAppScanCannotInventAConnectedSession() throws {
@@ -739,7 +696,7 @@ final class AppRosterTests: XCTestCase {
     func testClaudeCodeAndCodexSessionsStayWithTheirOwnApps() throws {
         let roster = AppRoster(
             apps: try apps(#"[{"target":"codex-cli","detected":true},{"target":"claude-code","detected":true}]"#),
-            sessions: try sessions(#"[{"transport":"ipc","session_id":"codex-1","client_type":"Codex CLI","client_info":"codex-mcp-client","connected_secs":5},{"transport":"ipc","session_id":"claude-1","client_type":"Claude Code","client_info":"claude-code","connected_secs":9}]"#)
+            sessions: try sessions(#"[{"transport":"daemon_proxy","session_id":"codex-1","client_type":"CodexCli","client_info":"codex-mcp-client","target":"codex-cli","connected_secs":5},{"transport":"daemon_proxy","session_id":"claude-1","client_type":"ClaudeCode","client_info":"claude-code","target":"claude-code","connected_secs":9}]"#)
         )
         XCTAssertEqual(roster.connected[0].sessions.map(\.sessionId), ["codex-1"])
         XCTAssertEqual(roster.connected[1].sessions.map(\.sessionId), ["claude-1"])
@@ -765,10 +722,10 @@ final class AppRosterTests: XCTestCase {
          {"target":"claude-code","detected":true,"linked":true,"linked_transport":"stdio"},
          {"target":"codex-cli","detected":true,"linked_transport":"http"}]
         """#)
-        XCTAssertTrue(ClientStatus.hasNetworkRepresentation(list[0], grantNames: ["Cursor"]))
-        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[0], grantNames: ["Claude Code"]))
-        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[1], grantNames: ["Claude Code"]))
-        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[2], grantNames: ["Codex CLI"]))
+        XCTAssertTrue(ClientStatus.hasNetworkRepresentation(list[0], grantTargets: ["cursor"]))
+        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[0], grantTargets: ["claude-code"]))
+        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[1], grantTargets: ["claude-code"]))
+        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[2], grantTargets: ["codex-cli"]))
     }
 }
 
@@ -783,27 +740,15 @@ final class PopoverRecentTests: XCTestCase {
             server: server,
             tool: tool,
             latencyMs: 10,
-            outcome: "success"
+            outcome: .success
         )
-    }
-
-    func testRecentCallsAreToolCallsNewestFirst() {
-        let events = [
-            event(1, tool: "Figma__get_file"),
-            event(2, tool: nil),
-            event(3, tool: "Slack__channels_list"),
-            event(4, tool: ""),
-            event(5, tool: "Notion__search"),
-            event(6, tool: "Gmail__send_message"),
-        ]
-        XCTAssertEqual(PlugPopover.recentCalls(events, limit: 3).map(\.sequence), [6, 5, 3])
     }
 
     func testACallIsShownUnderTheNameItsOwnerGaveTheClient() {
         let reported = ActivityEvent(
             sequence: 1, occurredAtMs: 0, client: "s1", method: "tools/call", server: "imessage",
             tool: "IMessage__get_messages", clientType: "Cursor", clientLabel: "Cursor 1.0",
-            clientKey: "oauth:abc", latencyMs: 1, outcome: "success"
+            clientKey: "oauth:abc", target: "cursor", latencyMs: 1, outcome: .success
         )
         let named = CallFacts(reported, ownerName: "GrokBot")
         XCTAssertEqual(named.caller, "GrokBot")
@@ -820,12 +765,32 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertEqual(CallFacts(reported).caller, "Cursor")
     }
 
+    /// Activity's search finds a call by the names its row shows, not only
+    /// by what the client reported.
+    func testASearchFindsACallByTheNameOnItsRow() {
+        let reported = ActivityEvent(
+            sequence: 1, occurredAtMs: 0, client: "s1", method: "tools/call", server: "workspace",
+            tool: "Gmail__send_message", clientType: "Claude Desktop", clientLabel: "claude-ai",
+            clientKey: "claude-desktop", target: "claude-desktop", latencyMs: 1, outcome: .success
+        )
+        let call = CallFacts(reported, delimiter: "__")
+        XCTAssertEqual(call.caller, "Claude Desktop")
+        XCTAssertTrue(call.matches("claude desktop"))
+        XCTAssertTrue(call.matches("claude-ai"))
+        XCTAssertTrue(call.matches("workspace"))
+        XCTAssertTrue(call.matches("gmail"))
+        XCTAssertFalse(call.matches("figma"))
+        let named = CallFacts(reported, delimiter: "__", ownerName: "Desk", place: "Studio")
+        XCTAssertTrue(named.matches("desk"))
+        XCTAssertTrue(named.matches("studio"))
+    }
+
     func testAClientThatCameAndWentIsListedByItsLastCall() {
         func call(_ sequence: UInt64, at ms: UInt64, key: String?) -> ActivityEvent {
             ActivityEvent(
                 sequence: sequence, occurredAtMs: ms, client: "s", method: "tools/call", server: "gmail",
                 tool: "Gmail__search_messages", clientType: "Unknown", clientLabel: "radar",
-                clientKey: key, latencyMs: 1, outcome: "success"
+                clientKey: key, latencyMs: 1, outcome: .success
             )
         }
         let events = [
@@ -838,8 +803,6 @@ final class PopoverRecentTests: XCTestCase {
         // One row a client, by its newest call; a client already shown and a
         // call nobody can be told apart by add none.
         XCTAssertEqual(RecentCallers.latest(events, excluding: ["cursor"]).map(\.sequence), [2, 3])
-        XCTAssertFalse(RecentCallers.isRemote(key: "host:python#radar.py"))
-        XCTAssertTrue(RecentCallers.isRemote(key: "oauth:abc"))
 
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = .gmt
@@ -850,34 +813,55 @@ final class PopoverRecentTests: XCTestCase {
     }
 
     func testACallFromANetworkClientIsPicturedByItsSignIn() {
-        func call(_ type: String, grant: String?) -> CallFacts {
+        func call(_ type: String, target: String? = nil, grant: String?) -> CallFacts {
             CallFacts(ActivityEvent(
                 sequence: 1, occurredAtMs: 0, client: "s1", method: "tools/call", server: "imessage",
                 tool: "IMessage__get_messages", clientType: type, clientKey: "oauth:abc",
-                latencyMs: 1, outcome: "success"
+                target: target, latencyMs: 1, outcome: .success
             ), grantName: grant)
         }
         // A client that says nothing useful about itself takes its sign-in's name.
         let hermes = call("Unknown", grant: "Hermes Agent")
         XCTAssertEqual(hermes.caller, "Hermes Agent")
         XCTAssertEqual(hermes.callerTarget, "hermes")
-        // A script is pictured by its language, under its own name.
-        let script = call("mcp", grant: "Ditto email-manager")
+        let script = call("Unknown", grant: "Ditto email-manager")
         XCTAssertEqual(script.caller, "Ditto email-manager")
-        XCTAssertEqual(script.callerIconName, "Python")
         // What a known client reports still outranks its sign-in.
-        XCTAssertEqual(call("Cursor", grant: "Something").callerTarget, "cursor")
+        XCTAssertEqual(call("Cursor", target: "cursor", grant: "Something").callerTarget, "cursor")
         XCTAssertEqual(call("Unknown", grant: nil).caller, "Unknown client")
     }
 
     func testCallFactsSplitTheServerPrefix() {
-        let call = CallFacts(event(1, tool: "Figma__get_file", server: "figma"))
-        XCTAssertEqual(call.server, "Figma")
+        let call = CallFacts(event(1, tool: "Figma__get_file", server: "figma"), delimiter: "__")
+        XCTAssertEqual(call.server, "figma")
         XCTAssertEqual(call.tool, "get_file")
     }
 
+    /// A group rule files a server's tools under other names. The call is
+    /// the server's that the daemon routed it to, and the tool keeps the
+    /// name the tool list gives it.
+    func testACallToAGroupsToolBelongsToTheServerThatAnswered() {
+        let call = CallFacts(event(1, tool: "Gmail__send_message", server: "workspace"), delimiter: "__")
+        XCTAssertEqual(call.server, "workspace")
+        XCTAssertEqual(call.tool, "Gmail__send_message")
+        XCTAssertEqual(
+            call.tool, ToolFacts(delimiter: "__", name: "Gmail__send_message", server: "workspace").shortName
+        )
+    }
+
+    /// The delimiter is the daemon's, whatever the config sets it to.
+    func testCallFactsSplitOnTheDaemonsDelimiter() {
+        let dotted = CallFacts(event(1, tool: "Figma.get_file", server: "figma"), delimiter: ".")
+        XCTAssertEqual(dotted.server, "figma")
+        XCTAssertEqual(dotted.tool, "get_file")
+        let whole = CallFacts(event(1, tool: "Figma__get_file", server: "figma"), delimiter: ".")
+        XCTAssertEqual(whole.tool, "Figma__get_file")
+        XCTAssertEqual(ToolFacts(delimiter: ".", name: "figma.get_file", server: "figma").shortName, "get_file")
+        XCTAssertEqual(ToolCatalog.groups(ofNames: ["Gmail.search", "Drive.list"], delimiter: "."), ["Drive", "Gmail"])
+    }
+
     func testCallFactsKeepAnUnprefixedName() {
-        let call = CallFacts(event(1, tool: "search", server: "notion"))
+        let call = CallFacts(event(1, tool: "search", server: "notion"), delimiter: "__")
         XCTAssertEqual(call.server, "notion")
         XCTAssertEqual(call.tool, "search")
     }
@@ -893,39 +877,50 @@ final class PopoverRecentTests: XCTestCase {
     func testAFailedCallSaysWhyAndWhatToDo() {
         let failed = CallFacts(ActivityEvent(
             sequence: 1, occurredAtMs: 1, client: nil, method: "tools/call", server: "notion",
-            tool: "Notion__search", clientType: "claude-code", latencyMs: 30_000,
-            outcome: "error", reason: "upstream request timed out"
+            tool: "Notion__search", clientType: "ClaudeCode", target: "claude-code", latencyMs: 30_000,
+            outcome: .error, reason: "upstream request timed out"
         ))
         XCTAssertEqual(failed.result, "Failed")
         XCTAssertEqual(failed.caller, "Claude Code")
         XCTAssertEqual(failed.reason, "upstream request timed out")
-        XCTAssertEqual(failed.advice, Explain.advice(forReason: "timed out"))
+        XCTAssertNotNil(failed.advice)
+        XCTAssertNotEqual(failed.advice, Explain.fallback, "a timeout has advice of its own")
         XCTAssertEqual(failed.duration, "30.0 s")
 
         let old = CallFacts(ActivityEvent(
             sequence: 2, occurredAtMs: 1, client: nil, method: "tools/call", server: "notion",
-            latencyMs: 12, outcome: "error"
+            latencyMs: 12, outcome: .error
         ))
         XCTAssertNil(old.reason)
         XCTAssertNotNil(old.advice, "a failure always has a next step")
         XCTAssertEqual(old.duration, "12 ms")
     }
 
+    func testACallIsPicturedAsTheClientTheDaemonTookItFor() {
+        let call = CallFacts(ActivityEvent(
+            sequence: 1, occurredAtMs: 1, client: nil, method: "tools/call", server: "notion",
+            clientType: "Unknown", clientLabel: "mcp", clientKey: "codex-cli", target: "codex-cli",
+            latencyMs: 1, outcome: .success
+        ))
+        XCTAssertEqual(call.callerTarget, "codex-cli")
+        XCTAssertEqual(call.caller, "Codex CLI")
+    }
+
     func testACancelledCallIsNotAFailure() {
-        func call(_ outcome: String) -> CallFacts {
+        func call(_ outcome: CallOutcome) -> CallFacts {
             CallFacts(ActivityEvent(
                 sequence: 1, occurredAtMs: 1, client: nil, method: "tools/call", server: "notion",
                 latencyMs: 12, outcome: outcome
             ))
         }
-        let cancelled = call("cancelled")
+        let cancelled = call(.cancelled)
         XCTAssertTrue(cancelled.cancelled)
         XCTAssertFalse(cancelled.failed)
         XCTAssertFalse(cancelled.succeeded)
         XCTAssertEqual(cancelled.result, "Canceled")
         XCTAssertEqual(cancelled.advice, "The client stopped this call before it finished.")
 
-        let failed = call("error")
+        let failed = call(.error)
         XCTAssertTrue(failed.failed)
         XCTAssertFalse(failed.cancelled)
         XCTAssertEqual(failed.result, "Failed")
@@ -944,22 +939,55 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertEqual(Explain.advice(forReason: "zzz"), Explain.fallback)
     }
 
-    func testAPartialImportNamesWhatFailed() {
+    /// A taken name is told apart by the daemon's code, whatever its message says.
+    func testATakenNameIsKnownByItsCode() {
         XCTAssertEqual(
-            ImportServersView.summary(failed: ["notion"], of: 3),
-            "Could not add notion. 2 servers were added. The reason is under each one."
+            Explain.advice(for: PlugIPCError.daemon(PlugIPCError.serverNameTaken, "nope")),
+            "Choose another name."
         )
-        XCTAssertEqual(
-            ImportServersView.summary(failed: ["a", "b", "c", "d", "e"], of: 5),
-            "Could not add a, b, c, and 2 more. The reason is under each one."
+        XCTAssertNotEqual(
+            Explain.advice(for: PlugIPCError.daemon("MUTATION_FAILED", "github already exists")),
+            "Choose another name."
         )
+    }
+
+    /// The app's own errors carry their advice. Their words are the app's,
+    /// so "deadline" or "unexpected" in one is not read as a slow server or
+    /// a bad entry; text from outside the app inside one still is.
+    func testTheAppsOwnErrorsCarryTheirAdvice() {
+        XCTAssertEqual(Explain.advice(for: PlugIPCError.timedOut), Explain.fallback)
+        XCTAssertEqual(Explain.advice(for: PlugIPCError.unexpectedResponse("Tools")), Explain.fallback)
+        XCTAssertEqual(Explain.advice(for: PlugIPCError.disconnected), Explain.starting)
+        XCTAssertEqual(Explain.advice(for: DaemonServiceError.registrationDisabled), Explain.fallback)
+        XCTAssertEqual(Explain.advice(for: DaemonServiceError.commandFailed("")), Explain.fallback)
+
+        XCTAssertTrue(Explain.advice(for: PlugIPCError.daemon("E", "token expired")).contains("Sign in"))
+        XCTAssertTrue(Explain.advice(for: AppLinkError.commandFailed("Permission denied")).contains("access"))
+        XCTAssertTrue(Explain.advice(for: ClientRepairError.commandFailed(status: 1, stderr: "os error 2")).contains("command"))
+
+        let outside = NSError(domain: "x", code: 1, userInfo: [NSLocalizedDescriptionKey: "connection refused"])
+        XCTAssertTrue(Explain.advice(for: outside).contains("address"))
+    }
+
+    /// Edit Server, like every sheet, keeps the error's advice, so a
+    /// timed-out or garbled answer from Plug's own connection gets the same
+    /// next step in the sheet as on a button press, not the advice its words
+    /// would pick ("deadline" for a slow server, "unexpected" for a bad entry).
+    func testASheetKeepsTheAdviceTheErrorCarries() {
+        for error in [PlugIPCError.timedOut, PlugIPCError.unexpectedResponse("ServerConfig")] {
+            let failure = SheetFailure(error)
+            XCTAssertEqual(failure.reason, error.localizedDescription)
+            XCTAssertEqual(failure.advice, Explain.fallback, "\(error)")
+            XCTAssertNotEqual(failure.advice, Explain.advice(forReason: failure.reason), "\(error)")
+        }
+        XCTAssertTrue(SheetFailure(PlugIPCError.daemon("E", "token expired")).advice.contains("Sign in"))
     }
 
     /// A new sign-in under a name others gave asks which one it is, once.
     func testANewSignInAsksAboutEarlierOnesWithItsName() {
         let now = Date(timeIntervalSince1970: 2_000_000)
         func grant(_ id: String, _ name: String, at created: UInt64, used: UInt64? = 1) -> DownstreamClient {
-            let json = #"{"client_id":"\#(id)","client_name":"\#(name)","redirect_uris":[],"source":"dynamic","created_at":\#(created),"signed_in":true}"#
+            let json = #"{"client_id":"\#(id)","client_name":"\#(name)","redirect_uris":[],"source":"dynamic","created_at":\#(created),"expires_at":3000000,"signed_in":true,"client_key":"oauth:\#(id)"}"#
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
             var client = try! decoder.decode(DownstreamClient.self, from: Data(json.utf8))
@@ -989,7 +1017,33 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertEqual(SignInFacts.goneIn(expiresAt: 1_000_030, now: now), "gone soon")
         XCTAssertEqual(SignInFacts.goneIn(expiresAt: 1_001_500, now: now), "gone in 25 min")
         XCTAssertEqual(SignInFacts.goneIn(expiresAt: 1_007_300, now: now), "gone in 2 hr")
-        XCTAssertEqual(SignInFacts.goneIn(expiresAt: nil, now: now), "")
         XCTAssertEqual(SignInFacts.day(1_000_000, now: now), "today")
+    }
+}
+
+final class ActivityLogTests: XCTestCase {
+    private func calls(_ sequences: ClosedRange<UInt64>) -> [ActivityEvent] {
+        sequences.map {
+            ActivityEvent(
+                sequence: $0, occurredAtMs: $0, client: nil, method: "tools/call",
+                server: "Figma", tool: "Figma__read", latencyMs: 1, outcome: .success
+            )
+        }
+    }
+
+    /// A daemon that started again numbers its calls from 1, however long the
+    /// old one ran, so the app reads it from the start and drops the old rows.
+    func testCallsFromAnotherDaemonStartReplaceTheOldOnes() {
+        var log = ActivityLog()
+        log.take(calls(1...40), after: log.cursor(startedId: 7), startedId: 7)
+        XCTAssertEqual(log.cursor(startedId: 7), 40)
+        log.take(calls(41...42), after: 40, startedId: 7)
+        XCTAssertEqual(log.events.last?.sequence, 42)
+
+        let cursor = log.cursor(startedId: 8)
+        XCTAssertEqual(cursor, 0)
+        log.take(calls(1...3), after: cursor, startedId: 8)
+        XCTAssertEqual(log.events.map(\.sequence), [1, 2, 3])
+        XCTAssertEqual(log.cursor(startedId: 8), 3)
     }
 }

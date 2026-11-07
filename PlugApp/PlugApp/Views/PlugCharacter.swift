@@ -2,8 +2,8 @@ import AppKit
 import SwiftUI
 
 /// The shapes of Plug's mark, the plug with a face, in the units of
-/// `docs/assets/plug-icon.svg`. The menu bar icon and the moving character
-/// are both drawn from these.
+/// `docs/assets/plug-icon.svg`. The menu bar icon and the moving character's
+/// resting pose are both drawn from these.
 enum PlugMark {
     /// How far the mark leans to the left, in degrees.
     static let lean: CGFloat = -10
@@ -11,11 +11,21 @@ enum PlugMark {
     static let height: CGFloat = 81.7
     static let body = CGRect(x: 24, y: 40, width: 72, height: 54)
     static let bodyCorner: CGFloat = 18
+    /// The left prong and the right, each a bar with round ends.
+    static let prongs = [CGRect(x: 39, y: 17, width: 14, height: 37), CGRect(x: 67, y: 17, width: 14, height: 37)]
+    /// Where each eye's middle is, wide open.
+    static let eyeMiddles = [CGPoint(x: 51.5, y: 65), CGPoint(x: 76.5, y: 65)]
+    static let eyeSize = CGSize(width: 9.24, height: 22.28)
+    /// The point the mark leans about.
+    static let middle = CGPoint(x: 60, y: 55.5)
+    /// How far the middle of the leaning mark, as it looks, is from `middle`.
+    static let offCentre = CGVector(dx: 2.04, dy: 0.48)
 
     static var silhouette: Path {
         var path = Path()
-        for x in [39.0, 67.0] {
-            path.addRoundedRect(in: CGRect(x: x, y: 17, width: 14, height: 37), cornerSize: CGSize(width: 7, height: 7))
+        for prong in prongs {
+            let corner = prong.width / 2
+            path.addRoundedRect(in: prong, cornerSize: CGSize(width: corner, height: corner))
         }
         path.addRoundedRect(in: body, cornerSize: CGSize(width: bodyCorner, height: bodyCorner))
         return path
@@ -24,13 +34,13 @@ enum PlugMark {
     /// The eyes, from wide open (1) to shut (0), looking `gaze` units to one
     /// side. Shut, each is a line `lid` units thick.
     static func eyes(open: CGFloat, gaze: CGFloat = 0, lid: CGFloat = 5) -> Path {
-        let height = max(lid, 22.28 * open)
-        let width = 9.24 + 3.76 * (1 - open)
+        let height = max(lid, eyeSize.height * open)
+        let width = eyeSize.width + 3.76 * (1 - open)
         let corner = min(width, height) / 2
         var path = Path()
-        for middle in [51.5, 76.5] {
+        for middle in eyeMiddles {
             path.addRoundedRect(
-                in: CGRect(x: middle + gaze - width / 2, y: 65 - height / 2, width: width, height: height),
+                in: CGRect(x: middle.x + gaze - width / 2, y: middle.y - height / 2, width: width, height: height),
                 cornerSize: CGSize(width: corner, height: corner)
             )
         }
@@ -45,15 +55,18 @@ enum PlugMark {
         lean: CGFloat = lean,
         yUp: Bool = false
     ) -> CGAffineTransform {
-        CGAffineTransform(translationX: centre.x - 2.04 * scale, y: centre.y + (yUp ? 0.48 : -0.48) * scale)
-            .scaledBy(x: scale, y: yUp ? -scale : scale)
-            .rotated(by: lean * .pi / 180)
-            .translatedBy(x: -60, y: -55.5)
+        CGAffineTransform(
+            translationX: centre.x - offCentre.dx * scale,
+            y: centre.y + (yUp ? offCentre.dy : -offCentre.dy) * scale
+        )
+        .scaledBy(x: scale, y: yUp ? -scale : scale)
+        .rotated(by: lean * .pi / 180)
+        .translatedBy(x: -middle.x, y: -middle.y)
     }
 }
 
 /// Plug's mark, with a face for each thing Plug can be: awake, working,
-/// worried, asleep and the rest of `Mood`. Going from one face to the next it
+/// worried, asleep and the rest of `PlugMood`. Going from one face to the next it
 /// changes shape on springs; nothing is swapped. The prongs move like ears,
 /// and the two prongs and the body can pull apart into three dots, an
 /// exclamation mark, or one dot. A small mark beside it, a dot, a "?" or a
@@ -65,69 +78,7 @@ enum PlugMark {
 /// mark beside it takes that colour and the "z"s go grey, so the character
 /// itself can stay Plug blue while the mark says how bad things are.
 struct PlugCharacter: View {
-    enum Mood: Equatable, Sendable, CaseIterable {
-        /// Everything is working.
-        case awake
-        /// Something just came right.
-        case happy
-        /// A first: a server, a client, a tool call, a step done.
-        case cheering
-        /// It was clicked.
-        case wink
-        /// Waiting for a first something, on a page with nothing on it yet.
-        case curious
-        case surprised
-        /// Starting or busy.
-        case working
-        /// Something is taking a while.
-        case thinking
-        /// A page is loading: the three parts are three dots.
-        case loading
-        /// Sign in, or allow something.
-        case needsYou
-        /// Some of it works and some does not.
-        case unsure
-        /// Several things are wrong at once: its eyes are swirls.
-        case dizzy
-        /// Something stopped.
-        case worried
-        /// Plug cannot go on: the three parts are an exclamation mark.
-        case alert
-        /// Plug itself is stopped: its eyes are crosses.
-        case out
-        /// Plug is off.
-        case asleep
-        /// Out of the way: the three parts are one dot.
-        case tucked
-
-        /// The face for a tone when nothing says more.
-        init(_ tone: Verdict.Tone) {
-            switch tone {
-            case .good: self = .awake
-            case .quiet: self = .asleep
-            case .busy: self = .working
-            case .attention: self = .needsYou
-            case .blocked: self = .alert
-            }
-        }
-
-        /// Coming out of one of these into all-is-well is a relief.
-        fileprivate var isTrouble: Bool {
-            switch self {
-            case .working, .thinking, .needsYou, .unsure, .dizzy, .worried, .alert, .out: true
-            default: false
-            }
-        }
-
-        fileprivate var blinks: Bool {
-            switch self {
-            case .awake, .happy, .curious, .thinking, .needsYou: true
-            default: false
-            }
-        }
-    }
-
-    let mood: Mood
+    let mood: PlugMood
     /// Each time this goes up, the character cheers: it hops and sparks fly
     /// off its prongs, as when a step is done.
     var cheers = 0
@@ -156,7 +107,7 @@ struct PlugCharacter: View {
         var nudges: Int
     }
 
-    init(mood: Mood, cheers: Int = 0, mark: Color? = nil) {
+    init(mood: PlugMood, cheers: Int = 0, mark: Color? = nil) {
         self.mood = mood
         self.cheers = cheers
         self.mark = mark
@@ -293,7 +244,11 @@ private struct PlugStageHost: NSViewRepresentable {
 }
 
 private final class PlugStageView: NSHostingView<PlugHostedStage> {
-    var onSeen: ((Bool) -> Void)?
+    private lazy var watch = WindowSightWatch(view: self)
+    var onSeen: ((Bool) -> Void)? {
+        get { watch.onSeen }
+        set { watch.onSeen = newValue }
+    }
 
     // Clicks pass through to the character, which takes them.
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
@@ -301,27 +256,12 @@ private final class PlugStageView: NSHostingView<PlugHostedStage> {
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         super.viewWillMove(toWindow: newWindow)
-        let centre = NotificationCenter.default
-        centre.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
-        if let newWindow {
-            centre.addObserver(
-                self, selector: #selector(look), name: NSWindow.didChangeOcclusionStateNotification, object: newWindow
-            )
-        }
+        watch.watch(newWindow)
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        look()
-    }
-
-    /// Closed, covered, minimized or on another desktop, the window is not
-    /// on screen. Said a moment later, never in the middle of an update.
-    @objc private func look() {
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.onSeen?(self.window?.occlusionState.contains(.visible) ?? false)
-        }
+        watch.look()
     }
 }
 
@@ -358,11 +298,16 @@ struct PlugPose: Equatable, Sendable {
     /// The mark as `docs/assets/plug-icon.svg` draws it.
     static let rest = still.with([
         .lean: PlugMark.lean, .stretchX: 1, .stretchY: 1,
-        .leftProngX: 46, .leftProngY: 35.5, .leftProngWidth: 14, .leftProngHeight: 37, .leftProngShown: 1,
-        .rightProngX: 74, .rightProngY: 35.5, .rightProngWidth: 14, .rightProngHeight: 37, .rightProngShown: 1,
-        .bodyX: 60, .bodyY: 67, .bodyWidth: 72, .bodyHeight: 54, .bodyCorner: PlugMark.bodyCorner, .bodyShown: 1,
-        .eyeScale: 1, .pivot: 55.5,
-        .leftEyeWidth: 9.24, .leftEyeHeight: 22.28, .rightEyeWidth: 9.24, .rightEyeHeight: 22.28,
+        .leftProngX: PlugMark.prongs[0].midX, .leftProngY: PlugMark.prongs[0].midY,
+        .leftProngWidth: PlugMark.prongs[0].width, .leftProngHeight: PlugMark.prongs[0].height, .leftProngShown: 1,
+        .rightProngX: PlugMark.prongs[1].midX, .rightProngY: PlugMark.prongs[1].midY,
+        .rightProngWidth: PlugMark.prongs[1].width, .rightProngHeight: PlugMark.prongs[1].height, .rightProngShown: 1,
+        .bodyX: PlugMark.body.midX, .bodyY: PlugMark.body.midY,
+        .bodyWidth: PlugMark.body.width, .bodyHeight: PlugMark.body.height,
+        .bodyCorner: PlugMark.bodyCorner, .bodyShown: 1,
+        .eyeScale: 1, .pivot: PlugMark.middle.y,
+        .leftEyeWidth: PlugMark.eyeSize.width, .leftEyeHeight: PlugMark.eyeSize.height,
+        .rightEyeWidth: PlugMark.eyeSize.width, .rightEyeHeight: PlugMark.eyeSize.height,
     ])
 
     func with(_ changes: [Part: CGFloat]) -> PlugPose {
@@ -403,7 +348,7 @@ struct PlugPose: Equatable, Sendable {
 
     /// The face for `mood`, `time` seconds after it began. `moving` is false
     /// for the one pose a face holds when nothing may move.
-    static func pose(for mood: PlugCharacter.Mood, at time: TimeInterval, moving: Bool) -> PlugPose {
+    static func pose(for mood: PlugMood, at time: TimeInterval, moving: Bool) -> PlugPose {
         let t = moving ? CGFloat(time) : 0
         /// True for `lasts` seconds out of every `every`.
         func pulse(_ shift: CGFloat, every: CGFloat, lasts: CGFloat) -> Bool {
@@ -483,7 +428,7 @@ struct PlugPose: Equatable, Sendable {
     /// When the face for `mood` next changes by itself, in seconds after it
     /// began, looking from `time`. Never, for a face that holds still. Keep
     /// it in step with `pose` above.
-    static func nextChange(for mood: PlugCharacter.Mood, after time: TimeInterval) -> TimeInterval {
+    static func nextChange(for mood: PlugMood, after time: TimeInterval) -> TimeInterval {
         /// The next start or end of a pulse.
         func edge(_ shift: TimeInterval, every: TimeInterval, lasts: TimeInterval) -> TimeInterval {
             let phase = (time + shift).truncatingRemainder(dividingBy: every)
@@ -518,10 +463,10 @@ final class PlugPuppet {
     /// How far ahead `isResting` looks for the next movement, in seconds.
     static let lookAhead: TimeInterval = 0.25
 
-    private var mood: PlugCharacter.Mood
+    private var mood: PlugMood
     private var since: TimeInterval
     /// A face put on for a moment, over the one for the state.
-    private var act: (mood: PlugCharacter.Mood, since: TimeInterval, until: TimeInterval)?
+    private var act: (mood: PlugMood, since: TimeInterval, until: TimeInterval)?
     private var pose: PlugPose
     private var speed = PlugPose.still
     private var last: TimeInterval?
@@ -530,7 +475,7 @@ final class PlugPuppet {
     private var nextBlink: TimeInterval
     private var tappedAt = -TimeInterval.infinity
 
-    init(_ mood: PlugCharacter.Mood) {
+    init(_ mood: PlugMood) {
         let now = Self.now
         self.mood = mood
         since = now
@@ -542,13 +487,13 @@ final class PlugPuppet {
     private static let sparkTime: TimeInterval = 0.6
     private static let blinkTime: TimeInterval = 0.22
 
-    private var showing: PlugCharacter.Mood { act?.mood ?? mood }
+    private var showing: PlugMood { act?.mood ?? mood }
 
     private func goal(at time: TimeInterval, moving: Bool = true) -> PlugPose {
         PlugPose.pose(for: showing, at: time - (act?.since ?? since), moving: moving)
     }
 
-    func show(_ new: PlugCharacter.Mood, moving: Bool) {
+    func show(_ new: PlugMood, moving: Bool) {
         guard new != mood else { return }
         let relieved = new == .awake && mood.isTrouble
         mood = new
@@ -567,7 +512,7 @@ final class PlugPuppet {
     /// A click is a wink. Keep clicking and it goes through every face.
     func tap() {
         let now = Self.now
-        let faces = PlugCharacter.Mood.allCases
+        let faces = PlugMood.allCases
         if now - tappedAt < 3, let act, let index = faces.firstIndex(of: act.mood) {
             perform(faces[(index + 1) % faces.count], for: 3)
         } else {
@@ -576,14 +521,14 @@ final class PlugPuppet {
         tappedAt = now
     }
 
-    private func perform(_ mood: PlugCharacter.Mood, for seconds: TimeInterval) {
+    private func perform(_ mood: PlugMood, for seconds: TimeInterval) {
         let now = Self.now
         act = (mood, now, now + seconds)
         enter(mood)
     }
 
     /// How a face arrives, beyond changing shape.
-    private func enter(_ mood: PlugCharacter.Mood) {
+    private func enter(_ mood: PlugMood) {
         switch mood {
         case .cheering:
             hop(1.3)
@@ -687,19 +632,20 @@ enum PlugDrawing {
         // The same fit as the still mark, with a little room around it.
         let scale = side / (PlugMark.height + 8)
         var grid = context
-        grid.translateBy(x: size.width / 2 - 2.04 * scale, y: size.height / 2 - 0.48 * scale)
-        grid.scaleBy(x: scale, y: scale)
-        grid.translateBy(x: -60, y: -55.5)
+        grid.concatenate(
+            PlugMark.placement(centre: CGPoint(x: size.width / 2, y: size.height / 2), scale: scale, lean: 0)
+        )
 
         var whole = grid
         whole.translateBy(x: 0, y: pose[.lift] * 120)
         // It stretches and squashes from its feet.
-        whole.translateBy(x: 60, y: 94)
+        let middle = PlugMark.middle.x, feet = PlugMark.body.maxY
+        whole.translateBy(x: middle, y: feet)
         whole.scaleBy(x: pose[.stretchX], y: pose[.stretchY])
-        whole.translateBy(x: -60, y: -94)
-        whole.translateBy(x: 60, y: pose[.pivot])
+        whole.translateBy(x: -middle, y: -feet)
+        whole.translateBy(x: middle, y: pose[.pivot])
         whole.rotate(by: .degrees(pose[.lean]))
-        whole.translateBy(x: -60, y: -pose[.pivot])
+        whole.translateBy(x: -middle, y: -pose[.pivot])
 
         let badge = CGPoint(x: 98, y: 38)
         let badgeSize = max(0, 10 * pose[.badge])
@@ -783,16 +729,18 @@ enum PlugDrawing {
     /// Crossed, each eye is itself twice, turned one way and the other.
     private static func eyes(of pose: PlugPose, blink: CGFloat, time: TimeInterval) -> [Path] {
         // They shrink with the body, so they are gone before it is a dot.
-        let scale = max(0, pose[.eyeScale]) * min(1, pose[.bodyWidth] / 72)
+        let scale = max(0, pose[.eyeScale]) * min(1, pose[.bodyWidth] / PlugMark.body.width)
         var paths: [Path] = []
         guard scale > 0.02 else { return paths }
         let cross = pose[.cross] * .pi / 4
         let drawn = min(1, pose[.swirl])
         let spin = time.truncatingRemainder(dividingBy: 2.4) * 150
+        let body = PlugMark.body, eyes = PlugMark.eyeMiddles
         let sides: [(CGFloat, PlugPose.Part, PlugPose.Part, PlugPose.Part, PlugPose.Part, PlugPose.Part)] = [
-            (-8.5, .leftEyeWidth, .leftEyeHeight, .leftLid, .leftLidTurn, .leftCheek),
-            (16.5, .rightEyeWidth, .rightEyeHeight, .rightLid, .rightLidTurn, .rightCheek),
+            (eyes[0].x - body.midX, .leftEyeWidth, .leftEyeHeight, .leftLid, .leftLidTurn, .leftCheek),
+            (eyes[1].x - body.midX, .rightEyeWidth, .rightEyeHeight, .rightLid, .rightLidTurn, .rightCheek),
         ]
+        let raised = body.midY - eyes[0].y
         for (offset, width, height, lid, lidTurn, cheek) in sides {
             let width = max(0, pose[width] * scale)
             let height = max(4 * scale, pose[height] * scale * (1 - 0.85 * blink))
@@ -817,7 +765,7 @@ enum PlugDrawing {
             }
             let place = CGAffineTransform(
                 translationX: pose[.bodyX] + (offset + pose[.gazeX]) * scale,
-                y: pose[.bodyY] - 2 + pose[.gazeY] * scale
+                y: pose[.bodyY] - raised + pose[.gazeY] * scale
             )
             if abs(cross) > 0.01 {
                 paths.append(eye.applying(place.rotated(by: cross)))
@@ -858,7 +806,9 @@ enum PlugDrawing {
         let size = PlugMark.height + 8
         let near = size * (0.5 + 0.28 * eased)
         let far = near + size * 0.16 * sin(eased * .pi)
-        let centre = CGPoint(x: 62.04, y: 55.98)
+        let centre = CGPoint(
+            x: PlugMark.middle.x + PlugMark.offCentre.dx, y: PlugMark.middle.y + PlugMark.offCentre.dy
+        )
         var path = Path()
         // Fanned around the way the prongs point.
         for degrees in [-60.0, -30, 0, 30, 60] {
@@ -883,13 +833,30 @@ enum PlugDrawing {
 /// the words.
 struct PlugCharacterLabel: View {
     let title: String
-    let mood: PlugCharacter.Mood
+    let mood: PlugMood
 
     var body: some View {
         Label {
             Text(title)
         } icon: {
             PlugCharacter(mood: mood).frame(width: 52, height: 52)
+        }
+    }
+}
+
+extension PlugMood {
+    /// Coming out of one of these into all-is-well is a relief.
+    fileprivate var isTrouble: Bool {
+        switch self {
+        case .working, .thinking, .needsYou, .unsure, .dizzy, .worried, .alert, .out: true
+        default: false
+        }
+    }
+
+    fileprivate var blinks: Bool {
+        switch self {
+        case .awake, .happy, .curious, .thinking, .needsYou: true
+        default: false
         }
     }
 }

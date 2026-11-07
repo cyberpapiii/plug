@@ -155,11 +155,11 @@ fn is_non_forwarded_meta_key(key: &str) -> bool {
             | "traceparent"
             | "tracestate"
             | "baggage"
-            | "io.modelcontextprotocol/protocolVersion"
+            | crate::protocol::PROTOCOL_VERSION_META_KEY
             | "io.modelcontextprotocol/clientInfo"
             | "io.modelcontextprotocol/clientCapabilities"
             | "io.modelcontextprotocol/logLevel"
-            | "plug.dev/legacy-task"
+            | crate::protocol::LEGACY_TASK_REQUEST_KEY
     )
 }
 
@@ -337,14 +337,19 @@ pub(crate) fn valid_traceparent(value: &str) -> bool {
     let parts = value.split('-').collect::<Vec<_>>();
     parts.len() == 4
         && parts[0] == "00"
-        && parts[1].len() == 32
-        && parts[1].bytes().all(|byte| byte.is_ascii_hexdigit())
-        && parts[1].bytes().any(|byte| byte != b'0')
+        && valid_trace_id(parts[1])
         && parts[2].len() == 16
         && parts[2].bytes().all(|byte| byte.is_ascii_hexdigit())
         && parts[2].bytes().any(|byte| byte != b'0')
         && parts[3].len() == 2
         && parts[3].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// A W3C trace id: 32 hex digits, not all zero.
+pub(crate) fn valid_trace_id(value: &str) -> bool {
+    value.len() == 32
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value.bytes().any(|byte| byte != b'0')
 }
 
 fn validate_value(
@@ -413,7 +418,8 @@ pub enum PrincipalId {
         config_id: String,
         generation: u64,
     },
-    StdioProcess {
+    /// A caller that proved nothing, counted only for quotas.
+    Anonymous {
         instance_id: Uuid,
     },
     DaemonIpc {
@@ -441,20 +447,12 @@ impl PrincipalId {
         }
     }
 
-    pub fn stdio_process(instance_id: Uuid) -> Self {
-        Self::StdioProcess { instance_id }
+    pub fn anonymous(instance_id: Uuid) -> Self {
+        Self::Anonymous { instance_id }
     }
 
     pub fn daemon_ipc(registry_id: Uuid) -> Self {
         Self::DaemonIpc { registry_id }
-    }
-
-    pub fn daemon_ipc_registry(registry_client_id: &str) -> Self {
-        use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(format!("plug:ipc-registry:{registry_client_id}"));
-        let mut bytes = [0_u8; 16];
-        bytes.copy_from_slice(&digest[..16]);
-        Self::daemon_ipc(Uuid::from_bytes(bytes))
     }
 
     /// Stable opaque key suitable for ownership indexes and logs. The
@@ -521,7 +519,7 @@ mod tests {
     #[test]
     fn principal_tags_prevent_cross_domain_collisions() {
         let id = Uuid::from_u128(7);
-        assert_ne!(PrincipalId::stdio_process(id), PrincipalId::daemon_ipc(id));
+        assert_ne!(PrincipalId::anonymous(id), PrincipalId::daemon_ipc(id));
     }
 
     #[test]
@@ -831,6 +829,31 @@ mod tests {
     }
 
     #[test]
+    fn three_failed_checks_degrade_six_fail_and_successes_climb_back() {
+        use super::{HealthState, ServerHealth};
+        let mut state = HealthState::new();
+        let after: Vec<ServerHealth> = (0..6)
+            .map(|_| {
+                state.record_failure();
+                state.health
+            })
+            .collect();
+        use ServerHealth::{Degraded, Failed, Healthy};
+        assert_eq!(
+            after,
+            [Healthy, Healthy, Degraded, Degraded, Degraded, Failed]
+        );
+        assert_eq!(
+            state.consecutive_failures,
+            HealthState::failed().consecutive_failures
+        );
+        state.record_success();
+        assert_eq!(state.health, Degraded);
+        state.record_success();
+        assert_eq!(state.health, Healthy);
+    }
+
+    #[test]
     fn auth_required_is_sticky_on_success() {
         use super::{HealthState, ServerHealth};
         let mut state = HealthState {
@@ -934,7 +957,7 @@ pub enum ClientType {
     Devin,
     VSCodeCopilot,
     /// GitHub's terminal agent. It shares a config file with VS Code but
-    /// not VS Code's 128-tool ceiling.
+    /// not VS Code's tool ceiling in `clients::TOOL_LIMITS`.
     CopilotCli,
     GeminiCli,
     CodexCli,
@@ -946,38 +969,6 @@ pub enum ClientType {
     OpenCode,
     Zed,
     Unknown,
-}
-
-impl ClientType {
-    /// Stable config/export target slug for known clients.
-    pub fn target_slug(&self) -> Option<&'static str> {
-        match self {
-            ClientType::ClaudeCode => Some("claude-code"),
-            ClientType::ClaudeDesktop => Some("claude-desktop"),
-            ClientType::Cursor => Some("cursor"),
-            ClientType::Devin => Some("devin"),
-            ClientType::VSCodeCopilot => Some("vscode"),
-            ClientType::CopilotCli => Some("copilot-cli"),
-            ClientType::GeminiCli => Some("gemini-cli"),
-            ClientType::CodexCli => Some("codex-cli"),
-            ClientType::GrokBuild => Some("grok-build"),
-            ClientType::GrokBot | ClientType::Unknown => None,
-            ClientType::OpenCode => Some("opencode"),
-            ClientType::Zed => Some("zed"),
-        }
-    }
-
-    /// Returns the maximum number of tools this client supports, if known.
-    pub fn tool_limit(&self) -> Option<usize> {
-        match self {
-            // Cascade's ceiling. Devin Local publishes none, but it is not
-            // yet known to report a distinct `clientInfo.name`, so the cap
-            // applies to whatever calls itself Devin.
-            ClientType::Devin => Some(100),
-            ClientType::VSCodeCopilot => Some(128),
-            _ => None,
-        }
-    }
 }
 
 /// Operator-facing lazy discovery setting stored in config.
@@ -1064,27 +1055,6 @@ impl ResolvedLazyToolPolicy {
     }
 }
 
-impl std::fmt::Display for ClientType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            ClientType::ClaudeCode => "Claude Code",
-            ClientType::ClaudeDesktop => "Claude Desktop",
-            ClientType::Cursor => "Cursor",
-            ClientType::Devin => "Devin",
-            ClientType::VSCodeCopilot => "VS Code Copilot",
-            ClientType::CopilotCli => "GitHub Copilot CLI",
-            ClientType::GeminiCli => "Gemini CLI",
-            ClientType::CodexCli => "Codex CLI",
-            ClientType::GrokBuild => "Grok Build",
-            ClientType::GrokBot => "Grok Bot",
-            ClientType::OpenCode => "OpenCode",
-            ClientType::Zed => "Zed",
-            ClientType::Unknown => "Unknown",
-        };
-        write!(f, "{name}")
-    }
-}
-
 /// Health state of an upstream server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerHealth {
@@ -1136,11 +1106,12 @@ pub enum Availability {
 
 /// Tracked health state with consecutive failure counting for state machine transitions.
 ///
-/// State machine:
-/// - Healthy → 3 consecutive failures → Degraded
-/// - Degraded → 3 more failures → Failed
+/// State machine, counting failures since the last success:
+/// - Healthy → `DEGRADED_AFTER` failures → Degraded
+/// - Degraded → `FAILED_AFTER` failures → Failed
 /// - Failed → 1 success → Degraded
 /// - Degraded → 1 success → Healthy
+/// - AuthRequired stays until something else clears it
 #[derive(Debug, Clone)]
 pub struct HealthState {
     pub health: ServerHealth,
@@ -1148,9 +1119,28 @@ pub struct HealthState {
 }
 
 impl HealthState {
+    const DEGRADED_AFTER: u32 = 3;
+    const FAILED_AFTER: u32 = 6;
+
     pub fn new() -> Self {
         Self {
             health: ServerHealth::Healthy,
+            consecutive_failures: 0,
+        }
+    }
+
+    /// The state of a server that is down: what a run of failed checks
+    /// would have reached.
+    pub fn failed() -> Self {
+        Self {
+            health: ServerHealth::Failed,
+            consecutive_failures: Self::FAILED_AFTER,
+        }
+    }
+
+    pub fn auth_required() -> Self {
+        Self {
+            health: ServerHealth::AuthRequired,
             consecutive_failures: 0,
         }
     }
@@ -1163,7 +1153,7 @@ impl HealthState {
             ServerHealth::Healthy => ServerHealth::Healthy,
             ServerHealth::Degraded => ServerHealth::Healthy,
             ServerHealth::Failed => ServerHealth::Degraded,
-            ServerHealth::AuthRequired => ServerHealth::AuthRequired, // sticky
+            ServerHealth::AuthRequired => ServerHealth::AuthRequired,
         };
         old != self.health
     }
@@ -1174,21 +1164,21 @@ impl HealthState {
         let old = self.health;
         self.health = match old {
             ServerHealth::Healthy => {
-                if self.consecutive_failures >= 3 {
+                if self.consecutive_failures >= Self::DEGRADED_AFTER {
                     ServerHealth::Degraded
                 } else {
                     ServerHealth::Healthy
                 }
             }
             ServerHealth::Degraded => {
-                if self.consecutive_failures >= 6 {
+                if self.consecutive_failures >= Self::FAILED_AFTER {
                     ServerHealth::Failed
                 } else {
                     ServerHealth::Degraded
                 }
             }
             ServerHealth::Failed => ServerHealth::Failed,
-            ServerHealth::AuthRequired => ServerHealth::AuthRequired, // sticky
+            ServerHealth::AuthRequired => ServerHealth::AuthRequired,
         };
         old != self.health
     }
@@ -1218,7 +1208,7 @@ pub struct UpstreamMetricsSnapshot {
     /// Circuit-breaker state: `"closed"`, `"open"`, or `"half-open"`.
     pub circuit_state: String,
     /// How many times this upstream has been restarted since start by recovery
-    /// or supervision (item 2b). Always present; `0` for a never-restarted
+    /// or supervision. Always present; `0` for a never-restarted
     /// upstream.
     #[serde(default)]
     pub restart_count: u64,

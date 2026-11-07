@@ -1,0 +1,585 @@
+use super::server::HttpState;
+use crate::notifications::{ListsChanged, NotificationTarget, ProtocolNotification};
+use crate::session::SseMessage;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+impl HttpState {
+    pub fn spawn_notification_fanout(self: &Arc<Self>) {
+        if self
+            .notification_task_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let state = Arc::clone(self);
+        let mut rx = state.router.subscribe_notifications();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = state.cancel.cancelled() => break,
+                    recv = rx.recv() => {
+                        match recv {
+                            Ok(notification) => {
+                                // One task serves every HTTP session, so a targeted
+                                // notification is routed by the session it names.
+                                match notification.target() {
+                                    Some(NotificationTarget::Http { session_id }) => {
+                                        if let Some(message) =
+                                            notification_to_sse_message(&notification)
+                                        {
+                                            state.sessions.send_to_live_session(session_id, message);
+                                        }
+                                    }
+                                    Some(_) => {}
+                                    None => broadcast(&state, &notification),
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "HTTP notification fan-out lagged");
+                                if let Some(message) = notification_to_sse_message(&
+                                    ProtocolNotification::LoggingMessage {
+                                        params: ProtocolNotification::control_lagged_logging_params(
+                                            skipped,
+                                            "http",
+                                        ),
+                                    },
+                                ) {
+                                    state.sessions.broadcast(
+                                        message,
+                                        crate::session::BroadcastKind::Logging,
+                                    );
+                                }
+                                // What was skipped may have said a list changed.
+                                for notification in ListsChanged::ALL.notifications() {
+                                    broadcast(&state, &notification);
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+        });
+
+        // Log lines have their own channel, so a burst of them cannot crowd
+        // out list changes.
+        let log_state = Arc::clone(self);
+        let mut log_rx = log_state.router.subscribe_logging();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = log_state.cancel.cancelled() => break,
+                    recv = log_rx.recv() => {
+                        match recv {
+                            Ok(notif @ ProtocolNotification::LoggingMessage { .. }) => {
+                                if let Some(message) = notification_to_sse_message(&notif) {
+                                    // A log line does not say which server
+                                    // wrote it, so a client kept from any
+                                    // server gets none. Asked per line: a
+                                    // block added to an open stream applies
+                                    // to the next one.
+                                    let router = &log_state.router;
+                                    log_state.sessions.broadcast_where(
+                                        message,
+                                        crate::session::BroadcastKind::Logging,
+                                        &|grant| may_be_told(router, grant, &notif),
+                                    );
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "HTTP logging fan-out lagged");
+                                let synthetic = ProtocolNotification::LoggingMessage {
+                                    params: ProtocolNotification::lagged_logging_params(skipped),
+                                };
+                                if let Some(message) = notification_to_sse_message(&synthetic) {
+                                    log_state.sessions.broadcast(
+                                        message,
+                                        crate::session::BroadcastKind::Logging,
+                                    );
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Send `notification`, which names no session, to every session that may
+/// hear it.
+fn broadcast(state: &HttpState, notification: &ProtocolNotification) {
+    if let Some(kind) = crate::session::BroadcastKind::of(notification)
+        && let Some(message) = notification_to_sse_message(notification)
+    {
+        let router = &state.router;
+        state.sessions.broadcast_where(message, kind, &|grant| {
+            may_be_told(router, grant, notification)
+        });
+    }
+}
+
+pub(super) fn notification_to_sse_message(
+    notification: &ProtocolNotification,
+) -> Option<SseMessage> {
+    SseMessage::from_json_value(notification.to_json_value())
+        .map_err(|error| {
+            tracing::error!(%error, "failed to serialize SSE notification payload");
+        })
+        .ok()
+}
+
+/// Whether a session opened under `grant` may be sent `notification`. See
+/// [`crate::proxy::ToolRouter::client_may_be_told`].
+pub(super) fn may_be_told(
+    router: &crate::proxy::ToolRouter,
+    grant: Option<&str>,
+    notification: &ProtocolNotification,
+) -> bool {
+    let key = crate::downstream_identity::remote_access_key(grant);
+    router.client_may_be_told(Some(&key), notification)
+}
+
+pub(super) fn drain_targeted_notifications(
+    receiver: &mut tokio::sync::broadcast::Receiver<ProtocolNotification>,
+    target: &NotificationTarget,
+) -> Vec<ProtocolNotification> {
+    let mut notifications = Vec::new();
+    loop {
+        match receiver.try_recv() {
+            Ok(notification) => {
+                if notification.target() == Some(target) {
+                    notifications.push(notification);
+                }
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+        }
+    }
+    notifications
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::test_support::*;
+
+    use crate::test_helpers::collect_sse_events;
+    use axum::body::Body;
+    use http::Request as HttpRequest;
+
+    use tower::ServiceExt;
+
+    fn sse_event_id(event: &str) -> Option<u64> {
+        event.lines().find_map(|line| {
+            line.strip_prefix("id: ")
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        })
+    }
+
+    #[tokio::test]
+    async fn word_about_a_server_goes_only_to_clients_allowed_that_server() {
+        let state = test_state();
+        let mut clients = std::collections::BTreeMap::new();
+        clients.insert(
+            crate::downstream_identity::grant_client_key("watcher"),
+            crate::config::ClientSettings {
+                blocked_servers: vec!["git".to_string()],
+                ..Default::default()
+            },
+        );
+        state.router.set_client_access(&clients);
+        let told = |grant, notification| may_be_told(&state.router, Some(grant), &notification);
+        let sign_in = |server: &str| ProtocolNotification::AuthStateChanged {
+            server_id: server.into(),
+            new_state: crate::types::ServerHealth::AuthRequired,
+        };
+        let refreshed = |server: &str| ProtocolNotification::TokenRefreshExchanged {
+            server_id: server.into(),
+        };
+        let log = || ProtocolNotification::LoggingMessage {
+            params: rmcp::model::LoggingMessageNotificationParam::new(
+                rmcp::model::LoggingLevel::Info,
+                serde_json::json!("line"),
+            ),
+        };
+        assert!(!told("watcher", sign_in("git")));
+        assert!(!told("watcher", refreshed("git")));
+        assert!(told("watcher", sign_in("mail")));
+        assert!(!told("watcher", log()), "a log line names no server");
+        assert!(told("watcher", ProtocolNotification::ToolListChanged));
+        for notification in [sign_in("git"), refreshed("git"), log()] {
+            assert!(told("someone-else", notification));
+        }
+        // The block is lifted while streams are open: the next one arrives.
+        state.router.set_client_access(&Default::default());
+        assert!(told("watcher", sign_in("git")));
+    }
+
+    #[tokio::test]
+    async fn tools_list_changed_reaches_http_sse_client() {
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0"
+                }
+            }
+        });
+
+        let init_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&init_body).unwrap()))
+            .unwrap();
+
+        let init_resp = app.clone().oneshot(init_req).await.unwrap();
+        let session_id = init_resp
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("session id header")
+            .to_string();
+
+        let sse_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, session_id)
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+
+        let sse_resp = app.oneshot(sse_req).await.unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        let body = sse_resp.into_body();
+
+        state.router.publish_protocol_notification(
+            crate::notifications::ProtocolNotification::ToolListChanged,
+        );
+
+        let events = collect_sse_events(body, 3).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("notifications/tools/list_changed")),
+            "expected SSE stream to contain tools/list_changed notification, got {events:?}"
+        );
+    }
+
+    /// Notifications the fan-out fell too far behind to read may have said a
+    /// list changed, so every session is told all three may have.
+    #[tokio::test]
+    async fn a_lagged_fan_out_tells_sessions_every_list_may_have_changed() {
+        let state = test_state();
+        let app = build_router(state.clone());
+        let session_id = state.sessions.create_session().unwrap();
+        bind_for_tests(&state.sessions, &session_id, None);
+        let sse_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, &session_id)
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+        let sse_resp = app.oneshot(sse_req).await.unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+
+        // Word for another session, more than the channel holds, published
+        // before the fan-out task runs.
+        for step in 0..200 {
+            state
+                .router
+                .publish_protocol_notification(ProtocolNotification::Progress {
+                    target: NotificationTarget::Http {
+                        session_id: Arc::from("another-session"),
+                    },
+                    params: ProgressNotificationParam::new(
+                        ProgressToken(NumberOrString::Number(step)),
+                        0.5,
+                    ),
+                });
+        }
+
+        let events = collect_sse_events(sse_resp.into_body(), 5).await;
+        for method in [
+            "notifications/tools/list_changed",
+            "notifications/resources/list_changed",
+            "notifications/prompts/list_changed",
+        ] {
+            assert!(
+                events.iter().any(|event| event.contains(method)),
+                "{method} missing from {events:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn last_event_id_replays_missed_http_sse_notifications() {
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        let session_id = state.sessions.create_session().unwrap();
+        // This test drives the SSE stream without going through initialize, so
+        // it has to record the audience initialize would have resolved for an
+        // unauthenticated loopback listener.
+        bind_for_tests(&state.sessions, &session_id, None);
+        let sse_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, &session_id)
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+        let sse_resp = app.clone().oneshot(sse_req).await.unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        let body = sse_resp.into_body();
+
+        state.router.publish_protocol_notification(
+            crate::notifications::ProtocolNotification::ToolListChanged,
+        );
+        state.router.publish_protocol_notification(
+            crate::notifications::ProtocolNotification::ResourceListChanged,
+        );
+
+        let events = collect_sse_events(body, 3).await;
+        let tool_event = events
+            .iter()
+            .find(|event| event.contains("notifications/tools/list_changed"))
+            .expect("tool list changed event");
+        let last_seen_id = sse_event_id(tool_event).expect("event id");
+
+        let replay_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, &session_id)
+            .header("accept", "text/event-stream")
+            .header("last-event-id", last_seen_id.to_string())
+            .body(Body::empty())
+            .unwrap();
+        let replay_resp = app.oneshot(replay_req).await.unwrap();
+        assert_eq!(replay_resp.status(), StatusCode::OK);
+
+        let replayed = collect_sse_events(replay_resp.into_body(), 2).await;
+        assert!(
+            replayed
+                .iter()
+                .any(|event| event.contains("notifications/resources/list_changed")),
+            "expected replayed resource list_changed after id {last_seen_id}, got {replayed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_progress_reaches_http_sse_session() {
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0"
+                }
+            }
+        });
+
+        let init_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&init_body).unwrap()))
+            .unwrap();
+
+        let init_resp = app.clone().oneshot(init_req).await.unwrap();
+        let session_id = init_resp
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("session id header")
+            .to_string();
+
+        let sse_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, &session_id)
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+
+        let sse_resp = app.oneshot(sse_req).await.unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        let body = sse_resp.into_body();
+
+        state.router.publish_protocol_notification(
+            crate::notifications::ProtocolNotification::Progress {
+                target: crate::notifications::NotificationTarget::Http {
+                    session_id: Arc::from(session_id),
+                },
+                params: ProgressNotificationParam::new(
+                    ProgressToken(NumberOrString::String(Arc::from("http-progress"))),
+                    0.5,
+                )
+                .with_message("halfway"),
+            },
+        );
+
+        let events = collect_sse_events(body, 3).await;
+        assert!(
+            events.iter().any(|event| {
+                event.contains("notifications/progress")
+                    && event.contains("http-progress")
+                    && event.contains("halfway")
+            }),
+            "expected SSE stream to contain targeted progress notification, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_state_changed_reaches_http_sse_as_logging_message() {
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0"
+                }
+            }
+        });
+
+        let init_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&init_body).unwrap()))
+            .unwrap();
+
+        let init_resp = app.clone().oneshot(init_req).await.unwrap();
+        let session_id = init_resp
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("session id header")
+            .to_string();
+
+        let sse_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, &session_id)
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+
+        let sse_resp = app.oneshot(sse_req).await.unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        let body = sse_resp.into_body();
+
+        state.router.publish_protocol_notification(
+            crate::notifications::ProtocolNotification::AuthStateChanged {
+                server_id: Arc::from("github"),
+                new_state: crate::types::ServerHealth::AuthRequired,
+            },
+        );
+
+        let events = collect_sse_events(body, 3).await;
+        assert!(
+            events.iter().any(|event| {
+                event.contains("notifications/message")
+                    && event.contains("auth_state_changed")
+                    && event.contains("github")
+                    && event.contains("AuthRequired")
+            }),
+            "expected SSE stream to contain auth state logging notification, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_refresh_exchanged_reaches_http_sse_as_logging_message() {
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0"
+                }
+            }
+        });
+
+        let init_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&init_body).unwrap()))
+            .unwrap();
+
+        let init_resp = app.clone().oneshot(init_req).await.unwrap();
+        let session_id = init_resp
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("session id header")
+            .to_string();
+
+        let sse_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header(SESSION_ID_HEADER, &session_id)
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+
+        let sse_resp = app.oneshot(sse_req).await.unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        let body = sse_resp.into_body();
+
+        state.router.publish_protocol_notification(
+            crate::notifications::ProtocolNotification::TokenRefreshExchanged {
+                server_id: Arc::from("github"),
+            },
+        );
+
+        let events = collect_sse_events(body, 3).await;
+        assert!(
+            events.iter().any(|event| {
+                event.contains("notifications/message")
+                    && event.contains("token_refresh_exchanged")
+                    && event.contains("github")
+            }),
+            "expected SSE stream to contain token refresh logging notification, got {events:?}"
+        );
+    }
+}

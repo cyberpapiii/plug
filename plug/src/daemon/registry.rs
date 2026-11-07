@@ -6,14 +6,10 @@ use dashmap::DashMap;
 use rmcp::model::ClientCapabilities;
 
 /// Tracks proxy client sessions connected to the daemon.
-///
-/// Uses a `watch` channel to broadcast client count changes for the grace
-/// period shutdown logic (avoids missed-wakeup races that `Notify` has).
 pub struct ClientRegistry {
     sessions: DashMap<String, ClientSession>,
-    pub(super) client_sessions: DashMap<String, String>,
-    /// Sends current client count on every change.
-    count_tx: tokio::sync::watch::Sender<usize>,
+    /// The one live session of each client id.
+    client_sessions: DashMap<String, String>,
 }
 
 /// Metadata for a connected proxy client.
@@ -21,11 +17,28 @@ struct ClientSession {
     client_id: String,
     client_info: Option<String>,
     adapter_version: Option<String>,
-    host: Option<plug_core::ipc::ClientHost>,
+    host: Option<plug_core::downstream_identity::ClientHost>,
     link_target: Option<String>,
     connected_at: Instant,
     capabilities: ClientCapabilities,
     cancellation_capability: String,
+}
+
+impl ClientSession {
+    fn client_type(&self) -> plug_core::types::ClientType {
+        self.client_info
+            .as_deref()
+            .map(plug_core::client_detect::detect_client)
+            .unwrap_or(plug_core::types::ClientType::Unknown)
+    }
+
+    fn client_key(&self) -> Option<String> {
+        plug_core::downstream_identity::local_client_key(
+            self.link_target.as_deref(),
+            self.client_type(),
+            self.host.as_ref(),
+        )
+    }
 }
 
 pub(super) struct RegistrationResult {
@@ -35,16 +48,11 @@ pub(super) struct RegistrationResult {
 }
 
 impl ClientRegistry {
-    pub(super) fn new() -> (Self, tokio::sync::watch::Receiver<usize>) {
-        let (count_tx, count_rx) = tokio::sync::watch::channel(0usize);
-        (
-            Self {
-                sessions: DashMap::new(),
-                client_sessions: DashMap::new(),
-                count_tx,
-            },
-            count_rx,
-        )
+    pub(super) fn new() -> Self {
+        Self {
+            sessions: DashMap::new(),
+            client_sessions: DashMap::new(),
+        }
     }
 
     /// Register a live local client, returning the assigned session ID.
@@ -59,7 +67,7 @@ impl ClientRegistry {
         client_id: String,
         client_info: Option<String>,
         adapter_version: Option<String>,
-        host: Option<plug_core::ipc::ClientHost>,
+        host: Option<plug_core::downstream_identity::ClientHost>,
     ) -> RegistrationResult {
         let session_id = uuid::Uuid::new_v4().to_string();
         let cancellation_capability = format!(
@@ -93,7 +101,6 @@ impl ClientRegistry {
                 cancellation_capability: cancellation_capability.clone(),
             },
         );
-        self.count_tx.send_modify(|c| *c = self.sessions.len());
         RegistrationResult {
             session_id,
             replaced_session_id,
@@ -111,32 +118,33 @@ impl ClientRegistry {
         self.register_hosted(client_id, client_info, adapter_version, None)
     }
 
-    /// Deregister a client session.
-    pub(super) fn deregister(&self, session_id: &str) {
-        if let Some((_, session)) = self.sessions.remove(session_id) {
-            if self
-                .client_sessions
-                .get(&session.client_id)
-                .is_some_and(|entry| entry.value() == session_id)
-            {
-                self.client_sessions.remove(&session.client_id);
-            }
-            let duration = session.connected_at.elapsed();
-            tracing::info!(
-                client_id = %session.client_id,
-                session_id = %session_id,
-                duration_secs = duration.as_secs(),
-                "client deregistered"
-            );
-            self.count_tx.send_modify(|c| *c = self.sessions.len());
-        }
+    /// Deregister a client session. Returns its client id when no session
+    /// holds that id any more.
+    pub(super) fn deregister(&self, session_id: &str) -> Option<String> {
+        let (_, session) = self.sessions.remove(session_id)?;
+        let duration = session.connected_at.elapsed();
+        tracing::info!(
+            client_id = %session.client_id,
+            session_id = %session_id,
+            duration_secs = duration.as_secs(),
+            "client deregistered"
+        );
+        self.client_sessions
+            .remove_if(&session.client_id, |_, live| live == session_id)
+            .map(|(client_id, _)| client_id)
+    }
+
+    /// Whether a session holds `client_id`.
+    pub(super) fn has_client(&self, client_id: &str) -> bool {
+        self.client_sessions.contains_key(client_id)
     }
 
     /// Record the target the connector says it was linked as. One that is
     /// neither a client `plug link` accepts nor one the owner named is
     /// dropped, so a key is never invented from free text.
     pub(super) fn set_link_target(&self, session_id: &str, link_target: Option<&str>) {
-        let Some(target) = link_target.and_then(plug_core::ipc::link_target_key) else {
+        let Some(target) = link_target.and_then(plug_core::downstream_identity::link_target_key)
+        else {
             return;
         };
         if let Some(mut entry) = self.sessions.get_mut(session_id) {
@@ -146,16 +154,7 @@ impl ClientRegistry {
 
     /// The key this session's settings are stored under.
     pub(super) fn client_key(&self, session_id: &str) -> Option<String> {
-        let entry = self.sessions.get(session_id)?;
-        plug_core::ipc::local_client_key(
-            entry.link_target.as_deref(),
-            entry
-                .client_info
-                .as_deref()
-                .map(plug_core::client_detect::detect_client)
-                .unwrap_or(plug_core::types::ClientType::Unknown),
-            entry.host.as_ref(),
-        )
+        self.sessions.get(session_id)?.client_key()
     }
 
     /// Update client_info for an existing session.
@@ -168,11 +167,12 @@ impl ClientRegistry {
         }
     }
 
-    /// Get the client_info string for a session (for client type detection).
-    pub(super) fn client_info(&self, session_id: &str) -> Option<String> {
+    /// Which client a session is, from what it declared; `Unknown` for a
+    /// session that is not registered.
+    pub(super) fn client_type(&self, session_id: &str) -> plug_core::types::ClientType {
         self.sessions
             .get(session_id)
-            .and_then(|s| s.client_info.clone())
+            .map_or(plug_core::types::ClientType::Unknown, |s| s.client_type())
     }
 
     /// Get the stable client_id for a session.
@@ -220,35 +220,30 @@ impl ClientRegistry {
         self.sessions.contains_key(session_id)
     }
 
-    /// Snapshot all live sessions in the newer transport-aware shape.
+    /// Every live session, in no particular order.
     pub(super) fn list_live_sessions(&self) -> Vec<plug_core::ipc::IpcLiveSessionInfo> {
-        let mut sessions = self
-            .sessions
+        self.sessions
             .iter()
             .map(|entry| plug_core::ipc::IpcLiveSessionInfo {
                 transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
                 client_id: Some(entry.client_id.clone()),
                 session_id: entry.key().clone(),
-                client_type: entry
-                    .client_info
-                    .as_deref()
-                    .map(plug_core::client_detect::detect_client)
-                    .unwrap_or(plug_core::types::ClientType::Unknown),
+                client_type: entry.client_type(),
                 client_info: entry.client_info.clone(),
                 adapter_version: entry.adapter_version.clone(),
                 host: entry.host.clone(),
                 grant: None,
                 link_target: entry.link_target.clone(),
+                client_key: entry.client_key(),
+                access_key: entry.client_key(),
+                target: plug_core::downstream_identity::client_target(
+                    entry.link_target.as_deref(),
+                    entry.client_type(),
+                ),
                 connected_secs: entry.connected_at.elapsed().as_secs(),
                 last_activity_secs: None,
             })
-            .collect::<Vec<_>>();
-        sessions.sort_by(|a, b| {
-            a.client_info
-                .cmp(&b.client_info)
-                .then(a.session_id.cmp(&b.session_id))
-        });
-        sessions
+            .collect()
     }
 }
 
@@ -258,7 +253,7 @@ mod tests {
 
     #[test]
     fn registration_does_not_reject_live_desktop_connections_at_an_arbitrary_count() {
-        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = ClientRegistry::new();
 
         for i in 0..256 {
             registry.register_hosted(
@@ -274,7 +269,7 @@ mod tests {
 
     #[test]
     fn register_replaces_existing_session_for_same_client_id() {
-        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = ClientRegistry::new();
 
         let first = registry.register_hosted(
             "client-123".to_string(),
@@ -305,7 +300,7 @@ mod tests {
 
     #[test]
     fn deregistering_replaced_session_does_not_remove_active_replacement() {
-        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = ClientRegistry::new();
 
         let first = registry.register_hosted(
             "client-123".to_string(),
@@ -328,8 +323,8 @@ mod tests {
 
     #[test]
     fn registration_keeps_the_host_program_in_live_inventory() {
-        let (registry, _count_rx) = ClientRegistry::new();
-        let host = plug_core::ipc::ClientHost {
+        let registry = ClientRegistry::new();
+        let host = plug_core::downstream_identity::ClientHost {
             name: "Hermes".to_string(),
             executable: "/Applications/Hermes.app/Contents/MacOS/Hermes".to_string(),
             app: Some("/Applications/Hermes.app".to_string()),
@@ -348,7 +343,7 @@ mod tests {
 
     #[test]
     fn registration_preserves_adapter_version_in_live_inventory() {
-        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = ClientRegistry::new();
 
         registry.register_hosted(
             "client-123".to_string(),
@@ -364,7 +359,7 @@ mod tests {
     }
     #[test]
     fn a_session_is_keyed_by_how_it_was_linked_before_what_it_reports() {
-        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = ClientRegistry::new();
         let session = registry
             .register(
                 "client".to_string(),

@@ -8,10 +8,8 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::legacy_tasks::{
-    CancelTaskResult, GetTaskPayloadResult, GetTaskResult, ListTasksResult, Task, TaskStatus,
-};
-use crate::protocol::QuotaLease;
+use crate::admission::QuotaLease;
+use crate::legacy_tasks::{GetTaskPayloadResult, GetTaskResult, Task, TaskStatus};
 
 pub const DEFAULT_TASK_TTL_MS: u64 = 60 * 60 * 1000;
 pub const DEFAULT_TASK_POLL_INTERVAL_MS: u64 = 1000;
@@ -22,8 +20,8 @@ pub(crate) const DEFAULT_STALE_IN_FLIGHT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 /// session is still live. Checked by `enqueue_tool_task` immediately after it
 /// registers its [`OwnerCreateGuard`], closing the race where a teardown
 /// completes *entirely* before the enqueue registers anything (so the
-/// tombstone never sees the create). `None` means the transport has no
-/// teardown path that could race task creation (stdio).
+/// tombstone never sees the create). `None` means the caller has no
+/// teardown that could race task creation.
 pub type OwnerLivenessProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -51,6 +49,14 @@ pub enum TaskUpstreamRef {
         server_id: String,
         task_id: String,
     },
+}
+
+impl TaskUpstreamRef {
+    pub fn server_id(&self) -> &str {
+        match self {
+            Self::Request { server_id, .. } | Self::Task { server_id, .. } => server_id,
+        }
+    }
 }
 
 /// The tool a task is running: the name it was called by, and the server
@@ -93,13 +99,9 @@ pub(crate) struct ExpiredTaskCleanup {
 
 type CancelledTaskParts = (Task, Option<TaskUpstreamRef>, Option<JoinHandle<()>>);
 
-/// Outcome of [`TaskStore::set_upstream_request`].
-///
-/// `Missing` and "recorded with no pending cancel" must be distinguishable:
-/// the old `Option<String>` return conflated them, so a record that vanished
-/// between the upstream send and this call (owner teardown draining the
-/// store) could never trigger an upstream cancellation from the dispatch
-/// path.
+/// Outcome of [`TaskStore::set_upstream_request`]. `Missing` means the
+/// record vanished between the upstream send and this call (owner teardown
+/// drained the store), so the caller must cancel the upstream request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpstreamRecordOutcome {
     /// No record exists for the task id: the owner was torn down (or the
@@ -275,35 +277,56 @@ impl TaskStore {
         self.lifecycle.lock_states().contains_key(owner)
     }
 
-    pub fn create(&mut self, owner: TaskOwner, name: &str) -> Result<Task, McpError> {
-        self.create_inner(owner, name, None)
-    }
-
-    pub fn create_with_quota(
-        &mut self,
-        owner: TaskOwner,
-        name: &str,
-        quota_lease: QuotaLease,
-    ) -> Result<Task, McpError> {
-        self.create_inner(owner, name, Some(quota_lease))
-    }
-
-    fn create_inner(
+    /// A task Plug runs itself, for `owner`'s call of the tool listed as
+    /// `name`.
+    pub fn create(
         &mut self,
         owner: TaskOwner,
         name: &str,
         quota_lease: Option<QuotaLease>,
     ) -> Result<Task, McpError> {
+        self.admit(owner, name, None, quota_lease, |task_id| {
+            let now = rmcp::task_manager::current_timestamp();
+            Task::new(task_id, TaskStatus::Working, now.clone(), now)
+                .with_status_message(format!("Running {name}"))
+                .with_ttl(DEFAULT_TASK_TTL_MS)
+                .with_poll_interval(DEFAULT_TASK_POLL_INTERVAL_MS)
+        })
+    }
+
+    /// A task that stands for `upstream_task`, which a server runs.
+    pub fn create_passthrough(
+        &mut self,
+        owner: TaskOwner,
+        name: &str,
+        upstream_task: &Task,
+        upstream: TaskUpstreamRef,
+        quota_lease: Option<QuotaLease>,
+    ) -> Result<Task, McpError> {
+        self.admit(owner, name, Some(upstream), quota_lease, |task_id| {
+            let mut task = upstream_task.clone();
+            task.task_id = task_id;
+            if task.status_message.is_none() {
+                task.status_message = Some(format!("Running {name}"));
+            }
+            task
+        })
+    }
+
+    /// Every way a task is created comes through here.
+    fn admit(
+        &mut self,
+        owner: TaskOwner,
+        name: &str,
+        upstream: Option<TaskUpstreamRef>,
+        quota_lease: Option<QuotaLease>,
+        task_named: impl FnOnce(String) -> Task,
+    ) -> Result<Task, McpError> {
         self.ensure_owner_accepts_creates(&owner)?;
         self.prune_expired();
         let task_id = format!("task_{}", self.next_task_id);
         self.next_task_id += 1;
-
-        let now = rmcp::task_manager::current_timestamp();
-        let task = Task::new(task_id.clone(), TaskStatus::Working, now.clone(), now)
-            .with_status_message(format!("Running {name}"))
-            .with_ttl(DEFAULT_TASK_TTL_MS)
-            .with_poll_interval(DEFAULT_TASK_POLL_INTERVAL_MS);
+        let task = task_named(task_id.clone());
 
         self.tasks.insert(
             task_id,
@@ -316,7 +339,7 @@ impl TaskStore {
                 },
                 result: None,
                 abort_handle: None,
-                upstream: None,
+                upstream,
                 last_touched: Instant::now(),
                 pending_cancel_reason: None,
                 _quota_lease: quota_lease,
@@ -371,68 +394,6 @@ impl TaskStore {
     /// The tool a task is running, while the task is kept.
     pub fn source_of(&self, task_id: &str) -> Option<TaskSource> {
         self.tasks.get(task_id).map(|record| record.source.clone())
-    }
-
-    pub fn create_passthrough(
-        &mut self,
-        owner: TaskOwner,
-        name: &str,
-        upstream_task: &Task,
-        upstream: TaskUpstreamRef,
-    ) -> Result<Task, McpError> {
-        self.create_passthrough_inner(owner, name, upstream_task, upstream, None)
-    }
-
-    pub fn create_passthrough_with_quota(
-        &mut self,
-        owner: TaskOwner,
-        name: &str,
-        upstream_task: &Task,
-        upstream: TaskUpstreamRef,
-        quota_lease: QuotaLease,
-    ) -> Result<Task, McpError> {
-        self.create_passthrough_inner(owner, name, upstream_task, upstream, Some(quota_lease))
-    }
-
-    fn create_passthrough_inner(
-        &mut self,
-        owner: TaskOwner,
-        name: &str,
-        upstream_task: &Task,
-        upstream: TaskUpstreamRef,
-        quota_lease: Option<QuotaLease>,
-    ) -> Result<Task, McpError> {
-        self.ensure_owner_accepts_creates(&owner)?;
-        self.prune_expired();
-        let task_id = format!("task_{}", self.next_task_id);
-        self.next_task_id += 1;
-
-        let mut task = upstream_task.clone();
-        task.task_id = task_id.clone();
-        if task.status_message.is_none() {
-            task.status_message = Some(format!("Running {name}"));
-        }
-
-        self.tasks.insert(
-            task_id,
-            TaskRecord {
-                task: task.clone(),
-                owner,
-                source: TaskSource {
-                    listed: name.to_string(),
-                    behind: None,
-                },
-                result: None,
-                abort_handle: None,
-                upstream: Some(upstream),
-                last_touched: Instant::now(),
-                pending_cancel_reason: None,
-                _quota_lease: quota_lease,
-            },
-        );
-
-        self.enforce_owner_completed_retention();
-        Ok(task)
     }
 
     pub fn complete(&mut self, task_id: &str, result: Value) {
@@ -569,11 +530,8 @@ impl TaskStore {
             .collect()
     }
 
-    pub fn list_for_owner(
-        &mut self,
-        owner: &TaskOwner,
-        request: Option<rmcp::model::PaginatedRequestParams>,
-    ) -> ListTasksResult {
+    /// `owner`'s tasks, oldest first.
+    pub fn list_for_owner(&mut self, owner: &TaskOwner) -> Vec<Task> {
         self.prune_expired();
         let mut tasks = self
             .tasks
@@ -582,8 +540,7 @@ impl TaskStore {
             .map(|record| record.task.clone())
             .collect::<Vec<_>>();
         tasks.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-
-        paginate_tasks(tasks, request)
+        tasks
     }
 
     pub fn get_info_for_owner(
@@ -743,20 +700,6 @@ impl TaskStore {
         }
     }
 
-    pub fn cancel_result_for_owner(
-        &mut self,
-        owner: &TaskOwner,
-        task_id: &str,
-    ) -> Result<CancelTaskResult, McpError> {
-        self.prune_expired();
-        let record = self
-            .tasks
-            .get(task_id)
-            .ok_or_else(|| task_not_found(task_id))?;
-        ensure_owner(owner, record)?;
-        Ok(CancelTaskResult::new(record.task.clone()))
-    }
-
     /// Drain stale in-flight cleanup after the synchronous store operation
     /// that discovered it. The router owns bounded upstream cancellation;
     /// dropping these values releases their retained quota leases.
@@ -858,25 +801,6 @@ fn task_not_found(task_id: &str) -> McpError {
     )
 }
 
-fn paginate_tasks(
-    tasks: Vec<Task>,
-    request: Option<rmcp::model::PaginatedRequestParams>,
-) -> ListTasksResult {
-    const PAGE_SIZE: usize = 500;
-    let start = request
-        .as_ref()
-        .and_then(|params| params.cursor.as_ref())
-        .and_then(|cursor| cursor.parse::<usize>().ok())
-        .filter(|idx| *idx < tasks.len())
-        .unwrap_or(0);
-    let end = usize::min(start + PAGE_SIZE, tasks.len());
-    let next_cursor = (end < tasks.len()).then(|| end.to_string());
-
-    let mut result = ListTasksResult::new(tasks[start..end].to_vec());
-    result.next_cursor = next_cursor;
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -891,7 +815,9 @@ mod tests {
         let owner = TaskOwner::new(Arc::<str>::from("principal:a"));
         let other = TaskOwner::new(Arc::<str>::from("principal:b"));
 
-        let working = store.create(owner.clone(), "working").expect("working");
+        let working = store
+            .create(owner.clone(), "working", None)
+            .expect("working");
         assert_eq!(
             modern_status(
                 &store
@@ -901,7 +827,7 @@ mod tests {
             rmcp::model::TaskStatus::Working
         );
 
-        let input = store.create(owner.clone(), "input").expect("input");
+        let input = store.create(owner.clone(), "input", None).expect("input");
         let input_record = store.tasks.get_mut(&input.task_id).expect("input record");
         input_record.task.status = TaskStatus::InputRequired;
         let error = store
@@ -910,7 +836,9 @@ mod tests {
         assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
         assert!(error.message.contains("not bridged"));
 
-        let completed = store.create(owner.clone(), "completed").expect("completed");
+        let completed = store
+            .create(owner.clone(), "completed", None)
+            .expect("completed");
         store.complete(
             &completed.task_id,
             serde_json::json!({"content": [], "isError": false}),
@@ -923,7 +851,7 @@ mod tests {
             rmcp::model::TaskPayload::Completed { .. }
         ));
 
-        let failed = store.create(owner.clone(), "failed").expect("failed");
+        let failed = store.create(owner.clone(), "failed", None).expect("failed");
         store.fail(&failed.task_id, "boom".to_string());
         let failed = store
             .get_modern_for_owner(&owner, &failed.task_id)
@@ -933,7 +861,9 @@ mod tests {
             rmcp::model::TaskPayload::Failed { .. }
         ));
 
-        let cancelled = store.create(owner.clone(), "cancelled").expect("cancelled");
+        let cancelled = store
+            .create(owner.clone(), "cancelled", None)
+            .expect("cancelled");
         store
             .mark_cancelled(&owner, &cancelled.task_id)
             .expect("cancel");
@@ -958,7 +888,7 @@ mod tests {
     fn a_task_remembers_the_tool_it_runs() {
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("principal:a"));
-        let task = store.create(owner, "git__commit").expect("task");
+        let task = store.create(owner, "git__commit", None).expect("task");
         let listed = "git__commit".to_string();
         assert_eq!(
             store.source_of(&task.task_id),
@@ -983,7 +913,9 @@ mod tests {
     fn modern_completed_projection_fails_closed_without_object_result() {
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("principal:a"));
-        let task = store.create(owner.clone(), "completed").expect("task");
+        let task = store
+            .create(owner.clone(), "completed", None)
+            .expect("task");
         store.complete(&task.task_id, serde_json::json!("not-an-object"));
 
         let error = store
@@ -998,7 +930,7 @@ mod tests {
         let owner_a = TaskOwner::new(Arc::<str>::from("stdio:a"));
         let owner_b = TaskOwner::new(Arc::<str>::from("stdio:b"));
         let task = store
-            .create(owner_a.clone(), "Mock__echo")
+            .create(owner_a.clone(), "Mock__echo", None)
             .expect("create task");
         store.complete(&task.task_id, serde_json::json!({"ok": true}));
 
@@ -1015,19 +947,19 @@ mod tests {
         let owner_b = TaskOwner::new(Arc::<str>::from("stdio:b"));
 
         store
-            .create(owner_a.clone(), "Mock__echo")
+            .create(owner_a.clone(), "Mock__echo", None)
             .expect("create task");
         store
-            .create(owner_a.clone(), "Mock__echo")
+            .create(owner_a.clone(), "Mock__echo", None)
             .expect("create task");
         store
-            .create(owner_b.clone(), "Mock__echo")
+            .create(owner_b.clone(), "Mock__echo", None)
             .expect("create task");
 
-        let list_a = store.list_for_owner(&owner_a, None);
-        let list_b = store.list_for_owner(&owner_b, None);
-        assert_eq!(list_a.tasks.len(), 2);
-        assert_eq!(list_b.tasks.len(), 1);
+        let list_a = store.list_for_owner(&owner_a);
+        let list_b = store.list_for_owner(&owner_b);
+        assert_eq!(list_a.len(), 2);
+        assert_eq!(list_b.len(), 1);
     }
 
     #[test]
@@ -1035,7 +967,7 @@ mod tests {
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("stdio:a"));
         let task = store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("create task");
 
         store.complete(&task.task_id, serde_json::json!({"ok": true}));
@@ -1064,10 +996,10 @@ mod tests {
         let owner_b = TaskOwner::new(Arc::<str>::from("ipc:b"));
 
         let task_a = store
-            .create(owner_a.clone(), "Mock__echo")
+            .create(owner_a.clone(), "Mock__echo", None)
             .expect("create task");
         let task_b = store
-            .create(owner_b.clone(), "Mock__echo")
+            .create(owner_b.clone(), "Mock__echo", None)
             .expect("create task");
 
         store.cleanup_owner(&owner_a);
@@ -1086,7 +1018,7 @@ mod tests {
         let owner = TaskOwner::new(Arc::<str>::from("ipc:a"));
 
         let running = store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("create task");
         let handle = tokio::spawn(async {
             std::future::pending::<()>().await;
@@ -1107,7 +1039,7 @@ mod tests {
         );
 
         let completed = store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("create task");
         store.complete(&completed.task_id, serde_json::json!({"ok": true}));
 
@@ -1163,6 +1095,7 @@ mod tests {
                     server_id: "mock".to_string(),
                     task_id: "upstream-task-1".to_string(),
                 },
+                None,
             )
             .expect("create passthrough task");
 
@@ -1184,17 +1117,15 @@ mod tests {
 
     #[test]
     fn set_upstream_request_replays_a_cancel_that_arrived_before_it() {
-        // Regression guard for the task-cancellation window: if a task is
-        // cancelled before dispatch has recorded an upstream request ref,
-        // `mark_cancelled` has no ref to forward `notify_cancelled` to and
-        // used to drop the cancellation on the floor — the upstream would
-        // run the call to completion for a result nobody wants. The fix
-        // stashes a pending-cancel reason on the record and replays it via
-        // `set_upstream_request`'s return value once the ref lands.
+        // A task cancelled before dispatch has recorded an upstream request
+        // ref leaves `mark_cancelled` no ref to forward `notify_cancelled`
+        // to. The record keeps a pending-cancel reason, and
+        // `set_upstream_request`'s return value replays it once the ref
+        // lands, so the upstream does not run a call nobody wants.
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("ipc:a"));
         let task = store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("create task");
 
         // Cancel arrives first — no upstream ref has been set yet.
@@ -1249,7 +1180,9 @@ mod tests {
         // a pending-cancel reason.
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("ipc:a"));
-        let task = store.create(owner, "Mock__echo").expect("create task");
+        let task = store
+            .create(owner, "Mock__echo", None)
+            .expect("create task");
 
         let pending = store.set_upstream_request(
             &task.task_id,
@@ -1276,7 +1209,7 @@ mod tests {
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("http:gone"));
         let task = store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("create task");
 
         store.cleanup_owner(&owner);
@@ -1319,7 +1252,7 @@ mod tests {
 
         // The late create (either path) must be refused, not inserted.
         let create_err = store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect_err("local create after teardown must be refused");
         assert_eq!(create_err.code, ErrorCode::INVALID_REQUEST);
         let passthrough_err = store
@@ -1331,19 +1264,20 @@ mod tests {
                     server_id: "mock".to_string(),
                     task_id: "upstream-task-1".to_string(),
                 },
+                None,
             )
             .expect_err("passthrough create after teardown must be refused");
         assert_eq!(passthrough_err.code, ErrorCode::INVALID_REQUEST);
-        assert!(store.list_for_owner(&owner, None).tasks.is_empty());
+        assert!(store.list_for_owner(&owner).is_empty());
 
         // Tombstone hygiene: once the in-flight enqueue resolves (guard
         // drops), the tombstone is gone and a fresh create for the same
         // owner key succeeds.
         drop(guard);
         store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("fresh create after the in-flight enqueue resolved");
-        assert_eq!(store.list_for_owner(&owner, None).tasks.len(), 1);
+        assert_eq!(store.list_for_owner(&owner).len(), 1);
     }
 
     /// The tombstone must survive until the LAST in-flight create resolves —
@@ -1360,13 +1294,13 @@ mod tests {
 
         drop(guard_a);
         assert!(
-            store.create(owner.clone(), "Mock__echo").is_err(),
+            store.create(owner.clone(), "Mock__echo", None).is_err(),
             "tombstone must persist while another create is still in flight"
         );
 
         drop(guard_b);
         store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("tombstone cleared once the last in-flight create resolved");
     }
 
@@ -1379,12 +1313,12 @@ mod tests {
         let owner = TaskOwner::new(Arc::<str>::from("ipc:reused"));
 
         store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("create task");
         store.cleanup_owner(&owner);
 
         store
-            .create(owner.clone(), "Mock__echo")
+            .create(owner.clone(), "Mock__echo", None)
             .expect("create for the same owner key after a quiescent teardown");
     }
 
@@ -1399,7 +1333,9 @@ mod tests {
 
         let mut store = TaskStore::new();
         let owner = TaskOwner::new(Arc::<str>::from("http:expired"));
-        let task = store.create(owner.clone(), "slow").expect("create task");
+        let task = store
+            .create(owner.clone(), "slow", None)
+            .expect("create task");
         store
             .tasks
             .get_mut(&task.task_id)
@@ -1416,7 +1352,7 @@ mod tests {
         store.attach_abort_handle(&task.task_id, handle);
 
         tokio::time::advance(Duration::from_millis(DEFAULT_STALE_IN_FLIGHT_TTL_MS + 1)).await;
-        assert!(store.list_for_owner(&owner, None).tasks.is_empty());
+        assert!(store.list_for_owner(&owner).is_empty());
         tokio::task::yield_now().await;
         assert!(
             dropped.load(std::sync::atomic::Ordering::SeqCst),

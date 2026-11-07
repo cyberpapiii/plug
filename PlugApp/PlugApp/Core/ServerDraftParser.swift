@@ -105,7 +105,7 @@ enum ServerDraftParser {
             guard let draft = draft(named: name, from: container) else {
                 return .unreadable("That block has no command or address, so there is nothing to connect to.")
             }
-            return .draft(draft)
+            return isPlugItself(draft) ? .unreadable(plugItself) : .draft(draft)
         }
 
         let entries = container.compactMap { key, value -> ServerDraft? in
@@ -114,41 +114,78 @@ enum ServerDraftParser {
         }
         .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
 
-        guard let first = entries.first else {
-            return .unreadable("That block has no server in it. Paste the one with a command or address inside.")
+        guard let first = entries.first(where: { !isPlugItself($0) }) else {
+            return .unreadable(
+                entries.isEmpty
+                    ? "That block has no server in it. Paste the one with a command or address inside."
+                    : plugItself
+            )
         }
         return .draft(first)
     }
 
-    private static func looksLikeServerBody(_ body: [String: Any]) -> Bool {
-        body["command"] != nil || body["url"] != nil || body["type"] != nil || body["transport"] != nil
+    private static let plugItself = "That is Plug's own entry. Adding it would connect Plug to itself."
+
+    /// An entry that is Plug, by the rule `plug import` skips it by
+    /// (`is_plug_itself` in `plug-core/src/clients/layout.rs`): named `plug`,
+    /// or running `plug connect` or `plug serve` under any name.
+    /// `testdata/server_entries.json` holds both to the same entries.
+    private static func isPlugItself(_ draft: ServerDraft) -> Bool {
+        if draft.name.lowercased() == "plug" { return true }
+        guard let command = draft.config.command,
+              URL(fileURLWithPath: command).lastPathComponent == "plug"
+        else { return false }
+        return draft.config.args.contains("connect") || draft.config.args.contains("serve")
     }
 
+    private static func looksLikeServerBody(_ body: [String: Any]) -> Bool {
+        // A value that is an object is an entry named like a field.
+        (["command", "type", "transport"] + urlKeys).contains { body[$0] != nil && !(body[$0] is [String: Any]) }
+    }
+
+    /// Where the clients `plug import` reads keep an entry's address, in the
+    /// order `read_entry` in `plug-core/src/clients/layout.rs` tries them.
+    /// `testdata/server_entries.json` holds both readers to the same entries.
+    private static let urlKeys = ["url", "httpUrl", "sseUrl", "uri", "http_url"]
+
     private static func draft(named name: String, from body: [String: Any]) -> ServerDraft? {
-        if let url = (body["url"] as? String)?.trimmingCharacters(in: .whitespaces), !url.isEmpty {
-            var config = ServerConfig.remote(url)
+        let url = urlKeys.lazy
+            .compactMap { (body[$0] as? String)?.trimmingCharacters(in: .whitespaces) }
+            .first { !$0.isEmpty }
+        var config: ServerConfig
+        if let url {
+            config = ServerConfig.remote(url)
             if let declared = declaredTransport(in: body), declared == "sse" {
                 config.transport = "sse"
             }
             if let token = bearerToken(in: body) {
                 config.authToken = token
             }
-            return ServerDraft(name: name, config: config, facts: facts(for: config))
-        }
-
-        guard let command = (body["command"] as? String)?.trimmingCharacters(in: .whitespaces),
-              !command.isEmpty
-        else { return nil }
-
-        let args = (body["args"] as? [Any])?.compactMap { $0 as? String } ?? []
-        var config = ServerConfig.command(command, args: args)
-        if let env = body["env"] as? [String: Any] {
-            config.env = env.compactMapValues { $0 as? String }
+        } else {
+            guard let words = commandWords(in: body),
+                  let command = words.first?.trimmingCharacters(in: .whitespaces),
+                  !command.isEmpty
+            else { return nil }
+            let args = Array(words.dropFirst()) + ((body["args"] as? [Any])?.compactMap { $0 as? String } ?? [])
+            config = ServerConfig.command(command, args: args)
+            if let env = (body["env"] ?? body["environment"]) as? [String: Any] {
+                config.env = env.compactMapValues { $0 as? String }
+            }
         }
         if let enabled = body["enabled"] as? Bool {
             config.enabled = enabled
         }
         return ServerDraft(name: name, config: config, facts: facts(for: config))
+    }
+
+    /// The command and the words after it. OpenCode keeps both in one list,
+    /// which must hold only text, as `read_entry` requires.
+    private static func commandWords(in body: [String: Any]) -> [String]? {
+        switch body["command"] {
+        case let text as String: [text]
+        case let list as [Any]: list as? [String]
+        default: nil
+        }
     }
 
     private static func declaredTransport(in body: [String: Any]) -> String? {

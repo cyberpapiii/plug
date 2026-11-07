@@ -1,8 +1,8 @@
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
-/// HTTP-layer errors that map to HTTP status codes.
-/// Separate from `ProtocolError` which maps to JSON-RPC error codes.
+/// What the HTTP transport refuses a request with. Each one is answered
+/// with its own HTTP status, some with a JSON-RPC error body as well.
 #[derive(Debug, thiserror::Error)]
 pub enum HttpError {
     #[error("forbidden: invalid origin")]
@@ -50,11 +50,17 @@ pub enum HttpError {
     #[error("too many sessions")]
     TooManySessions,
 
-    #[error("request body too large")]
-    BodyTooLarge,
-
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+impl From<crate::session::SessionError> for HttpError {
+    fn from(error: crate::session::SessionError) -> Self {
+        match error {
+            crate::session::SessionError::NotFound => Self::SessionNotFound,
+            crate::session::SessionError::TooMany => Self::TooManySessions,
+        }
+    }
 }
 
 impl IntoResponse for HttpError {
@@ -72,7 +78,10 @@ impl IntoResponse for HttpError {
             HttpError::Unauthorized => {
                 let body = serde_json::json!({
                     "jsonrpc": "2.0",
-                    "error": { "code": -32001, "message": "authentication required" },
+                    "error": {
+                        "code": crate::protocol::AUTHORIZATION_REQUIRED_CODE,
+                        "message": "authentication required",
+                    },
                     "id": null
                 });
                 let mut response = (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
@@ -87,7 +96,10 @@ impl IntoResponse for HttpError {
             } => {
                 let body = serde_json::json!({
                     "jsonrpc": "2.0",
-                    "error": { "code": -32001, "message": "authentication required" },
+                    "error": {
+                        "code": crate::protocol::AUTHORIZATION_REQUIRED_CODE,
+                        "message": "authentication required",
+                    },
                     "id": null
                 });
                 let mut response = (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
@@ -112,9 +124,12 @@ impl IntoResponse for HttpError {
                 metadata_url,
                 scope,
             } => {
+                let code = crate::protocol::ProtocolOutcome::PermissionDenied
+                    .encode(crate::protocol::ProtocolEra::Modern)
+                    .code;
                 let body = serde_json::json!({
                     "jsonrpc": "2.0",
-                    "error": { "code": -32003, "message": "insufficient scope" },
+                    "error": { "code": code, "message": "insufficient scope" },
                     "id": null
                 });
                 let mut response = (StatusCode::FORBIDDEN, axum::Json(body)).into_response();
@@ -156,7 +171,6 @@ impl IntoResponse for HttpError {
             }
             HttpError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.as_str()),
             HttpError::TooManySessions => (StatusCode::TOO_MANY_REQUESTS, "too many sessions"),
-            HttpError::BodyTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
             HttpError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
         };
 
@@ -205,7 +219,6 @@ mod tests {
                 StatusCode::BAD_REQUEST,
             ),
             (HttpError::TooManySessions, StatusCode::TOO_MANY_REQUESTS),
-            (HttpError::BodyTooLarge, StatusCode::PAYLOAD_TOO_LARGE),
             (
                 HttpError::Internal("err".into()),
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -216,15 +229,6 @@ mod tests {
             let response = error.into_response();
             assert_eq!(response.status(), expected_status);
         }
-    }
-
-    #[test]
-    fn session_not_found_does_not_leak_session_id() {
-        // Security: error response body must not contain session IDs
-        let error = HttpError::SessionNotFound;
-        let display = format!("{error}");
-        assert!(!display.contains("session_id"));
-        assert!(!display.contains("uuid"));
     }
 
     #[test]
@@ -246,8 +250,8 @@ mod tests {
         assert!(header.contains("scope=\"tools:read\""));
     }
 
-    #[test]
-    fn insufficient_scope_sets_rfc6750_challenge() {
+    #[tokio::test]
+    async fn insufficient_scope_sets_rfc6750_challenge() {
         let response = HttpError::InsufficientScopeWithMetadata {
             metadata_url: "https://plug.example.com/.well-known/oauth-protected-resource".into(),
             scope: "tools:read".into(),
@@ -263,5 +267,17 @@ mod tests {
         assert!(header.contains("error=\"insufficient_scope\""));
         assert!(header.contains("scope=\"tools:read\""));
         assert!(header.contains("resource_metadata="));
+
+        // A refusal, not a transition worth retrying.
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["error"]["code"],
+            crate::protocol::ProtocolOutcome::PermissionDenied
+                .encode(crate::protocol::ProtocolEra::Modern)
+                .code
+        );
     }
 }

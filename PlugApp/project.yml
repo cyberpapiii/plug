@@ -25,17 +25,23 @@ targets:
     preBuildScripts:
       - name: Bundle daemon and LaunchAgent
         basedOnDependencyAnalysis: false
+        # Declared so the app is signed again when the copied daemon changes;
+        # a file Xcode does not know about leaves the old signature in place.
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/plug
+          - $(TARGET_BUILD_DIR)/$(WRAPPER_NAME)/Contents/Library/LaunchAgents/com.plug.daemon.plist
         script: |
           set -euo pipefail
           ROOT="$SRCROOT/.."
+          CARGO_TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
           if [ -n "${PLUG_RELEASE_BINARY:-}" ] && [ -x "$PLUG_RELEASE_BINARY" ]; then
             PLUG_BIN="$PLUG_RELEASE_BINARY"
           elif [ "$CONFIGURATION" = "Release" ]; then
             cargo build --manifest-path "$ROOT/Cargo.toml" --release -p plug-mcp
-            PLUG_BIN="$ROOT/target/release/plug"
+            PLUG_BIN="$CARGO_TARGET/release/plug"
           else
             cargo build --manifest-path "$ROOT/Cargo.toml" -p plug-mcp
-            PLUG_BIN="$ROOT/target/debug/plug"
+            PLUG_BIN="$CARGO_TARGET/debug/plug"
           fi
           RESOURCES="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
           AGENTS="$TARGET_BUILD_DIR/$WRAPPER_NAME/Contents/Library/LaunchAgents"
@@ -60,6 +66,7 @@ targets:
     platform: macOS
     sources:
       - path: PlugAppTests
+      - path: PlugIPC/Tests/PlugIPCTests/Support/TestSocket.swift
       - path: ../testdata/legacy_plug_programs.json
         type: file
         buildPhase: resources

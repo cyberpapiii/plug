@@ -1,19 +1,29 @@
 import Foundation
 
-struct ClientRepairResult: Codable, Equatable, Sendable {
-    let examined: Int
-    let repaired: Int
-    let unchanged: Int
-}
-
-enum ClientRepairError: Error, Equatable {
+enum ClientRepairError: LocalizedError, AdvisedError, Equatable {
     case commandFailed(status: Int32, stderr: String)
     case malformedOutput
+
+    var errorDescription: String? {
+        switch self {
+        case let .commandFailed(status, stderr):
+            stderr.isEmpty
+                ? "Plug could not update your clients' settings (exit status \(status))."
+                : "Plug could not update your clients' settings: \(stderr)"
+        case .malformedOutput:
+            "Plug gave an answer it could not read. Try again."
+        }
+    }
+
+    var advice: String {
+        if case let .commandFailed(_, stderr) = self { return Explain.advice(forOutside: stderr) }
+        return Explain.fallback
+    }
 }
 
 protocol ClientRepairing: Sendable {
     func inspect(canonicalExecutable: URL) async throws -> Bool
-    func repairAll(canonicalExecutable: URL) async throws -> ClientRepairResult
+    func repairAll(canonicalExecutable: URL) async throws
 }
 
 struct ClientRepairService: ClientRepairing {
@@ -42,18 +52,15 @@ struct ClientRepairService: ClientRepairing {
         }
 
         do {
-            return try JSONDecoder().decode(ParsedRepairReport.self, from: process.stdout)
-                .repairNeeded
+            return try JSONDecoder().decode(ParsedRepairReport.self, from: process.stdout).repairNeeded
         } catch {
             throw ClientRepairError.malformedOutput
         }
     }
 
-    func repairAll(canonicalExecutable: URL) async throws -> ClientRepairResult {
-        try await executeRepair(canonicalExecutable: canonicalExecutable).result
-    }
-
-    private func executeRepair(canonicalExecutable: URL) async throws -> ParsedRepairReport {
+    /// A report that does not parse means the repair cannot be trusted to
+    /// have run, so it fails like the command did.
+    func repairAll(canonicalExecutable: URL) async throws {
         let process = try await runner.run(
             executable: canonicalExecutable,
             arguments: Self.repairArguments,
@@ -64,7 +71,7 @@ struct ClientRepairService: ClientRepairing {
         }
 
         do {
-            return try JSONDecoder().decode(ParsedRepairReport.self, from: process.stdout)
+            _ = try JSONDecoder().decode(ParsedRepairReport.self, from: process.stdout)
         } catch {
             throw ClientRepairError.malformedOutput
         }
@@ -78,35 +85,12 @@ struct ClientRepairService: ClientRepairing {
     }
 }
 
+/// The CLI's own verdict on its report, so the rule for which links need
+/// repair lives only in `PlugLinkDisposition::needs_repair`.
 private struct ParsedRepairReport: Decodable {
-    let items: [ParsedRepairItem]
-
-    var repairNeeded: Bool {
-        items.contains { item in
-            !["canonical", "http", "missing"].contains(item.disposition)
-        }
-    }
-
-    var result: ClientRepairResult {
-        let repaired = items.count(where: \.changed)
-        return ClientRepairResult(
-            examined: items.count,
-            repaired: repaired,
-            unchanged: items.count - repaired
-        )
-    }
+    let repairNeeded: Bool
 
     private enum CodingKeys: String, CodingKey {
-        case items
-    }
-}
-
-private struct ParsedRepairItem: Decodable {
-    let changed: Bool
-    let disposition: String
-
-    private enum CodingKeys: String, CodingKey {
-        case changed
-        case disposition
+        case repairNeeded = "repair_needed"
     }
 }

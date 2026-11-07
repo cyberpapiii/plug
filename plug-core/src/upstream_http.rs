@@ -1,0 +1,358 @@
+//! What every HTTP request Plug sends to an upstream has in common: the
+//! connect bound, the client builder, the hosts it refuses, and what counts
+//! as the same origin.
+
+use std::time::Duration;
+
+use rmcp::transport::auth::{
+    AuthError, AuthorizationManager, OAuthHttpClient, OAuthHttpClientError, OAuthHttpClientFuture,
+    OAuthHttpRedirectPolicy, OAuthHttpRequest,
+};
+
+/// How long an upstream HTTP connect may take before it is abandoned.
+///
+/// DNS, TCP and TLS to a reachable host settle well inside a second even
+/// across an ocean, so a connect still running after this is not slow, it is
+/// not happening. Without a bound it runs until the per-server start timeout
+/// expires — thirty seconds by default — and startup readiness waits on it,
+/// which is how one unreachable remote server delays every other one.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Which redirects an upstream client follows. None of them follows a
+/// redirect to a blocked host, so a server cannot reach one by redirecting.
+#[derive(Clone, Copy)]
+pub(crate) enum Redirects {
+    Never,
+    SameOrigin,
+    AnyHost,
+}
+
+/// How many redirects one request follows, as reqwest's default does.
+const MAX_REDIRECTS: usize = 10;
+
+/// A client for upstream traffic, following redirects by `redirects`.
+pub(crate) fn client(redirects: Redirects) -> anyhow::Result<Client> {
+    crate::tls::http_client_builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(redirect_policy(redirects))
+        .build()
+        .map(Client)
+        .map_err(|error| anyhow::anyhow!("could not build the HTTP client: {error}"))
+}
+
+/// An HTTP client that sends nothing to a blocked host: neither a request
+/// nor a redirect it follows.
+#[derive(Clone, Debug)]
+pub(crate) struct Client(reqwest::Client);
+
+/// A request refused because its host is a cloud metadata endpoint.
+#[derive(Debug, thiserror::Error)]
+#[error("URL host '{0}' is blocked: cloud metadata endpoint")]
+pub struct Blocked(String);
+
+impl Client {
+    /// A request to `url`.
+    pub(crate) fn request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+    ) -> Result<reqwest::RequestBuilder, Blocked> {
+        Ok(self.sending_to(url)?.request(method, url))
+    }
+
+    /// The client to send a request to `url` with. An address that does not
+    /// parse is left to reqwest to refuse.
+    pub(crate) fn sending_to(&self, url: &str) -> Result<&reqwest::Client, Blocked> {
+        match reqwest::Url::parse(url) {
+            Ok(url) => match url.host_str() {
+                Some(host) if is_blocked_host(host) => Err(Blocked(host.to_string())),
+                _ => Ok(&self.0),
+            },
+            Err(_) => Ok(&self.0),
+        }
+    }
+}
+
+fn redirect_policy(redirects: Redirects) -> reqwest::redirect::Policy {
+    if matches!(redirects, Redirects::Never) {
+        return reqwest::redirect::Policy::none();
+    }
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if let Some(host) = attempt
+            .url()
+            .host_str()
+            .filter(|host| is_blocked_host(host))
+        {
+            let refusal = format!("redirect to '{host}' is blocked: cloud metadata endpoint");
+            return attempt.error(refusal);
+        }
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        // A redirect may not carry a request, and its credential, anywhere
+        // but the address the server is configured for: not another port on
+        // the host, and not the same address without TLS.
+        let leaves_origin = !attempt
+            .previous()
+            .last()
+            .is_some_and(|previous| same_origin(previous, attempt.url()));
+        if matches!(redirects, Redirects::SameOrigin) && leaves_origin {
+            return attempt.stop();
+        }
+        attempt.follow()
+    })
+}
+
+/// rmcp's OAuth manager for `url`. It sends discovery, registration and
+/// token requests through Plug's upstream clients, so they follow the same
+/// redirect rules; rmcp asks for some of them not to follow redirects.
+pub async fn authorization_manager<U: reqwest::IntoUrl>(
+    url: U,
+) -> Result<AuthorizationManager, AuthError> {
+    let build =
+        |redirects| client(redirects).map_err(|error| AuthError::InternalError(error.to_string()));
+    let oauth_client = OAuthClient {
+        follow: build(Redirects::AnyHost)?,
+        stop: build(Redirects::Never)?,
+    };
+    AuthorizationManager::new_with_oauth_http_client(url, std::sync::Arc::new(oauth_client)).await
+}
+
+/// The most of an OAuth response body read, as rmcp's own client reads.
+const MAX_OAUTH_BODY_BYTES: usize = 1024 * 1024;
+
+struct OAuthClient {
+    follow: Client,
+    stop: Client,
+}
+
+impl OAuthHttpClient for OAuthClient {
+    fn execute(&self, request: OAuthHttpRequest) -> OAuthHttpClientFuture<'_> {
+        let OAuthHttpRequest {
+            request,
+            redirect_policy,
+            timeout,
+            ..
+        } = request;
+        Box::pin(self.send(request, redirect_policy, timeout))
+    }
+}
+
+impl OAuthClient {
+    async fn send(
+        &self,
+        request: http::Request<Vec<u8>>,
+        redirect_policy: OAuthHttpRedirectPolicy,
+        timeout: Option<Duration>,
+    ) -> Result<http::Response<Vec<u8>>, OAuthHttpClientError> {
+        use futures::StreamExt as _;
+        let client = match redirect_policy {
+            OAuthHttpRedirectPolicy::Stop => &self.stop,
+            _ => &self.follow,
+        };
+        let mut request = reqwest::Request::try_from(request)?;
+        *request.timeout_mut() = timeout;
+        // rmcp 3.1.0 checks only the authorization server's metadata address.
+        // The registration, token and other endpoints that metadata names
+        // arrive here unchecked.
+        let response = client
+            .sending_to(request.url().as_str())?
+            .execute(request)
+            .await?;
+        let mut builder = http::Response::builder()
+            .status(response.status())
+            .version(response.version());
+        for (name, value) in response.headers() {
+            builder = builder.header(name, value);
+        }
+        let mut body = Vec::new();
+        let mut chunks = response.bytes_stream();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk?;
+            if chunk.len() > MAX_OAUTH_BODY_BYTES - body.len() {
+                return Err(
+                    format!("OAuth response body exceeds {MAX_OAUTH_BODY_BYTES} bytes").into(),
+                );
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(builder.body(body)?)
+    }
+}
+
+/// Whether `host` is a cloud metadata endpoint, which no upstream may be.
+///
+/// Loopback and private addresses are allowed: every server is one the owner
+/// configured, and local servers are common. A hostname that resolves to a
+/// metadata address is not caught; that would need resolving at connect time.
+fn is_blocked_host(host: &str) -> bool {
+    if host == "metadata.google.internal" {
+        return true;
+    }
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    // AWS, GCP and Azure all answer on this one address.
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.to_canonical() == std::net::IpAddr::from([169, 254, 169, 254]))
+}
+
+/// Whether `a` and `b` share scheme, host and port, counting a default port
+/// written out the same as one left implicit.
+pub(crate) fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_cloud_metadata_hosts_are_blocked() {
+        for host in [
+            "169.254.169.254",
+            "[169.254.169.254]",
+            "[::ffff:169.254.169.254]",
+            "metadata.google.internal",
+        ] {
+            assert!(is_blocked_host(host), "{host}");
+        }
+        for host in [
+            "127.0.0.1",
+            "[::1]",
+            "10.0.0.1",
+            "192.168.1.1",
+            "169.254.0.1",
+            "8.8.8.8",
+            "example.com",
+            "localhost",
+        ] {
+            assert!(!is_blocked_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn no_request_is_made_to_a_cloud_metadata_endpoint() {
+        for redirects in [Redirects::Never, Redirects::SameOrigin, Redirects::AnyHost] {
+            let client = client(redirects).unwrap();
+            let error = client
+                .request(
+                    reqwest::Method::GET,
+                    "http://169.254.169.254/latest/meta-data/",
+                )
+                .expect_err("the request is refused");
+            assert!(
+                error.to_string().contains("cloud metadata endpoint"),
+                "{error}"
+            );
+            assert!(
+                client
+                    .sending_to("http://metadata.google.internal/")
+                    .is_err()
+            );
+            assert!(client.sending_to("http://127.0.0.1:8080/mcp").is_ok());
+        }
+    }
+
+    /// Serve one route that redirects to `location`. Returns its URL.
+    async fn redirecting_to(location: &'static str) -> String {
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || async move {
+                (
+                    axum::http::StatusCode::FOUND,
+                    [(axum::http::header::LOCATION, location)],
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("http://127.0.0.1:{port}/")
+    }
+
+    #[tokio::test]
+    async fn no_redirect_reaches_a_cloud_metadata_endpoint() {
+        for location in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::ffff:169.254.169.254]/latest/meta-data/",
+        ] {
+            let url = redirecting_to(location).await;
+            for redirects in [Redirects::AnyHost, Redirects::SameOrigin] {
+                let error = client(redirects)
+                    .unwrap()
+                    .request(reqwest::Method::GET, &url)
+                    .unwrap()
+                    .timeout(Duration::from_secs(5))
+                    .send()
+                    .await
+                    .expect_err("the redirect is refused");
+                assert!(error.is_redirect(), "{location}: {error:?}");
+                assert!(
+                    format!("{error:?}").contains("cloud metadata endpoint"),
+                    "{location}: {error:?}"
+                );
+            }
+        }
+    }
+
+    /// Metadata can name any registration or token endpoint, and the OAuth
+    /// client is the only place those addresses are checked.
+    #[tokio::test]
+    async fn the_oauth_client_refuses_a_cloud_metadata_endpoint_it_is_sent_to() {
+        let oauth = OAuthClient {
+            follow: client(Redirects::AnyHost).unwrap(),
+            stop: client(Redirects::Never).unwrap(),
+        };
+        for policy in [
+            OAuthHttpRedirectPolicy::Follow,
+            OAuthHttpRedirectPolicy::Stop,
+        ] {
+            let request = http::Request::post("http://169.254.169.254/register")
+                .body(b"{}".to_vec())
+                .unwrap();
+            let error = oauth
+                .send(request, policy, Some(Duration::from_secs(5)))
+                .await
+                .expect_err("the request is refused before it is sent");
+            assert!(
+                error.to_string().contains("cloud metadata endpoint"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_same_origin_client_stops_at_a_redirect_to_another_host() {
+        let url = redirecting_to("http://example.invalid/").await;
+        let response = client(Redirects::SameOrigin)
+            .unwrap()
+            .request(reqwest::Method::GET, &url)
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    }
+
+    #[test]
+    fn a_written_default_port_is_the_same_origin() {
+        let url = |s: &str| reqwest::Url::parse(s).unwrap();
+        assert!(same_origin(
+            &url("https://a.example/x"),
+            &url("https://a.example:443/y")
+        ));
+        assert!(!same_origin(
+            &url("https://a.example/x"),
+            &url("http://a.example/x")
+        ));
+        assert!(!same_origin(
+            &url("https://a.example/x"),
+            &url("https://a.example:8443/x")
+        ));
+        assert!(!same_origin(
+            &url("https://a.example/x"),
+            &url("https://b.example/x")
+        ));
+    }
+}

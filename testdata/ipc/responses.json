@@ -1,0 +1,664 @@
+{
+  "activity": {
+    "type": "ActivitySnapshot",
+    "events": [
+      {
+        "sequence": 42,
+        "occurred_at_ms": 1700000000000,
+        "client": "client-1",
+        "server": "healthy",
+        "method": "tools/call",
+        "tool": "healthy__send",
+        "client_type": "claude-code",
+        "client_label": "claude-code 2.0",
+        "client_key": "claude-code",
+        "target": "claude-code",
+        "remote": false,
+        "latency_ms": 120,
+        "outcome": "success"
+      },
+      {
+        "sequence": 43,
+        "occurred_at_ms": 1700000001000,
+        "client": null,
+        "server": "failed",
+        "method": "tools/call",
+        "tool": "failed__read",
+        "client_key": "oauth:abc",
+        "remote": true,
+        "latency_ms": 30000,
+        "outcome": "error",
+        "reason": "upstream timed out"
+      },
+      {
+        "sequence": 44,
+        "occurred_at_ms": 1700000002000,
+        "client": null,
+        "server": null,
+        "method": "tools/list",
+        "client_key": "remote:shared",
+        "remote": true,
+        "latency_ms": 3,
+        "outcome": "cancelled"
+      }
+    ]
+  },
+  "api_described": {
+    "type": "ApiDescribed",
+    "api": {
+      "title": "Pets",
+      "operations": [
+        {
+          "name": "listPets",
+          "method": "GET",
+          "path": "/pets",
+          "summary": "List pets",
+          "tag": "pets"
+        },
+        {
+          "name": "addPet",
+          "method": "POST",
+          "path": "/pets",
+          "summary": "",
+          "tag": null
+        }
+      ]
+    }
+  },
+  "api_server_config": {
+    "type": "ServerConfig",
+    "name": "pets",
+    "server": {
+      "command": null,
+      "args": [],
+      "env": {},
+      "enabled": true,
+      "transport": "openapi",
+      "protocol": "legacy",
+      "url": null,
+      "auth_token": "••••••••",
+      "auth": null,
+      "oauth_client_id": null,
+      "oauth_scopes": null,
+      "timeout_secs": 30,
+      "call_timeout_secs": 300,
+      "max_concurrent": 4,
+      "health_check_interval_secs": 60,
+      "circuit_breaker_enabled": true,
+      "tool_renames": {},
+      "tool_groups": [],
+      "sandbox": null,
+      "spec": "https://example.com/openapi.json",
+      "operations": [
+        "listPets"
+      ],
+      "token_in": "header:X-Api-Key"
+    }
+  },
+  "error": {
+    "type": "Error",
+    "code": "OPERATOR_MUTATION_FAILED",
+    "message": "unknown server `gone`"
+  },
+  "handshake": {
+    "type": "OperatorHandshake",
+    "handshake": {
+      "daemon_version": "0.9.0",
+      "daemon_executable": "/Applications/Plug.app/Contents/Resources/plug",
+      "ownership": "app_managed",
+      "ipc_min": 3,
+      "ipc_max": 6,
+      "capabilities": [
+        "server_mutation",
+        "client_mutation",
+        "auth_mutation",
+        "config_mutation",
+        "activity_stream",
+        "tool_mutation",
+        "server_config_read"
+      ]
+    }
+  },
+  "imported": {
+    "type": "OperatorMutation",
+    "result": {
+      "server": null,
+      "imported": [
+        {
+          "name": "github-cursor",
+          "enabled": true,
+          "transport": "stdio",
+          "oauth": false
+        }
+      ]
+    },
+    "reload": {
+      "added": [
+        "notes"
+      ],
+      "removed": [
+        "old"
+      ],
+      "changed": [
+        "workspace"
+      ],
+      "unchanged": [
+        "healthy"
+      ],
+      "settings_changed": true,
+      "restart_required": [
+        "http.port (restart required)"
+      ],
+      "errors": [
+        "pets: spec unreadable"
+      ]
+    }
+  },
+  "mutation": {
+    "type": "OperatorMutation",
+    "result": {
+      "server": {
+        "name": "workspace",
+        "enabled": false,
+        "transport": "stdio",
+        "oauth": false
+      },
+      "disabled_tools": [
+        "failed__*"
+      ]
+    },
+    "reload": {
+      "added": [
+        "notes"
+      ],
+      "removed": [
+        "old"
+      ],
+      "changed": [
+        "workspace"
+      ],
+      "unchanged": [
+        "healthy"
+      ],
+      "settings_changed": true,
+      "restart_required": [
+        "http.port (restart required)"
+      ],
+      "errors": [
+        "pets: spec unreadable"
+      ]
+    }
+  },
+  "ok": {
+    "type": "Ok"
+  },
+  "reloaded": {
+    "type": "Reloaded",
+    "report": {
+      "added": [
+        "notes"
+      ],
+      "removed": [
+        "old"
+      ],
+      "changed": [
+        "workspace"
+      ],
+      "unchanged": [
+        "healthy"
+      ],
+      "settings_changed": true,
+      "restart_required": [
+        "http.port (restart required)"
+      ],
+      "errors": [
+        "pets: spec unreadable"
+      ]
+    }
+  },
+  "remote_server_config": {
+    "type": "ServerConfig",
+    "name": "notes",
+    "server": {
+      "command": null,
+      "args": [],
+      "env": {},
+      "enabled": true,
+      "transport": "sse",
+      "protocol": "legacy",
+      "url": "https://example.com/sse",
+      "auth_token": null,
+      "auth": "oauth",
+      "oauth_client_id": "plug",
+      "oauth_scopes": [
+        "read"
+      ],
+      "timeout_secs": 30,
+      "call_timeout_secs": 300,
+      "max_concurrent": 1,
+      "health_check_interval_secs": 60,
+      "circuit_breaker_enabled": true,
+      "tool_renames": {},
+      "tool_groups": [],
+      "sandbox": null
+    }
+  },
+  "revoked": {
+    "type": "DownstreamClientRevoked",
+    "client_id": "abc"
+  },
+  "server_config": {
+    "type": "ServerConfig",
+    "name": "workspace",
+    "server": {
+      "command": "uvx",
+      "args": [
+        "workspace-mcp",
+        "--single-user"
+      ],
+      "env": {
+        "WORKSPACE_TOKEN": "$WORKSPACE_TOKEN"
+      },
+      "enabled": false,
+      "transport": "stdio",
+      "protocol": "legacy",
+      "url": null,
+      "auth_token": null,
+      "auth": null,
+      "oauth_client_id": null,
+      "oauth_scopes": null,
+      "timeout_secs": 45,
+      "call_timeout_secs": 600,
+      "max_concurrent": 2,
+      "health_check_interval_secs": 120,
+      "circuit_breaker_enabled": false,
+      "tool_renames": {
+        "search": "find"
+      },
+      "tool_groups": [
+        {
+          "prefix": "Gmail",
+          "contains": [
+            "gmail"
+          ],
+          "strip": [
+            "gmail"
+          ]
+        }
+      ],
+      "sandbox": {
+        "enabled": true,
+        "allow_network": true,
+        "allow_read": [
+          "/Users/me/notes"
+        ],
+        "allow_write": [],
+        "profile_path": null
+      }
+    }
+  },
+  "server_name_taken": {
+    "type": "Error",
+    "code": "SERVER_NAME_TAKEN",
+    "message": "server `github` already exists"
+  },
+  "server_validated": {
+    "type": "ServerValidated",
+    "server": {
+      "name": "workspace",
+      "enabled": false,
+      "transport": "stdio",
+      "oauth": false
+    }
+  },
+  "snapshot": {
+    "type": "OperatorSnapshot",
+    "snapshot": {
+      "runtime_version": "0.9.0",
+      "uptime_secs": 4000,
+      "started_id": 9000000000,
+      "tool_catalog_revision": 7,
+      "ownership": "app_managed",
+      "configured_servers": [
+        {
+          "name": "healthy",
+          "enabled": true,
+          "transport": "stdio",
+          "oauth": false
+        },
+        {
+          "name": "degraded",
+          "enabled": false,
+          "transport": "stdio",
+          "oauth": false
+        },
+        {
+          "name": "failed",
+          "enabled": true,
+          "transport": "stdio",
+          "oauth": false
+        },
+        {
+          "name": "auth-required",
+          "enabled": true,
+          "transport": "stdio",
+          "oauth": true
+        },
+        {
+          "name": "notes",
+          "enabled": true,
+          "transport": "sse",
+          "oauth": true
+        }
+      ],
+      "servers": [
+        {
+          "server_id": "healthy",
+          "health": "Healthy",
+          "tool_count": 0,
+          "auth_status": "none",
+          "upstream": {
+            "name": "healthy",
+            "version": "1.0.0",
+            "website_url": "https://example.com"
+          },
+          "metrics": null,
+          "availability": "healthy"
+        },
+        {
+          "server_id": "degraded",
+          "health": "Degraded",
+          "tool_count": 4,
+          "auth_status": "none",
+          "upstream": {
+            "name": "degraded",
+            "version": "1.0.0",
+            "website_url": "https://example.com"
+          },
+          "metrics": null,
+          "availability": "healthy"
+        },
+        {
+          "server_id": "failed",
+          "health": "Failed",
+          "tool_count": 8,
+          "auth_status": "none",
+          "upstream": {
+            "name": "failed",
+            "version": "1.0.0",
+            "website_url": "https://example.com"
+          },
+          "metrics": null,
+          "availability": "healthy",
+          "error": "failed to spawn `npx`: not found"
+        },
+        {
+          "server_id": "auth-required",
+          "health": "AuthRequired",
+          "tool_count": 12,
+          "auth_status": "none",
+          "upstream": {
+            "name": "auth-required",
+            "version": "1.0.0",
+            "website_url": "https://example.com"
+          },
+          "metrics": null,
+          "availability": "healthy"
+        }
+      ],
+      "live_sessions": [
+        {
+          "transport": "daemon_proxy",
+          "client_id": "client-1",
+          "session_id": "session-1",
+          "client_type": "ClaudeCode",
+          "client_info": "claude-code 2.0",
+          "adapter_version": "0.9.0",
+          "host": {
+            "name": "Claude Code",
+            "executable": "/opt/homebrew/bin/claude"
+          },
+          "link_target": "claude-code",
+          "client_key": "claude-code",
+          "access_key": "claude-code",
+          "target": "claude-code",
+          "connected_secs": 3700,
+          "last_activity_secs": 2
+        },
+        {
+          "transport": "http",
+          "client_id": null,
+          "session_id": "session-2",
+          "client_type": "Unknown",
+          "client_info": "ChatGPT",
+          "adapter_version": null,
+          "grant": "abc",
+          "client_key": "oauth:abc",
+          "access_key": "oauth:abc",
+          "connected_secs": 61,
+          "last_activity_secs": null
+        }
+      ],
+      "upstream_auth": [
+        {
+          "name": "auth-required",
+          "url": "https://example.com/mcp",
+          "authenticated": false,
+          "health": "AuthRequired",
+          "scopes": [
+            "read"
+          ],
+          "token_expires_in_secs": 7300,
+          "warnings": [
+            "token expires soon"
+          ]
+        }
+      ],
+      "downstream_clients": [
+        {
+          "client_id": "abc",
+          "client_name": "ChatGPT",
+          "redirect_uris": [
+            "https://chatgpt.com/callback"
+          ],
+          "source": "dynamic_registration",
+          "created_at": 1700000000,
+          "last_used_at": 1700000500,
+          "expires_at": 1800000000,
+          "signed_in": true,
+          "client_key": "oauth:abc"
+        }
+      ],
+      "client_names": [
+        {
+          "key": "oauth:abc",
+          "name": "Work laptop"
+        }
+      ],
+      "client_places": [
+        {
+          "key": "oauth:abc",
+          "place": "Studio Mac"
+        }
+      ],
+      "client_blocks": [
+        {
+          "key": "claude-code",
+          "servers": [
+            "degraded"
+          ],
+          "tools": [
+            "healthy__send",
+            "failed__*"
+          ],
+          "off_servers": [
+            "degraded"
+          ],
+          "off_tools": [
+            {
+              "name": "healthy__send"
+            },
+            {
+              "name": "failed__read",
+              "rule": "failed__*"
+            }
+          ]
+        },
+        {
+          "key": "oauth:abc",
+          "only_allowed": true,
+          "allowed_servers": [
+            "healthy"
+          ],
+          "allowed_tools": [
+            "failed__read"
+          ],
+          "off_servers": [
+            "degraded",
+            "notes"
+          ],
+          "off_tools": [
+            {
+              "name": "failed__write"
+            }
+          ]
+        }
+      ],
+      "events": [
+        {
+          "name": "healthy.watch0",
+          "server": "healthy",
+          "tool": "read",
+          "every_secs": 300,
+          "state": "waiting",
+          "last_checked": 1700000100,
+          "last_changed": 1700000000,
+          "subscribers": 0
+        },
+        {
+          "name": "healthy.watch1",
+          "server": "healthy",
+          "tool": "read",
+          "every_secs": 300,
+          "state": "watching",
+          "last_checked": 1700000101,
+          "subscribers": 1
+        },
+        {
+          "name": "healthy.watch2",
+          "server": "healthy",
+          "tool": "read",
+          "every_secs": 300,
+          "state": "tool_missing",
+          "last_checked": 1700000102,
+          "last_changed": 1700000000,
+          "subscribers": 2
+        },
+        {
+          "name": "healthy.watch3",
+          "server": "healthy",
+          "tool": "read",
+          "every_secs": 300,
+          "state": "not_read_only",
+          "last_checked": 1700000103,
+          "subscribers": 3
+        },
+        {
+          "name": "healthy.watch4",
+          "server": "healthy",
+          "tool": "read",
+          "every_secs": 300,
+          "state": "call_failed",
+          "last_checked": 1700000104,
+          "last_changed": 1700000000,
+          "subscribers": 4
+        },
+        {
+          "name": "healthy.watch5",
+          "server": "healthy",
+          "tool": "read",
+          "every_secs": 300,
+          "state": "too_large",
+          "last_checked": 1700000105,
+          "subscribers": 5
+        },
+        {
+          "name": "slack.message",
+          "server": "slack",
+          "state": "watching",
+          "subscribers": 1
+        }
+      ],
+      "client_address": "https://plug.example.com/mcp",
+      "prefix_delimiter": "."
+    }
+  },
+  "status": {
+    "type": "Status",
+    "servers": [
+      {
+        "server_id": "healthy",
+        "health": "Healthy",
+        "tool_count": 3,
+        "auth_status": "none",
+        "upstream": {
+          "name": "healthy",
+          "version": "1.0.0",
+          "website_url": "https://example.com"
+        },
+        "metrics": null,
+        "availability": "healthy"
+      }
+    ],
+    "clients": 2,
+    "uptime_secs": 4000,
+    "runtime_version": "0.9.0",
+    "resource_subscriptions": 1
+  },
+  "tools": {
+    "type": "Tools",
+    "tools": [
+      {
+        "name": "healthy__send",
+        "server_id": "healthy",
+        "description": "Send a message.",
+        "title": "Send",
+        "disabled": false,
+        "own_name": "send",
+        "read_only": false,
+        "risk": {
+          "upstream_declared": {},
+          "plug_inferred": {},
+          "effective": {},
+          "has_conflict": false
+        },
+        "trust": {
+          "tier": "unknown",
+          "source": "unknown",
+          "boundary": "unknown"
+        }
+      },
+      {
+        "name": "failed__read",
+        "server_id": "failed",
+        "description": null,
+        "title": null,
+        "disabled": true,
+        "disabled_by_pattern": "failed__*",
+        "own_name": "read",
+        "read_only": true,
+        "risk": {
+          "upstream_declared": {},
+          "plug_inferred": {},
+          "effective": {},
+          "has_conflict": false
+        },
+        "trust": {
+          "tier": "unknown",
+          "source": "unknown",
+          "boundary": "unknown"
+        }
+      }
+    ]
+  }
+}

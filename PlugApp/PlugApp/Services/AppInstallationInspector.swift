@@ -1,4 +1,5 @@
 import Foundation
+import PlugIPC
 import Security
 
 struct AppSignatureEvidence: Equatable, Sendable {
@@ -7,7 +8,7 @@ struct AppSignatureEvidence: Equatable, Sendable {
     let teamID: String
 }
 
-enum AppInstallationError: Error, Equatable {
+enum AppInstallationError: LocalizedError, AdvisedError, Equatable {
     case invalidSignature
     case wrongBundleIdentifier(String)
     case untrustedTeam(String)
@@ -15,6 +16,30 @@ enum AppInstallationError: Error, Equatable {
     case missingEmbeddedExecutable(URL)
     case embeddedVersionFailure(String)
     case versionMismatch(app: String, embedded: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidSignature:
+            "This copy of Plug is damaged or was changed. Download Plug again and replace this copy."
+        case let .wrongBundleIdentifier(identifier):
+            "This app is \(identifier), not Plug. Download Plug again and replace this copy."
+        case let .untrustedTeam(team):
+            "This copy of Plug was signed by someone else (\(team)). Download Plug again and replace this copy."
+        case .missingMetadata:
+            "This copy of Plug does not say which version it is. Download Plug again and replace this copy."
+        case .missingEmbeddedExecutable:
+            "This copy of Plug has no service inside it. Download Plug again and replace this copy."
+        case let .embeddedVersionFailure(detail):
+            "Plug's service could not say which version it is: \(detail)"
+        case let .versionMismatch(app, embedded):
+            "This copy of Plug is version \(app), and the service inside it is \(embedded). Download Plug again and replace this copy."
+        }
+    }
+
+    var advice: String {
+        if case let .embeddedVersionFailure(detail) = self { return Explain.advice(forOutside: detail) }
+        return Explain.fallback
+    }
 }
 
 protocol AppInstallationInspecting: Sendable {
@@ -22,8 +47,14 @@ protocol AppInstallationInspecting: Sendable {
 }
 
 struct AppInstallationInspector: AppInstallationInspecting {
-    static let bundleIdentifier = "com.cyberpapiii.plug"
-    static let teamID = "HJF7LN64XX"
+    static let bundleIdentifier = PlugPaths.appBundleID
+    static let teamID = PlugPaths.teamID
+
+    /// The code-signing requirement a Plug binary meets: Apple-anchored, with
+    /// this identifier, signed by Plug's team.
+    static func signingRequirement(identifier: String) -> String {
+        "anchor apple generic and identifier \"\(identifier)\" and certificate leaf[subject.OU] = \"\(teamID)\""
+    }
 
     private let bundleURL: @Sendable () -> URL
     private let signatureReader: @Sendable (URL) throws -> AppSignatureEvidence
@@ -34,7 +65,7 @@ struct AppInstallationInspector: AppInstallationInspecting {
         bundleURL = { Bundle.main.bundleURL }
         signatureReader = Self.readSignature
         infoReader = Self.readBundleInfo
-        embeddedVersionReader = Self.readEmbeddedVersion
+        embeddedVersionReader = { try await Self.readEmbeddedVersion(at: $0) }
     }
 
     init(
@@ -69,7 +100,7 @@ struct AppInstallationInspector: AppInstallationInspecting {
             throw AppInstallationError.missingMetadata
         }
 
-        let executableURL = bundleURL.appending(path: "Contents/Resources/plug")
+        let executableURL = bundleURL.appending(path: PlugPaths.bundledBinary)
         let embeddedVersion = try await embeddedVersionReader(executableURL)
         guard embeddedVersion == appVersion else {
             throw AppInstallationError.versionMismatch(app: appVersion, embedded: embeddedVersion)
@@ -79,13 +110,11 @@ struct AppInstallationInspector: AppInstallationInspecting {
             bundleURL: bundleURL,
             executableURL: executableURL,
             appVersion: appVersion,
-            buildVersion: buildVersion,
-            embeddedVersion: embeddedVersion,
-            teamID: signature.teamID
+            buildVersion: buildVersion
         )
     }
 
-    private static func readSignature(at bundleURL: URL) throws -> AppSignatureEvidence {
+    static func readSignature(at bundleURL: URL) throws -> AppSignatureEvidence {
         var staticCode: SecStaticCode?
         guard SecStaticCodeCreateWithPath(bundleURL as CFURL, [], &staticCode) == errSecSuccess,
               let staticCode
@@ -93,7 +122,7 @@ struct AppInstallationInspector: AppInstallationInspecting {
             throw AppInstallationError.invalidSignature
         }
 
-        let requirementText = "anchor apple generic and identifier \"\(bundleIdentifier)\" and certificate leaf[subject.OU] = \"\(teamID)\""
+        let requirementText = signingRequirement(identifier: bundleIdentifier)
         var requirement: SecRequirement?
         guard SecRequirementCreateWithString(requirementText as CFString, [], &requirement) == errSecSuccess,
               let requirement
@@ -115,7 +144,7 @@ struct AppInstallationInspector: AppInstallationInspecting {
         )
     }
 
-    private static func readBundleInfo(at bundleURL: URL) throws -> [String: String] {
+    static func readBundleInfo(at bundleURL: URL) throws -> [String: String] {
         guard let bundle = Bundle(url: bundleURL) else {
             throw AppInstallationError.missingMetadata
         }
@@ -125,11 +154,15 @@ struct AppInstallationInspector: AppInstallationInspecting {
         ]
     }
 
-    private static func readEmbeddedVersion(at executableURL: URL) async throws -> String {
+    /// The version `plug --version` prints, its last word.
+    static func readEmbeddedVersion(
+        at executableURL: URL,
+        runner: any ProcessRunning = ProcessRunner()
+    ) async throws -> String {
         guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
             throw AppInstallationError.missingEmbeddedExecutable(executableURL)
         }
-        let result = try await ProcessRunner().run(
+        let result = try await runner.run(
             executable: executableURL,
             arguments: ["--version"],
             // Right after login the first run of a fresh binary can wait on

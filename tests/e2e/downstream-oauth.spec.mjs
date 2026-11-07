@@ -9,8 +9,10 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
-const PLUG_BIN = join(REPO_ROOT, "target/debug/plug");
-const MOCK_BIN = join(REPO_ROOT, "target/debug/mock-mcp-server");
+// Where cargo put the binaries: CARGO_TARGET_DIR when set, as cargo reads it.
+const TARGET_DIR = resolve(REPO_ROOT, process.env.CARGO_TARGET_DIR ?? "target");
+const PLUG_BIN = join(TARGET_DIR, "debug/plug");
+const MOCK_BIN = join(TARGET_DIR, "debug/mock-mcp-server");
 const PUBLIC_ORIGIN = "https://plug.test";
 const PUBLIC_HOST = "plug.test";
 const CLIENT_ORIGIN = "https://client.test";

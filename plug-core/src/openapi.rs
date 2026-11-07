@@ -80,48 +80,9 @@ pub struct ApiDocument {
     pub token_place: TokenPlace,
 }
 
-/// Where a request carries the server's `auth_token`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TokenPlace {
-    /// `Authorization: Bearer <token>`.
-    Bearer,
-    /// A header of this name holding the token alone.
-    Header(String),
-    /// A query parameter of this name.
-    Query(String),
-}
+pub use crate::config::TokenPlace;
 
 impl TokenPlace {
-    /// Read the `token_in` setting: `bearer`, `header:<name>`, or
-    /// `query:<name>`.
-    pub fn parse(setting: &str) -> anyhow::Result<Self> {
-        let place = match setting.split_once(':') {
-            None if setting.eq_ignore_ascii_case("bearer") => Some(Self::Bearer),
-            Some(("header", name)) => Self::header(name),
-            Some(("query", name)) if !name.is_empty() => Some(Self::Query(name.to_string())),
-            _ => None,
-        };
-        place.ok_or_else(|| {
-            anyhow::anyhow!(
-                "token_in '{setting}' is not 'bearer', 'header:<name>', or 'query:<name>'"
-            )
-        })
-    }
-
-    /// A header place, unless the name cannot be a header or is one the
-    /// HTTP client owns.
-    fn header(name: &str) -> Option<Self> {
-        let parsed = http::HeaderName::from_bytes(name.as_bytes()).ok()?;
-        let owned = [
-            http::header::HOST,
-            http::header::CONTENT_LENGTH,
-            http::header::CONTENT_TYPE,
-            http::header::TRANSFER_ENCODING,
-            http::header::CONNECTION,
-        ];
-        (!owned.contains(&parsed)).then(|| Self::Header(name.to_string()))
-    }
-
     /// The place the document asks for. Only a document whose security
     /// schemes agree decides; otherwise a bearer token is assumed and
     /// `token_in` can say different.
@@ -236,10 +197,12 @@ async fn read_document(spec: &str, timeout: Duration) -> anyhow::Result<String> 
             .map_err(|_| anyhow::anyhow!("OpenAPI document '{spec}' is not UTF-8 text"));
     }
 
+    let url = Url::parse(spec)
+        .map_err(|e| anyhow::anyhow!("invalid OpenAPI document address '{spec}': {e}"))?;
     // The bearer token is never sent here: the document may live on a
     // different host from the API it describes.
-    let response = http_client()
-        .get(spec)
+    let response = http_client()?
+        .request(reqwest::Method::GET, url.as_str())?
         .timeout(timeout)
         .header(
             http::header::ACCEPT,
@@ -279,15 +242,6 @@ async fn read_up_to(
     Ok((body, false))
 }
 
-/// Whether a redirect from `from` to `to` stays on the same scheme, host
-/// and port. A credential sent to one is not sent on to anything else: not
-/// another port on the host, and not the same address without TLS.
-fn same_origin(from: &reqwest::Url, to: &reqwest::Url) -> bool {
-    from.scheme() == to.scheme()
-        && from.host_str() == to.host_str()
-        && from.port_or_known_default() == to.port_or_known_default()
-}
-
 fn expand_home(path: &str) -> std::path::PathBuf {
     match path.strip_prefix("~/") {
         Some(rest) => dirs::home_dir()
@@ -297,25 +251,8 @@ fn expand_home(path: &str) -> std::path::PathBuf {
     }
 }
 
-fn http_client() -> reqwest::Client {
-    crate::tls::ensure_rustls_provider_installed();
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        // A redirect may not carry a request, and its credential, anywhere
-        // but the address the server is configured for.
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            let same_host = attempt
-                .previous()
-                .last()
-                .is_some_and(|previous| same_origin(previous, attempt.url()));
-            if same_host && attempt.previous().len() < 5 {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        }))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+fn http_client() -> anyhow::Result<crate::upstream_http::Client> {
+    crate::upstream_http::client(crate::upstream_http::Redirects::SameOrigin)
 }
 
 /// Parse an OpenAPI 3 document, JSON or YAML.
@@ -477,8 +414,8 @@ fn parse_unlimited(
 fn is_selected(selected: &[String], name: &str, operation_id: Option<&str>) -> bool {
     selected.is_empty()
         || selected.iter().any(|pattern| {
-            crate::proxy::wildcard_match(pattern, name)
-                || operation_id.is_some_and(|id| crate::proxy::wildcard_match(pattern, id))
+            crate::tool_patterns::wildcard_match(pattern, name)
+                || operation_id.is_some_and(|id| crate::tool_patterns::wildcard_match(pattern, id))
         })
 }
 
@@ -545,9 +482,6 @@ fn base_url(root: &Value, spec: &str, url_override: Option<&str>) -> anyhow::Res
         matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
         "API address '{url}' must be an http or https URL"
     );
-    if url.host_str().is_some_and(crate::server::is_blocked_host) {
-        anyhow::bail!("API address '{url}' is blocked: cloud metadata endpoint");
-    }
     url.set_query(None);
     url.set_fragment(None);
     Ok(url)
@@ -872,19 +806,19 @@ fn plain_text(value: &Value) -> String {
 /// The MCP server that stands in for one API.
 pub(crate) struct OpenApiServer {
     document: ApiDocument,
-    client: reqwest::Client,
+    client: crate::upstream_http::Client,
     auth_token: Option<crate::types::SecretString>,
     call_timeout: Duration,
 }
 
 impl OpenApiServer {
-    pub(crate) fn new(document: ApiDocument, config: &ServerConfig) -> Self {
-        Self {
+    pub(crate) fn new(document: ApiDocument, config: &ServerConfig) -> anyhow::Result<Self> {
+        Ok(Self {
             document,
-            client: http_client(),
+            client: http_client()?,
             auth_token: config.auth_token.clone(),
             call_timeout: Duration::from_secs(config.call_timeout_secs),
-        }
+        })
     }
 
     async fn call(&self, operation: &Operation, arguments: &Map<String, Value>) -> CallToolResult {
@@ -899,9 +833,13 @@ impl OpenApiServer {
         }
         let PlannedRequest { url, headers, body } = planned;
 
-        let mut request = self
-            .client
-            .request(operation.method.clone(), url)
+        let mut request = match self.client.request(operation.method.clone(), url.as_str()) {
+            Ok(request) => request,
+            Err(blocked) => {
+                return CallToolResult::error(vec![ContentBlock::text(blocked.to_string())]);
+            }
+        };
+        request = request
             .timeout(self.call_timeout)
             .header(http::header::ACCEPT, "application/json, */*;q=0.8");
         for (name, value) in headers {
@@ -1042,19 +980,6 @@ impl ServerHandler for OpenApiServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_redirect_keeps_the_scheme_host_and_port() {
-        let url = |text: &str| reqwest::Url::parse(text).unwrap();
-        let api = url("https://api.example.com/v1/items");
-        assert!(same_origin(&api, &url("https://api.example.com/v2/items")));
-        assert!(same_origin(&api, &url("https://api.example.com:443/v2")));
-        // Another port on the host is another program.
-        assert!(!same_origin(&api, &url("https://api.example.com:8443/v1")));
-        // The same address without TLS would send the key in the clear.
-        assert!(!same_origin(&api, &url("http://api.example.com/v1/items")));
-        assert!(!same_origin(&api, &url("https://example.com/v1/items")));
-    }
 
     #[tokio::test]
     async fn a_response_is_read_only_up_to_the_limit() {
@@ -1206,7 +1131,10 @@ mod tests {
         let error = parse_document(&text, "/tmp/big.json", None, &[])
             .unwrap_err()
             .to_string();
-        assert!(error.contains("51 operations"), "{error}");
+        assert!(
+            error.contains(&format!("{} operations", MAX_OPERATIONS + 1)),
+            "{error}"
+        );
 
         let chosen = ["thing1".to_string(), "thing4*".to_string()];
         let document = parse_document(&text, "/tmp/big.json", None, &chosen).expect("parse");
@@ -1241,14 +1169,31 @@ mod tests {
         assert!(error.contains("set 'url'"), "{error}");
     }
 
-    #[test]
-    fn the_metadata_address_is_refused() {
-        let error = parse_document(
+    #[tokio::test]
+    async fn no_call_reaches_the_metadata_address() {
+        let document = parse_document(
             PETSTORE,
             "/tmp/p.json",
             Some("http://169.254.169.254/"),
             &[],
         )
+        .unwrap();
+        let server = OpenApiServer::new(document, &ServerConfig::default()).unwrap();
+        let result = server
+            .call(operation(&server.document, "listPets"), &Map::new())
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let text = serde_json::to_string(&result.content).unwrap();
+        assert!(text.contains("blocked"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_document_on_the_metadata_address_is_not_fetched() {
+        let error = read_document(
+            "http://169.254.169.254/openapi.json",
+            Duration::from_secs(1),
+        )
+        .await
         .unwrap_err()
         .to_string();
         assert!(error.contains("blocked"), "{error}");

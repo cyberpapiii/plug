@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import PlugIPC
 
 protocol LaunchdJobInspecting: Sendable {
     func daemonJobs(
@@ -8,15 +9,37 @@ protocol LaunchdJobInspecting: Sendable {
     ) async throws -> DaemonOwnershipState
 }
 
-enum LaunchdJobInspectionError: Error, Equatable {
+enum LaunchdJobInspectionError: LocalizedError, AdvisedError, Equatable {
     case listFailed(status: Int32, detail: String)
     case printFailed(label: String, status: Int32, detail: String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .listFailed(status, detail):
+            "Plug could not list launchd jobs (launchctl exit status \(status)). \(detail)"
+                .trimmingCharacters(in: .whitespaces)
+        case let .printFailed(label, status, detail):
+            "Plug could not read the launchd job \(label) (launchctl exit status \(status)). \(detail)"
+                .trimmingCharacters(in: .whitespaces)
+        }
+    }
+
+    var advice: String {
+        switch self {
+        case let .listFailed(_, detail), let .printFailed(_, _, detail): Explain.advice(forOutside: detail)
+        }
+    }
 }
 
+/// Reads launchd the way `plug doctor` does (`plug/src/service.rs`): the
+/// labels from `launchctl print gui/<uid>`, then each job's own print. Both
+/// parsers are held to the samples in `testdata/launchd`.
 struct LaunchdJobInspector: LaunchdJobInspecting {
-    private static let daemonLabel = "com.plug.daemon"
-    private static let appProgramIdentifier = "Contents/Resources/plug"
-    private static let appArguments = [appProgramIdentifier, "serve", "--daemon"]
+    private static let daemonLabel = PlugPaths.daemonLabel
+    private static let appProgramIdentifier = PlugPaths.bundledBinary
+    /// What `managed_by` says of a job SMAppService registered for an app.
+    static let serviceManagement = "com.apple.xpc.ServiceManagement"
+    private static let appArguments = [appProgramIdentifier] + PlugPaths.daemonArguments
 
     private let records: @Sendable () async throws -> [LaunchdJobRecord]
 
@@ -37,8 +60,7 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         let allRecords = try await records().map {
             Self.resolveAppManagedProgram(in: $0, canonical: canonical)
         }
-        let canonicalPath = Self.resolvedPath(canonical.executableURL)
-        let legacyPaths = Set(recognizedLegacyPaths.map(Self.resolvedPath))
+        let legacyPaths = Set(recognizedLegacyPaths.map(\.resolvedStandardized))
         let relevant = allRecords.filter { record in
             record.label == Self.daemonLabel
                 || record.programURL?.lastPathComponent == "plug"
@@ -47,19 +69,13 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         }
         guard !relevant.isEmpty else { return .unmanaged }
 
-        let appOwned = relevant.filter {
-            $0.programURL.map(Self.resolvedPath) == canonicalPath
-                && $0.parentBundleIdentifier == AppInstallationInspector.bundleIdentifier
-        }
-        if appOwned.count == 1, relevant.count == 1, let record = appOwned.first {
-            return record.parentBundleVersion == canonical.buildVersion
-                ? .appManagedCurrent(record)
-                : .appManagedStale(record)
+        if relevant.count == 1, let record = relevant.first, canonical.registered(record) {
+            return canonical.registeredCurrent(record) ? .appManagedCurrent(record) : .appManagedStale(record)
         }
 
         let recognized = relevant.filter { record in
             guard let programURL = record.programURL else { return false }
-            let program = Self.resolvedPath(programURL)
+            let program = programURL.resolvedStandardized
             return legacyPaths.contains(program)
                 || LegacyPlugProgram.isRecognized(programURL)
                 || LegacyPlugProgram.isRecognized(program)
@@ -77,13 +93,13 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         let launchctl = URL(fileURLWithPath: "/bin/launchctl")
         let listed = try await runner.run(
             executable: launchctl,
-            arguments: ["list"],
+            arguments: ["print", "gui/\(userID)"],
             timeout: .seconds(10)
         )
         guard listed.status == 0 else {
             throw LaunchdJobInspectionError.listFailed(
                 status: listed.status,
-                detail: errorDetail(listed)
+                detail: listed.stderrText
             )
         }
         let labels = parseLabels(String(decoding: listed.stdout, as: UTF8.self))
@@ -114,7 +130,7 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
                 throw LaunchdJobInspectionError.printFailed(
                     label: label,
                     status: detail.status,
-                    detail: errorDetail(detail)
+                    detail: detail.stderrText
                 )
             }
             records.append(parseRecord(label: label, output: String(decoding: detail.stdout, as: UTF8.self)))
@@ -131,12 +147,26 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
     /// used named its job `com.plug.*`. Excluding that namespace leaves a few
     /// dozen labels to inspect instead of several hundred.
     static func parseLabels(_ output: String) -> [String] {
-        output.split(separator: "\n").compactMap { line in
+        domainLabels(output).filter { !$0.hasPrefix("com.apple.") }
+    }
+
+    /// Every label in the `services` block of a launchd domain's print: a
+    /// line of PID, last exit status and label.
+    static func domainLabels(_ output: String) -> [String] {
+        var inServices = false
+        var labels: [String] = []
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            guard inServices else {
+                inServices = line.trimmingCharacters(in: .whitespaces) == "services = {"
+                continue
+            }
+            if line == "\t}" || line == "}" { break }
             let fields = line.split(whereSeparator: \.isWhitespace)
-            guard fields.count >= 3, fields.last != "Label" else { return nil }
-            guard let label = fields.last.map(String.init) else { return nil }
-            return label.hasPrefix("com.apple.") ? nil : label
+            if fields.count >= 3, UInt32(fields[0]) != nil, let label = fields.last {
+                labels.append(String(label))
+            }
         }
+        return labels
     }
 
     static func parseRecord(label: String, output: String) -> LaunchdJobRecord {
@@ -144,29 +174,29 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         var programIdentifier: String?
         var parentIdentifier: String?
         var parentVersion: String?
+        var managedBy: String?
         var arguments: [String] = []
         var parsingArguments = false
-        var loaded = false
         for line in output.split(separator: "\n") {
             let text = line.trimmingCharacters(in: .whitespaces)
             if parsingArguments {
                 if text == "}" {
                     parsingArguments = false
                 } else if !text.isEmpty {
-                    arguments.append(text)
+                    arguments.append(unquoted(text))
                 }
             } else if text == "arguments = {" {
                 parsingArguments = true
             } else if let value = value(after: "program identifier =", in: text) {
                 programIdentifier = value.components(separatedBy: " (mode:").first
             } else if let value = value(after: "program =", in: text) {
-                program = URL(fileURLWithPath: value).standardizedFileURL
+                program = URL(fileURLWithPath: unquoted(value)).standardizedFileURL
+            } else if let value = value(after: "managed_by =", in: text) {
+                managedBy = value
             } else if let value = value(after: "parent bundle identifier =", in: text) {
                 parentIdentifier = value
             } else if let value = value(after: "parent bundle version =", in: text) {
                 parentVersion = value
-            } else if text == "state = running" {
-                loaded = true
             }
         }
         if parsingArguments {
@@ -177,17 +207,21 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
             programURL: program,
             parentBundleIdentifier: parentIdentifier,
             parentBundleVersion: parentVersion,
-            loaded: loaded,
             programIdentifier: programIdentifier,
-            arguments: arguments
+            arguments: arguments,
+            managedBy: managedBy
         )
     }
 
+    /// The four facts `app_managed_launchd_evidence` in `plug/src/service.rs`
+    /// requires together: SMAppService registered it, for Plug.app, to run
+    /// the bundled binary as the daemon.
     private static func resolveAppManagedProgram(
         in record: LaunchdJobRecord,
         canonical: VerifiedAppInstallation
     ) -> LaunchdJobRecord {
         guard record.programURL == nil,
+              record.managedBy == serviceManagement,
               record.programIdentifier == appProgramIdentifier,
               record.arguments == appArguments,
               record.parentBundleIdentifier == AppInstallationInspector.bundleIdentifier
@@ -198,7 +232,7 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         let candidate = canonical.bundleURL
             .appending(path: appProgramIdentifier)
             .standardizedFileURL
-        guard resolvedPath(candidate) == resolvedPath(canonical.executableURL) else {
+        guard canonical.isExecutable(candidate) else {
             return record
         }
 
@@ -207,10 +241,14 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
             programURL: candidate,
             parentBundleIdentifier: record.parentBundleIdentifier,
             parentBundleVersion: record.parentBundleVersion,
-            loaded: record.loaded,
             programIdentifier: record.programIdentifier,
-            arguments: record.arguments
+            arguments: record.arguments,
+            managedBy: record.managedBy
         )
+    }
+
+    private static func unquoted(_ text: String) -> String {
+        text.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
     }
 
     private static func value(after prefix: String, in line: String) -> String? {
@@ -218,13 +256,6 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         return String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
     }
 
-    static func resolvedPath(_ url: URL) -> URL {
-        url.resolvedStandardized
-    }
-
-    private static func errorDetail(_ result: ProcessResult) -> String {
-        result.stderrText
-    }
 }
 
 /// Re-reads one launchd job in the moment before it is torn down.
@@ -271,8 +302,7 @@ struct LaunchdJobProbe: Sendable {
         // Only recognized-legacy jobs are ever booted out, and those always
         // carry a concrete `program`.
         guard let program = current.programURL else { return .replaced(nil) }
-        let same = LaunchdJobInspector.resolvedPath(program)
-            == LaunchdJobInspector.resolvedPath(expected)
+        let same = program.resolvedStandardized == expected.resolvedStandardized
         return same ? .unchanged : .replaced(program)
     }
 }

@@ -14,7 +14,6 @@ use tokio_util::sync::CancellationToken;
 use crate::config;
 use crate::engine::Engine;
 
-/// Debounce interval for config file changes.
 const DEBOUNCE_MS: u64 = 500;
 
 /// Spawn a background task that watches `config.toml` for changes.
@@ -63,12 +62,17 @@ async fn run_watcher(
     let mut debouncer = new_debouncer(
         Duration::from_millis(DEBOUNCE_MS),
         move |result: Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
-            if let Ok(events) = result {
-                for event in events {
-                    if event.kind == DebouncedEventKind::Any {
-                        // Non-blocking send — if channel is full, skip
-                        let _ = tx.try_send(event.path);
-                    }
+            let events = match result {
+                Ok(events) => events,
+                Err(error) => {
+                    tracing::warn!(%error, "config file watcher error; a change may be missed");
+                    return;
+                }
+            };
+            for event in events {
+                // A full channel already holds a change to reload for.
+                if event.kind == DebouncedEventKind::Any {
+                    let _ = tx.try_send(event.path);
                 }
             }
         },
@@ -113,19 +117,13 @@ async fn run_watcher(
                         continue;
                     }
                 };
-                match engine.reload_config(new_config).await {
-                    Ok(report) => {
-                        tracing::info!(
-                            added = report.added.len(),
-                            removed = report.removed.len(),
-                            changed = report.changed.len(),
-                            "config reloaded via file watcher"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "config reload failed — keeping current config");
-                    }
-                }
+                let report = engine.reload_config(new_config).await;
+                tracing::info!(
+                    added = report.added.len(),
+                    removed = report.removed.len(),
+                    changed = report.changed.len(),
+                    "config reloaded via file watcher"
+                );
             }
         }
     }
@@ -142,18 +140,14 @@ async fn run_watcher(
 // `DEBOUNCE_MS`), so they use `#[tokio::test(flavor = "multi_thread")]` —
 // paused/virtual tokio time cannot observe the debouncer's own OS thread.
 //
-// Residual gaps NOT covered here (see plan 024): the missing-directory
-// branch (`:48-55`, trivial and requires racing spawn against dir creation),
-// the full-channel drop (`:66`, needs >16 debounced events in flight), and
-// the reload-failure-keeps-config branch (`:116-118`) — `apply_reload`
-// (`reload.rs:230-334`) always returns `Ok`, recording per-server start
-// failures in `ReloadReport::errors` rather than surfacing an `Err`, so
-// there is no easy input that makes `engine.reload_config()` itself fail.
+// Not covered: the missing-directory branch (it needs a race between the
+// spawn and the directory appearing) and the dropped event when the channel
+// is full (it needs more than 16 debounced events in flight).
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, ServerConfig, TransportType};
-    use std::collections::HashMap;
+    use crate::config::Config;
+
     use tempfile::TempDir;
 
     fn write_config(path: &std::path::Path, config: &Config) {
@@ -161,43 +155,11 @@ mod tests {
             .expect("write config file");
     }
 
-    fn mock_server_config(tools: &str) -> ServerConfig {
-        ServerConfig {
-            command: Some(
-                plug_test_harness::mock_server_bin()
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            args: vec!["--tools".to_string(), tools.to_string()],
-            env: HashMap::new(),
-            enabled: true,
-            transport: TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 10,
-            call_timeout_secs: 5,
-            max_concurrent: 4,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
-        }
-    }
-
     fn config_with_mock_server() -> Config {
         let mut config = Config::default();
         config
             .servers
-            .insert("mock".to_string(), mock_server_config("echo"));
+            .insert("mock".to_string(), crate::test_helpers::mock_server("echo"));
         config
     }
 
@@ -210,8 +172,9 @@ mod tests {
         _dir: TempDir,
         config_path: PathBuf,
         engine: Arc<Engine>,
-        /// Reloads already observed by `wait_for_reload`.
-        seen_reloads: u64,
+        /// The config the last reload `wait_for_reload` saw put in place.
+        /// Every reload stores a new one, even of an unchanged file.
+        seen_config: Arc<Config>,
     }
 
     impl WatcherFixture {
@@ -220,9 +183,9 @@ mod tests {
             let config_path = dir.path().join("config.toml");
             write_config(&config_path, &Config::default());
 
-            let engine = Arc::new(Engine::new(Config::default()));
-            engine.start().await.expect("engine start");
-            let seen_reloads = engine.reloads_applied();
+            let engine = Engine::new(Config::default());
+            engine.start().await;
+            let seen_config = Arc::clone(&engine.config());
 
             let ready = spawn_config_watcher(
                 engine.clone(),
@@ -239,7 +202,7 @@ mod tests {
                 _dir: dir,
                 config_path,
                 engine,
-                seen_reloads,
+                seen_config,
             };
 
             // FSEvents can report a file event that predates registration.
@@ -264,9 +227,9 @@ mod tests {
         async fn wait_for_reload(&mut self, timeout: Duration) -> bool {
             let deadline = tokio::time::Instant::now() + timeout;
             loop {
-                let applied = self.engine.reloads_applied();
-                if applied > self.seen_reloads {
-                    self.seen_reloads = applied;
+                let current = Arc::clone(&self.engine.config());
+                if !Arc::ptr_eq(&current, &self.seen_config) {
+                    self.seen_config = current;
                     return true;
                 }
                 if tokio::time::Instant::now() >= deadline {
@@ -292,13 +255,6 @@ mod tests {
         async fn shutdown(self) {
             self.engine.shutdown().await;
         }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn watcher_smoke_spawns_and_cancels_cleanly() {
-        let fixture = WatcherFixture::new().await;
-        assert!(fixture.engine.server_statuses().is_empty());
-        fixture.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

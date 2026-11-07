@@ -1,16 +1,26 @@
 import AppKit
 import SwiftUI
 
+/// Xcode runs the unit tests inside Plug.app, and it sets
+/// `XCTestConfigurationFilePath` in the environment of a test host (an Xcode
+/// behavior). A host started that way must leave the owner's install alone:
+/// it starts no updater, connects to no daemon and writes no marker.
+enum TestHost {
+    static let isActive = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var showWindow: (() -> Void)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        guard !TestHost.isActive else { return }
         NSApp.setActivationPolicy(.accessory)
         // The daemon opens Plug hidden so no window comes up. A hidden app
         // cannot show its menu bar panel either, so it is hidden only until
         // it has finished opening.
         if NSApp.isHidden { NSApp.unhide(nil) }
         NotificationService.shared.install()
+        UpdateService.shared.start()
         MenuBarPresence.standard.appDidOpen()
         installSnapshotHook()
     }
@@ -57,10 +67,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct PlugApplication: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @State private var model = AppModel()
+    @State private var model: AppModel
     @State private var router = Router()
     @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
+
+    init() {
+        let model = AppModel(home: .standard)
+        model.snapshotDidLoad = { [weak model] snapshot in
+            NotificationService.shared.observe(snapshot)
+            guard let model else { return }
+            IconStore.shared.observe(snapshot) { await model.origins(configsFor: $0) }
+        }
+        _model = State(initialValue: model)
+    }
 
     var body: some Scene {
         // The menu bar panel is the app. It answers "is Plug working?" and
@@ -76,9 +96,9 @@ struct PlugApplication: App {
             // system redraws the whole menu bar item each time that happens.
             MenuBarStatus(model: model)
                 .task {
+                    guard !TestHost.isActive else { return }
                     appDelegate.showWindow = { runner.run(.openCurrentWindow) }
                     NotificationService.shared.perform = { runner.run($0) }
-                    IconStore.shared.attach(to: model)
                     await model.start()
                 }
         }
@@ -90,7 +110,7 @@ struct PlugApplication: App {
             RootView(model: model, router: router, run: runner.run)
                 .frame(minWidth: 860, minHeight: 520)
                 .task {
-                    IconStore.shared.attach(to: model)
+                    guard !TestHost.isActive else { return }
                     await model.start()
                 }
         }
@@ -133,7 +153,7 @@ struct PlugApplication: App {
                 // Plug refreshes itself, so a refresh button would be visual
                 // weight for something the app already does. The shortcut
                 // people reach for out of habit still works.
-                Button("Refresh") { Task { await model.refresh(forceCatalog: true) } }
+                Button("Refresh") { runner.run(.refresh) }
                     .keyboardShortcut("r", modifiers: .command)
             }
             CommandGroup(replacing: .help) {

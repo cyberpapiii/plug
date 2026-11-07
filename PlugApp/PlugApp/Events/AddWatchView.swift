@@ -16,7 +16,7 @@ struct AddWatchView: View {
     @State private var showsAllTools = false
     @State private var showsOptions = false
     @State private var saving = false
-    @State private var failure: String?
+    @State private var failure: SheetFailure?
     @FocusState private var nameFocused: Bool
     @FocusState private var argumentsFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -24,12 +24,12 @@ struct AddWatchView: View {
     /// Servers that have tools to watch right now.
     private var servers: [String] {
         model.situation.servers
-            .filter { $0.enabled && !model.tools(for: $0.name).isEmpty }
+            .filter { $0.enabled && !model.toolCatalog.tools(for: $0.name).isEmpty }
             .map(\.name)
     }
 
     private var serverTools: [ToolFacts] {
-        model.tools(for: server).sorted { own($0).localizedStandardCompare(own($1)) == .orderedAscending }
+        model.toolCatalog.tools(for: server).sorted { own($0).localizedStandardCompare(own($1)) == .orderedAscending }
     }
 
     /// Watching calls the tool over and over, so only tools the server marks
@@ -215,11 +215,11 @@ struct AddWatchView: View {
         failure = nil
         Task {
             do {
-                try await model.performOperation { .addWatch(authToken: $0, watch: watch) }
+                try await model.actions.addWatch(watch)
                 saving = false
                 dismiss()
             } catch {
-                failure = error.localizedDescription
+                failure = SheetFailure(error)
                 saving = false
             }
         }

@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use dialoguer::{Confirm, Input, Password, Select};
 
 use crate::commands::config::load_editable_config;
-use crate::ui::{cli_prompt_theme, print_info_line, print_success_line};
+use crate::ui::{can_prompt_interactively, cli_prompt_theme, print_info_line, print_success_line};
+use crate::views::servers::{
+    configured_servers_json, live_servers_json, print_configured_servers, print_live_servers,
+};
 use crate::{OutputFormat, ServerCommands};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +63,7 @@ fn parse_unset_env_names(values: &[String]) -> anyhow::Result<Vec<String>> {
 }
 
 fn current_remote_auth_selection(server: &plug_core::config::ServerConfig) -> RemoteAuthSelection {
-    if server.auth.as_deref() == Some("oauth") {
+    if server.is_oauth() {
         RemoteAuthSelection::Oauth {
             client_id: server.oauth_client_id.clone(),
             scopes: server.oauth_scopes.clone(),
@@ -322,99 +325,18 @@ pub(crate) async fn apply_server_mutation(
     }
 
     crate::runtime::ensure_daemon_with_feedback(None, false).await?;
-    let auth_token = crate::daemon::read_auth_token()?;
-    let request = match mutation {
-        plug_core::operator::OperatorMutation::AddServer { name, server } => {
-            plug_core::ipc::IpcRequest::AddServer {
-                name,
-                server: Box::new(server),
-                auth_token,
-                secret_store: None,
-            }
-        }
-        plug_core::operator::OperatorMutation::UpdateServer { name, server } => {
-            plug_core::ipc::IpcRequest::UpdateServer {
-                name,
-                server: Box::new(server),
-                auth_token,
-                secret_store: None,
-            }
-        }
-        plug_core::operator::OperatorMutation::RemoveServer { name } => {
-            plug_core::ipc::IpcRequest::RemoveServer { name, auth_token }
-        }
-        plug_core::operator::OperatorMutation::AddAccount { server, account } => {
-            plug_core::ipc::IpcRequest::AddAccount {
-                server,
-                account,
-                auth_token,
-            }
-        }
-        plug_core::operator::OperatorMutation::SetServerEnabled { name, enabled } => {
-            plug_core::ipc::IpcRequest::SetServerEnabled {
-                name,
-                enabled,
-                auth_token,
-            }
-        }
-        plug_core::operator::OperatorMutation::SetToolEnabled { tool, enabled } => {
-            plug_core::ipc::IpcRequest::SetToolEnabled {
-                tool,
-                enabled,
-                auth_token,
-            }
-        }
-        plug_core::operator::OperatorMutation::RenameClient { key, name } => {
-            plug_core::ipc::IpcRequest::RenameClient {
-                key,
-                name,
-                auth_token,
-            }
-        }
-        plug_core::operator::OperatorMutation::MoveClientSettings { from, to } => {
-            plug_core::ipc::IpcRequest::MoveClientSettings {
-                from,
-                to,
-                auth_token,
-            }
-        }
-        plug_core::operator::OperatorMutation::SetClientPlace { key, place } => {
-            plug_core::ipc::IpcRequest::SetClientPlace {
-                key,
-                place,
-                auth_token,
-            }
-        }
-        plug_core::operator::OperatorMutation::SetClientBlock {
-            key,
-            kind,
-            target,
-            blocked,
-        } => plug_core::ipc::IpcRequest::SetClientBlock {
-            key,
-            kind,
-            target,
-            blocked,
-            auth_token,
-        },
-        plug_core::operator::OperatorMutation::AddWatch { watch } => {
-            plug_core::ipc::IpcRequest::AddWatch { watch, auth_token }
-        }
-        plug_core::operator::OperatorMutation::RemoveWatch { event } => {
-            plug_core::ipc::IpcRequest::RemoveWatch { event, auth_token }
-        }
-        // Plug does this itself, with whatever else it saves.
-        plug_core::operator::OperatorMutation::PinToolBlocks => {
-            anyhow::bail!("Plug stores tool blocks by server itself")
-        }
+    let request = plug_core::ipc::OperatorRequest::Mutate {
+        mutation: Box::new(mutation),
+        secret_store: None,
     };
-    match crate::daemon::ipc_request(&request).await? {
+    match crate::ipc_client::operator(request).await? {
         plug_core::ipc::IpcResponse::OperatorMutation { result, .. } => Ok(result),
         plug_core::ipc::IpcResponse::Error { message, .. } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected daemon response: {other:?}"),
     }
 }
 
+#[allow(clippy::too_many_arguments)] // one per CLI flag
 pub(crate) async fn cmd_server_add(
     config_path: Option<&std::path::PathBuf>,
     name: Option<String>,
@@ -440,9 +362,7 @@ pub(crate) async fn cmd_server_add(
             .interact_text()?,
     };
 
-    if config.servers.contains_key(&name) {
-        anyhow::bail!("server `{name}` already exists");
-    }
+    plug_core::operator::NameTaken::check(&config, &name)?;
 
     let provided_transport = transport.clone();
     let env_updates = parse_env_assignments(&env)?;
@@ -519,24 +439,7 @@ pub(crate) async fn cmd_server_add(
                 env: env_updates,
                 enabled: !disabled,
                 transport,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             }
         }
         plug_core::config::TransportType::Http | plug_core::config::TransportType::Sse => {
@@ -560,29 +463,10 @@ pub(crate) async fn cmd_server_add(
                     .interact()?
             };
             let mut server = plug_core::config::ServerConfig {
-                command: None,
-                args: Vec::new(),
-                env: HashMap::new(),
                 enabled,
                 transport,
-                protocol_mode: Default::default(),
                 url: Some(url),
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             };
             if let Some(selection) = noninteractive_remote_auth_selection(
                 auth,
@@ -624,29 +508,15 @@ pub(crate) async fn cmd_server_add(
                     .into_owned()
             };
             let server = plug_core::config::ServerConfig {
-                command: None,
-                args: Vec::new(),
-                env: HashMap::new(),
                 enabled: !disabled,
                 transport,
-                protocol_mode: Default::default(),
                 url,
                 auth_token: bearer_token.map(Into::into),
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
                 max_concurrent: 4,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-                sandbox: None,
                 spec: Some(spec),
                 operations,
                 token_in,
+                ..Default::default()
             };
             // Read the document now, so a bad address or an API too large to
             // add whole is reported here and not later in a log.
@@ -664,7 +534,7 @@ pub(crate) async fn cmd_server_add(
         }
     };
 
-    let oauth_enabled = server.auth.as_deref() == Some("oauth");
+    let oauth_enabled = server.is_oauth();
     apply_server_mutation(
         config_path,
         plug_core::operator::OperatorMutation::AddServer {
@@ -759,6 +629,7 @@ pub(crate) async fn cmd_server_add_account(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // one per CLI flag
 pub(crate) async fn cmd_server_edit(
     config_path: Option<&std::path::PathBuf>,
     name: Option<String>,
@@ -972,7 +843,7 @@ pub(crate) async fn cmd_server_edit(
             }
         }
 
-        server.auth.as_deref() == Some("oauth")
+        server.is_oauth()
     };
     let updated_server = config
         .servers
@@ -1059,73 +930,161 @@ pub(crate) async fn cmd_server_set_enabled(
     Ok(())
 }
 
+async fn prompt_server_actions(
+    config_path: Option<&std::path::PathBuf>,
+    output: &OutputFormat,
+) -> anyhow::Result<bool> {
+    let options = [
+        "Done",
+        "Add server",
+        "Edit server",
+        "Remove server",
+        "Enable server",
+        "Disable server",
+    ];
+    let selection = Select::with_theme(&cli_prompt_theme())
+        .with_prompt("Choose action")
+        .items(options)
+        .default(0)
+        .interact_opt()?;
+
+    match selection {
+        Some(1) => {
+            cmd_server_add(
+                config_path,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                Vec::new(),
+                None,
+            )
+            .await?;
+            Ok(true)
+        }
+        Some(2) => {
+            cmd_server_edit(
+                config_path,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                output,
+            )
+            .await?;
+            Ok(true)
+        }
+        Some(3) => {
+            cmd_server_remove(config_path, None, false).await?;
+            Ok(true)
+        }
+        Some(4) => {
+            cmd_server_set_enabled(config_path, None, true).await?;
+            Ok(true)
+        }
+        Some(5) => {
+            cmd_server_set_enabled(config_path, None, false).await?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+pub(crate) async fn cmd_server_list(
+    config_path: Option<&std::path::PathBuf>,
+    output: &OutputFormat,
+) -> anyhow::Result<()> {
+    let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
+
+    loop {
+        let (availability, live_status) = crate::ipc_client::query(
+            plug_core::ipc::IpcRequest::Status,
+            |response| match response {
+                plug_core::ipc::IpcResponse::Status { servers, .. } => Some(servers),
+                _ => None,
+            },
+        )
+        .await;
+        if let Some(servers) = live_status {
+            let config = plug_core::config::load_config(config_path).ok();
+            match output {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&live_servers_json(
+                            servers,
+                            config.as_ref(),
+                            availability,
+                        ))?
+                    );
+                    return Ok(());
+                }
+                OutputFormat::Text => print_live_servers(&servers, config.as_ref()),
+            }
+        } else {
+            let config = plug_core::config::load_config(config_path)?;
+            if matches!(output, OutputFormat::Text) {
+                print_configured_servers(
+                    &config,
+                    availability,
+                    !availability.daemon_reachable() && crate::ipc_client::daemon_starting(),
+                );
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&configured_servers_json(&config, availability))?
+                );
+                return Ok(());
+            }
+        }
+
+        if !interactive {
+            break;
+        }
+        println!();
+        if !prompt_server_actions(config_path, output).await? {
+            break;
+        }
+        println!();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::config::save_config;
 
     fn test_config_path(prefix: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("plug-servers-{prefix}-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join("config.toml")
+        plug_core::paths::test::scratch(prefix).join("config.toml")
     }
 
     fn stdio_server(command: &str) -> plug_core::config::ServerConfig {
         plug_core::config::ServerConfig {
             command: Some(command.to_string()),
-            args: Vec::new(),
-            env: HashMap::new(),
-            enabled: true,
-            transport: plug_core::config::TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         }
     }
 
     fn remote_server() -> plug_core::config::ServerConfig {
         plug_core::config::ServerConfig {
-            command: None,
-            args: Vec::new(),
-            env: HashMap::new(),
-            enabled: true,
             transport: plug_core::config::TransportType::Http,
-            protocol_mode: Default::default(),
             url: Some("https://example.com/mcp".to_string()),
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         }
     }
 
@@ -1274,7 +1233,7 @@ mod tests {
         let config_path = test_config_path("remote-to-stdio");
         let mut config = plug_core::config::Config::default();
         config.servers.insert("demo".to_string(), remote_server());
-        save_config(&config_path, &config).unwrap();
+        plug_core::operator::persist_config_atomic(&config_path, &config).unwrap();
 
         let error = cmd_server_edit(
             Some(&config_path),
@@ -1308,7 +1267,7 @@ mod tests {
         config
             .servers
             .insert("demo".to_string(), stdio_server("echo"));
-        save_config(&config_path, &config).unwrap();
+        plug_core::operator::persist_config_atomic(&config_path, &config).unwrap();
 
         let error = cmd_server_edit(
             Some(&config_path),
@@ -1344,7 +1303,7 @@ mod tests {
         server.oauth_client_id = Some("client-123".to_string());
         server.oauth_scopes = Some(vec!["read".to_string()]);
         config.servers.insert("demo".to_string(), server);
-        save_config(&config_path, &config).unwrap();
+        plug_core::operator::persist_config_atomic(&config_path, &config).unwrap();
 
         cmd_server_edit(
             Some(&config_path),
@@ -1423,7 +1382,7 @@ mod tests {
         server.env.insert("OLD".to_string(), "1".to_string());
         server.env.insert("KEEP".to_string(), "yes".to_string());
         config.servers.insert("demo".to_string(), server);
-        save_config(&config_path, &config).unwrap();
+        plug_core::operator::persist_config_atomic(&config_path, &config).unwrap();
 
         cmd_server_edit(
             Some(&config_path),
@@ -1461,7 +1420,7 @@ mod tests {
         let config_path = test_config_path("remote-env-flags");
         let mut config = plug_core::config::Config::default();
         config.servers.insert("demo".to_string(), remote_server());
-        save_config(&config_path, &config).unwrap();
+        plug_core::operator::persist_config_atomic(&config_path, &config).unwrap();
 
         let error = cmd_server_edit(
             Some(&config_path),
@@ -1495,7 +1454,7 @@ mod tests {
         config
             .servers
             .insert("demo".to_string(), stdio_server("node"));
-        save_config(&config_path, &config).unwrap();
+        plug_core::operator::persist_config_atomic(&config_path, &config).unwrap();
 
         // JSON mode with a field flag must apply the change, not echo the
         // unedited config and return success (the review #8 regression).
@@ -1533,7 +1492,7 @@ mod tests {
         config
             .servers
             .insert("demo".to_string(), stdio_server("node"));
-        save_config(&config_path, &config).unwrap();
+        plug_core::operator::persist_config_atomic(&config_path, &config).unwrap();
 
         let error = cmd_server_edit(
             Some(&config_path),
@@ -1568,7 +1527,7 @@ mod tests {
         config
             .servers
             .insert("demo".to_string(), stdio_server("node"));
-        save_config(&config_path, &config).unwrap();
+        plug_core::operator::persist_config_atomic(&config_path, &config).unwrap();
 
         // JSON mode must not drop into the interactive server picker; absent
         // --name it must fail with a clear error.

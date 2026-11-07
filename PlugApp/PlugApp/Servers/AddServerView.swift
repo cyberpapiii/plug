@@ -16,7 +16,7 @@ struct AddServerView: View {
     /// The filled-in form, once a server was picked or a paste was understood.
     @State private var form: ServerForm?
     @State private var saving = false
-    @State private var failure: String?
+    @State private var failure: SheetFailure?
     /// The person's answer to "is this address an API?", when they gave one.
     @State private var addressIsAPI: Bool?
     /// The operations of the API being added, once the daemon has read its
@@ -283,7 +283,7 @@ struct AddServerView: View {
         choiceFailure = nil
         guard let spec = apiSpec else { return }
         do {
-            let api = try await model.describeAPI(spec)
+            let api = try await model.actions.describeAPI(spec)
             guard !Task.isCancelled else { return }
             let read = APIOperationChoice(api: api)
             choice = read
@@ -369,17 +369,12 @@ struct AddServerView: View {
         let store = form.keyStore.sent
         Task {
             do {
-                try await model.performOperation {
-                    .validateServer(authToken: $0, name: finalName, server: saved)
-                }
-                try await model.performOperation {
-                    .addServer(authToken: $0, name: finalName, server: saved, secretStore: store)
-                }
+                try await model.actions.addServer(finalName, saved, secretStore: store)
                 saving = false
                 router.reveal(server: finalName)
                 dismiss()
             } catch {
-                failure = error.localizedDescription
+                failure = SheetFailure(error)
                 saving = false
             }
         }

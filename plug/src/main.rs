@@ -1,44 +1,10 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 // RMCP 3.1 deprecates some APIs toward future SEP-2577. Plug intentionally
 // retains them while MCP 2025-11-25 remains the default negotiated revision.
 #![allow(deprecated)]
-#![allow(
-    clippy::items_after_test_module,
-    clippy::large_enum_variant,
-    clippy::manual_map,
-    clippy::manual_unwrap_or,
-    clippy::manual_unwrap_or_default,
-    clippy::needless_borrow,
-    clippy::suspicious_open_options,
-    clippy::too_many_arguments,
-    clippy::unnecessary_cast,
-    clippy::unnecessary_min_or_max
-)]
-
-/// Load `.env` file vars into the process environment.
-///
-/// SAFETY: Called before tokio runtime starts (single-threaded at this point).
-/// `set_var` is unsafe in Rust 2024 because it's not thread-safe, but we're
-/// guaranteed single-threaded here since this runs before `#[tokio::main]`.
-#[allow(unsafe_code)]
-fn apply_dotenv() {
-    for (key, value) in plug_core::dotenv::load_dotenv() {
-        unsafe {
-            std::env::set_var(&key, &value);
-        }
-    }
-}
 
 #[cfg(test)]
-pub(crate) fn install_test_credential_environment() {
-    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    INIT.get_or_init(|| {
-        plug_core::oauth::install_test_credential_environment(
-            std::env::temp_dir().join(format!("plug-oauth-binary-tests-{}", std::process::id())),
-        );
-    });
-}
-
+mod cli_goldens;
 mod client_host;
 mod commands;
 mod daemon;
@@ -46,7 +12,10 @@ mod daemon;
 // Linux keeps only the small standalone-command subset at runtime.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod install;
+mod ipc_client;
 mod ipc_proxy;
+mod legacy_programs;
+mod operator_http;
 mod runtime;
 mod service;
 mod ui;
@@ -111,6 +80,7 @@ pub(crate) enum ClientLinkTransport {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once per process
 enum Commands {
     #[command(display_order = 1)]
     /// Start Plug in the background
@@ -173,7 +143,7 @@ enum Commands {
         #[command(subcommand)]
         command: Option<commands::events::EventCommands>,
     },
-    #[command(display_order = 10)]
+    #[command(display_order = 10, alias = "export")]
     /// Connect a client to Plug
     Link {
         /// Client targets to link, such as `cursor` or `claude-code`
@@ -247,17 +217,6 @@ enum Commands {
         /// Import every server found without asking
         #[arg(long)]
         yes: bool,
-    },
-    #[command(display_order = 18, hide = true)]
-    /// Compatibility alias for `plug link`
-    Export {
-        targets: Vec<String>,
-        #[arg(long)]
-        all: bool,
-        #[arg(long)]
-        yes: bool,
-        #[arg(long, value_enum)]
-        transport: Option<ClientLinkTransport>,
     },
     #[command(display_order = 19)]
     /// Sign in to a server, and see who is signed in
@@ -559,59 +518,52 @@ pub(crate) enum OwnerCommands {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     install::maybe_delegate_to_app()?;
-    apply_dotenv();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     plug_core::tls::ensure_rustls_provider_installed();
 
     let cli = Cli::parse();
 
-    // `plug status -v`, `plug clients -v`, and `plug tools -v` spend the
-    // first -v on showing more, so their debug logs start at -vv.
-    let log_verbosity = match &cli.command {
-        Some(Commands::Status { .. })
-        | Some(Commands::Clients { .. })
-        | Some(Commands::Tools { .. }) => cli.verbose.saturating_sub(1),
-        _ => cli.verbose,
-    };
-    let log_level = match log_verbosity {
-        0 => default_log_level(cli.command.as_ref()),
-        1 => "debug",
-        _ => "trace",
-    };
-
+    let log_level = log_level(&cli);
     let daemon_mode = matches!(&cli.command, Some(Commands::Serve { daemon: true, .. }));
 
     let _log_guard = if daemon_mode {
-        Some(daemon::setup_file_logging(&daemon::log_dir())?)
+        Some(daemon::setup_file_logging(
+            &plug_core::paths::log_dir(),
+            log_filter(log_level),
+        )?)
     } else {
         init_stderr_tracing(log_level);
         None
     };
 
     match cli.command {
-        None => views::overview::cmd_overview(cli.config.as_ref(), &cli.output).await?,
+        None => commands::overview::cmd_overview(cli.config.as_ref(), &cli.output).await?,
         Some(Commands::Start) => runtime::cmd_start(cli.config.as_ref(), &cli.output).await?,
         Some(Commands::Connect { client }) => {
-            runtime::cmd_connect(cli.config.as_ref(), client).await?
+            ipc_proxy::cmd_connect(cli.config.as_ref(), client).await?
         }
         Some(Commands::Serve { daemon }) => {
-            if daemon {
-                // Stderr is the only place this error would otherwise land, and
-                // the app-owned LaunchAgent redirects stderr nowhere. Record the
-                // reason in the daemon log so a restart loop can be diagnosed.
-                runtime::cmd_daemon(cli.config.as_ref())
-                    .await
-                    .inspect_err(|error| {
+            // Stderr is the only place this error would otherwise land, and
+            // the app-owned LaunchAgent redirects stderr nowhere. Record the
+            // reason in the daemon log so a restart loop can be diagnosed.
+            runtime::cmd_daemon(cli.config.as_ref())
+                .await
+                .inspect_err(|error| {
+                    if daemon {
                         tracing::error!(error = %error, "daemon exited with a fatal error");
-                    })?;
-            } else {
-                runtime::cmd_serve(cli.config.as_ref()).await?;
-            }
+                    }
+                })?;
         }
         Some(Commands::Status { show_token }) => {
-            views::overview::cmd_status(
+            commands::overview::cmd_status(
                 cli.config.as_ref(),
                 &cli.output,
                 show_token,
@@ -621,10 +573,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Stop) => runtime::cmd_daemon_stop().await?,
         Some(Commands::Servers) => {
-            views::servers::cmd_server_list(cli.config.as_ref(), &cli.output).await?
+            commands::servers::cmd_server_list(cli.config.as_ref(), &cli.output).await?
         }
         Some(Commands::Clients { command: None }) => {
-            views::clients::cmd_client_list(cli.config.as_ref(), &cli.output, cli.verbose > 0)
+            commands::clients::cmd_client_list(cli.config.as_ref(), &cli.output, cli.verbose > 0)
                 .await?
         }
         Some(Commands::Clients {
@@ -703,16 +655,22 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Events {
             command: Some(commands::events::EventCommands::Unwatch { event }),
         }) => commands::events::cmd_event_unwatch(cli.config.as_ref(), event).await?,
-        Some(Commands::Tools { command, server }) => {
-            commands::tools::cmd_tool_command(
+        Some(Commands::Tools {
+            command: None,
+            server,
+        }) => {
+            commands::tools::cmd_tool_list(
                 cli.config.as_ref(),
-                command,
-                server,
                 &cli.output,
                 cli.verbose,
+                server.as_deref(),
             )
             .await?
         }
+        Some(Commands::Tools {
+            command: Some(command),
+            ..
+        }) => commands::tools::cmd_tool_command(cli.config.as_ref(), command, &cli.output).await?,
         Some(Commands::Link {
             targets,
             all,
@@ -724,33 +682,28 @@ async fn main() -> anyhow::Result<()> {
             all,
             yes,
             transport.map(Into::into),
+            &cli.output,
         )?,
         Some(Commands::Unlink { targets, all, yes }) => {
-            commands::clients::cmd_unlink(targets, all, yes)?
+            commands::clients::cmd_unlink(cli.config.as_ref(), targets, all, yes, &cli.output)?
         }
         Some(Commands::Server { command }) => {
             commands::servers::cmd_server_command(cli.config.as_ref(), command, &cli.output).await?
         }
         Some(Commands::Import {
             clients,
-            all,
+            all: _,
             dry_run,
             yes,
-        }) => commands::misc::cmd_import(
-            cli.config.as_ref(),
-            clients,
-            all,
-            dry_run,
-            yes,
-            &cli.output,
-        )?,
+        }) => {
+            commands::import::cmd_import(cli.config.as_ref(), clients, dry_run, yes, &cli.output)
+                .await?
+        }
         Some(Commands::Doctor) => {
-            let exit_code = commands::misc::cmd_doctor(cli.config.as_ref(), &cli.output).await?;
+            let exit_code = commands::doctor::cmd_doctor(cli.config.as_ref(), &cli.output).await?;
             if exit_code != 0 {
                 // Flush before process::exit, which bypasses destructors.
-                // Rust's stdout is line-buffered so the trailing-newline
-                // output is already flushed, but make it explicit so a
-                // future non-newline write can't be truncated when piped.
+                // `exit` skips destructors, so stdout is flushed by hand.
                 use std::io::Write as _;
                 let _ = std::io::stdout().flush();
                 std::process::exit(exit_code);
@@ -760,44 +713,53 @@ async fn main() -> anyhow::Result<()> {
             targets,
             all,
             dry_run,
-        }) => commands::misc::cmd_repair(cli.config.as_ref(), targets, all, dry_run, &cli.output)?,
-        Some(Commands::Setup { yes, transport }) => {
-            commands::misc::cmd_setup(cli.config.as_ref(), yes, transport.map(Into::into))?
+        }) => {
+            commands::repair::cmd_repair(cli.config.as_ref(), targets, all, dry_run, &cli.output)?
         }
-        Some(Commands::Reload) => commands::misc::cmd_reload(&cli.output).await?,
+        Some(Commands::Setup { yes, transport }) => {
+            commands::setup::cmd_setup(cli.config.as_ref(), yes, transport.map(Into::into)).await?
+        }
+        Some(Commands::Reload) => commands::reload::cmd_reload(&cli.output).await?,
         Some(Commands::Config { path, command }) => {
             commands::config::cmd_config(cli.config.as_ref(), path, command, &cli.output)?
         }
-        Some(Commands::Export {
-            targets,
-            all,
-            yes,
-            transport,
-        }) => commands::clients::cmd_link(
-            cli.config.as_ref(),
-            targets,
-            all,
-            yes,
-            transport.map(Into::into),
-        )?,
         Some(Commands::Auth { command }) => {
             commands::auth::cmd_auth(cli.config.as_ref(), command, &cli.output).await?
         }
         Some(Commands::Secret { command }) => {
             commands::secrets::cmd_secret(cli.config.as_ref(), command).await?
         }
-        Some(Commands::UninstallCleanup) => commands::misc::cmd_uninstall_cleanup(&cli.output)?,
+        Some(Commands::UninstallCleanup) => {
+            commands::uninstall::cmd_uninstall_cleanup(&cli.output)?
+        }
     }
 
     Ok(())
 }
 
-impl From<ClientLinkTransport> for plug_core::export::ExportTransport {
+impl From<ClientLinkTransport> for plug_core::clients::LinkTransport {
     fn from(value: ClientLinkTransport) -> Self {
         match value {
             ClientLinkTransport::Stdio => Self::Stdio,
             ClientLinkTransport::Http => Self::Http,
         }
+    }
+}
+
+/// The log level `-v` asks for, for stderr and the daemon log alike.
+fn log_level(cli: &Cli) -> &'static str {
+    // `plug status -v`, `plug clients -v`, and `plug tools -v` spend the
+    // first -v on showing more, so their debug logs start at -vv.
+    let verbosity = match &cli.command {
+        Some(Commands::Status { .. })
+        | Some(Commands::Clients { .. })
+        | Some(Commands::Tools { .. }) => cli.verbose.saturating_sub(1),
+        _ => cli.verbose,
+    };
+    match verbosity {
+        0 => default_log_level(cli.command.as_ref()),
+        1 => "debug",
+        _ => "trace",
     }
 }
 
@@ -815,10 +777,17 @@ fn default_log_level(command: Option<&Commands>) -> &'static str {
     }
 }
 
-/// The filter used when `PLUG_LOG` is not set, for stderr and the daemon log
-/// alike. Each directive quiets an RMCP module whose lines are not faults, or
-/// restate a failure Plug already reports in its own words.
-pub(crate) fn default_log_filter(level: &str) -> tracing_subscriber::EnvFilter {
+/// `PLUG_LOG` when set, else the default filter at `level`, for stderr and
+/// the daemon log alike.
+fn log_filter(level: &str) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
+        .unwrap_or_else(|_| default_log_filter(level))
+}
+
+/// The filter used when `PLUG_LOG` is not set. Each directive quiets an RMCP
+/// module whose lines are not faults, or restate a failure Plug already
+/// reports in its own words.
+fn default_log_filter(level: &str) -> tracing_subscriber::EnvFilter {
     // Version negotiation: RMCP warns whenever a client asks for a protocol
     // version Plug does not speak and falls back, which is ordinary.
     // Transport worker: RMCP logs every failed upstream connection as a fatal
@@ -838,11 +807,8 @@ fn init_stderr_tracing(level: &str) {
         return;
     }
 
-    let filter = tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
-        .unwrap_or_else(|_| default_log_filter(level));
-
     tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_env_filter(log_filter(level))
         .with_writer(std::io::stderr)
         .compact()
         .init();
@@ -900,8 +866,8 @@ mod tests {
     }
 
     /// RMCP matches concurrent stdio requests to replies by id, so a stdio
-    /// server with `max_concurrent > 1` is valid and must not warn. The warning
-    /// used to fire on every config load, which the app does every poll.
+    /// server with `max_concurrent > 1` is valid and must not warn: the app
+    /// loads the config on every poll.
     #[test]
     fn validating_a_concurrent_stdio_server_logs_nothing() {
         let server: plug_core::config::ServerConfig = serde_json::from_value(serde_json::json!({
@@ -971,8 +937,27 @@ mod tests {
     }
 
     #[test]
-    fn serve_command_accepts_daemon_flag() {
-        let cli = Cli::try_parse_from(["plug", "serve", "--daemon"]).unwrap();
+    fn daemon_log_level_follows_verbose() {
+        let quiet = Cli::try_parse_from(["plug", "serve", "--daemon"]).unwrap();
+        assert_eq!(log_level(&quiet), "info");
+        let verbose = Cli::try_parse_from(["plug", "serve", "--daemon", "-v"]).unwrap();
+        assert_eq!(log_level(&verbose), "debug");
+    }
+
+    #[test]
+    fn export_is_an_alias_for_link() {
+        let cli = Cli::try_parse_from(["plug", "export", "cursor", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Link { ref targets, yes: true, .. }) if targets == &["cursor"]
+        ));
+    }
+
+    /// What launchd runs the app's daemon with starts the daemon.
+    #[test]
+    fn the_daemon_launch_arguments_start_the_daemon() {
+        let argv = std::iter::once("plug").chain(plug_core::paths::DAEMON_ARGS);
+        let cli = Cli::try_parse_from(argv).unwrap();
         assert!(matches!(
             cli.command,
             Some(Commands::Serve { daemon: true })

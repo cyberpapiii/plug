@@ -1,31 +1,9 @@
 import Foundation
 import PlugIPC
 
-/// One event as the interface reads it. Pure value, so the wording can be
-/// tested without a daemon.
+/// One event as the interface reads it.
 struct EventFacts: Identifiable, Equatable, Sendable {
-    enum Health: Equatable, Sendable {
-        case waiting, watching, toolMissing, notReadOnly, callFailed, tooLarge
-
-        init(state: String) {
-            switch state {
-            case "watching": self = .watching
-            case "tool_missing": self = .toolMissing
-            case "not_read_only": self = .notReadOnly
-            case "call_failed": self = .callFailed
-            case "too_large": self = .tooLarge
-            default: self = .waiting
-            }
-        }
-
-        /// The watch cannot do its job until something changes.
-        var needsAttention: Bool {
-            switch self {
-            case .waiting, .watching: false
-            case .toolMissing, .notReadOnly, .callFailed, .tooLarge: true
-            }
-        }
-    }
+    typealias Health = WatchState
 
     var id: String { name }
     /// `<server>.<name>`, which is what a client subscribes to.
@@ -44,7 +22,7 @@ struct EventFacts: Identifiable, Equatable, Sendable {
         server = status.server
         tool = status.tool
         everySecs = status.everySecs
-        health = Health(state: status.state)
+        health = status.state
         lastChecked = status.lastChecked
         lastChanged = status.lastChanged
         listeners = status.subscribers
@@ -163,4 +141,14 @@ extension String {
     /// A sentence fragment such as "every 5 minutes", made fit to stand alone
     /// as a value.
     var capitalizedFirst: String { prefix(1).uppercased() + dropFirst() }
+}
+
+extension WatchState {
+    /// The watch cannot do its job until something changes.
+    var needsAttention: Bool {
+        switch self {
+        case .waiting, .watching: false
+        case .toolMissing, .notReadOnly, .callFailed, .tooLarge: true
+        }
+    }
 }

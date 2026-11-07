@@ -1,33 +1,3 @@
-"use strict";
-
-function decodeBase64url(value) {
-  const base64 = value.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((value.length + 3) % 4);
-  return Uint8Array.from(atob(base64), character => character.charCodeAt(0));
-}
-
-function encodeBase64url(value) {
-  const bytes = new Uint8Array(value);
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-async function postJson(path, body) {
-  const response = await fetch(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "same-origin",
-    body: JSON.stringify(body),
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const error = new Error(payload.error_description || "Plug could not complete this request.");
-    error.code = payload.error;
-    throw error;
-  }
-  return payload;
-}
-
 function requestOptions(publicKey) {
   return {
     ...publicKey,
@@ -52,6 +22,7 @@ function authenticationResponse(credential) {
   };
 }
 
+const REQUEST_FAILED = "Plug could not complete this request.";
 const page = document.getElementById("consent");
 const allow = document.getElementById("allow");
 const deny = document.getElementById("deny");
@@ -77,9 +48,9 @@ async function approve() {
   status.textContent = "Waiting for Touch ID or your passkey…";
   try {
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const challenge = await postJson("/oauth/consent/challenge", {
+      const challenge = await postJson(page.dataset.challengeEndpoint, {
         consent_id: page.dataset.consentId,
-      });
+      }, REQUEST_FAILED);
       if (challenge.redirect_uri) {
         window.location.assign(challenge.redirect_uri);
         return;
@@ -88,11 +59,11 @@ async function approve() {
         publicKey: requestOptions(challenge.public_key),
       });
       try {
-        const decision = await postJson("/oauth/consent/decision", {
+        const decision = await postJson(page.dataset.decisionEndpoint, {
           decision: "approve",
           ceremony_id: challenge.ceremony_id,
           credential: authenticationResponse(credential),
-        });
+        }, REQUEST_FAILED);
         window.location.assign(decision.redirect_uri);
         return;
       } catch (error) {
@@ -112,11 +83,11 @@ async function denyAccess() {
   deny.disabled = true;
   status.textContent = "Denying this request…";
   try {
-    const decision = await postJson("/oauth/consent/decision", {
+    const decision = await postJson(page.dataset.decisionEndpoint, {
       decision: "deny",
       consent_id: page.dataset.consentId,
       csrf_token: page.dataset.csrfToken,
-    });
+    }, REQUEST_FAILED);
     window.location.assign(decision.redirect_uri);
   } catch (error) {
     showError(error);

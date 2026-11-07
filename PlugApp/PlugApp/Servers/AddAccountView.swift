@@ -11,7 +11,7 @@ struct AddAccountView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var typed = ""
     @State private var saving = false
-    @State private var failure: String?
+    @State private var failure: SheetFailure?
 
     private var label: String? { AccountDraft.label(from: typed) }
 
@@ -75,12 +75,12 @@ struct AddAccountView: View {
         failure = nil
         Task {
             do {
-                try await model.performOperation { .addAccount(authToken: $0, server: server, account: label) }
+                let added = try await model.actions.addAccount(server: server, label: label)
                 saving = false
-                router.reveal(server: AccountDraft.serverName(server: server, label: label))
+                router.reveal(server: added)
                 dismiss()
             } catch {
-                failure = error.localizedDescription
+                failure = SheetFailure(error)
                 saving = false
             }
         }

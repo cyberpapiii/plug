@@ -1,19 +1,6 @@
 use super::*;
-
-fn test_router_config() -> RouterConfig {
-    RouterConfig {
-        enable_prefix: true,
-        prefix_delimiter: "__".to_string(),
-        priority_tools: Vec::new(),
-        disabled_tools: Vec::new(),
-        tool_description_max_chars: None,
-        tool_search_threshold: 50,
-        meta_tool_mode: false,
-        lazy_tools: LazyToolsConfig::default(),
-        tool_filter_enabled: true,
-        enrichment_servers: std::collections::HashSet::new(),
-    }
-}
+use rmcp::handler::server::ServerHandler;
+use rmcp::service::{RequestContext, RoleServer};
 
 fn expected_meta_tool_names() -> Vec<&'static str> {
     vec!["plug__search_tools"]
@@ -29,31 +16,14 @@ fn expected_legacy_meta_tool_names() -> Vec<&'static str> {
 }
 
 #[test]
-fn trace_ids_are_w3c_sized_hex_values() {
-    let trace_id = new_trace_id();
-    assert_eq!(trace_id.len(), 32);
-    assert!(trace_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    assert_ne!(trace_id, "00000000000000000000000000000000");
-}
-
-#[test]
 fn http_call_contexts_are_untrusted_until_an_adapter_opts_in() {
     // HTTP is the internet-reachable transport. A context that reaches policy
     // without an adapter having declared how the caller authenticated must be
     // able to do nothing, not everything.
     for context in [
-        DownstreamCallContext::http("bare-session", RequestId::Number(1)),
-        DownstreamCallContext::http_for_client(
-            "bare-session",
-            RequestId::Number(2),
-            ClientType::Unknown,
-        ),
-        DownstreamCallContext::http_for_client_with_trace(
-            "bare-session",
-            RequestId::Number(3),
-            ClientType::Unknown,
-            "0123456789abcdef0123456789abcdef",
-        ),
+        DownstreamCallContext::http("bare-session", RequestId::Number(2), ClientType::Unknown),
+        DownstreamCallContext::http("bare-session", RequestId::Number(3), ClientType::Unknown)
+            .with_trace_id("0123456789abcdef0123456789abcdef"),
     ] {
         assert!(
             !context.local_trust,
@@ -61,69 +31,75 @@ fn http_call_contexts_are_untrusted_until_an_adapter_opts_in() {
         );
         assert!(
             context
-                .authorize(crate::protocol::MethodFamily::ToolsList)
+                .authorize(crate::admission::MethodFamily::ToolsList)
                 .is_err(),
             "an unopted HTTP context must be denied, not allowed"
         );
     }
 
     // The two explicit opt-ins still work, so no legitimate caller regresses.
-    let bearer = DownstreamCallContext::http("oauth-session", RequestId::Number(4))
-        .with_authorization(
-            crate::types::PrincipalId::configured_credential("test-bearer", 0),
-            ["tools:read".to_string()],
-        );
+    let bearer = DownstreamCallContext::http(
+        "oauth-session",
+        RequestId::Number(4),
+        crate::types::ClientType::Unknown,
+    )
+    .with_authorization(
+        crate::types::PrincipalId::configured_credential("test-bearer", 0),
+        ["tools:read".to_string()],
+    );
     assert!(!bearer.local_trust);
     assert!(
         bearer
-            .authorize(crate::protocol::MethodFamily::ToolsList)
+            .authorize(crate::admission::MethodFamily::ToolsList)
             .is_ok()
     );
     assert!(
         bearer
-            .authorize(crate::protocol::MethodFamily::PromptsGet)
+            .authorize(crate::admission::MethodFamily::PromptsGet)
             .is_err(),
         "an authorized context is still bounded by its scopes"
     );
 
-    let loopback =
-        DownstreamCallContext::http("loopback-session", RequestId::Number(5)).with_local_principal(
-            crate::types::PrincipalId::configured_credential("downstream-http-loopback", 0),
-        );
+    let loopback = DownstreamCallContext::http(
+        "loopback-session",
+        RequestId::Number(5),
+        crate::types::ClientType::Unknown,
+    )
+    .with_local_principal(crate::types::PrincipalId::configured_credential(
+        "downstream-http-loopback",
+        0,
+    ));
     assert!(loopback.local_trust);
     assert!(
         loopback
-            .authorize(crate::protocol::MethodFamily::PromptsGet)
+            .authorize(crate::admission::MethodFamily::PromptsGet)
             .is_ok(),
         "a loopback listener that requires no auth keeps full local access"
     );
 
-    // Stdio and IPC are local by construction and must stay trusted.
-    for context in [
-        DownstreamCallContext::stdio("stdio-client", RequestId::Number(6)),
-        DownstreamCallContext::ipc_for_client(
-            "ipc-client",
-            RequestId::Number(7),
-            ClientType::Unknown,
-        ),
-    ] {
-        assert!(context.local_trust, "local transports keep local trust");
-        assert!(
-            context
-                .authorize(crate::protocol::MethodFamily::ToolsCall)
-                .is_ok()
-        );
-    }
+    // IPC is local by construction and must stay trusted.
+    let context = DownstreamCallContext::ipc(
+        "ipc-client",
+        RequestId::Number(7),
+        ClientType::Unknown,
+        None,
+    );
+    assert!(context.local_trust, "local transports keep local trust");
+    assert!(
+        context
+            .authorize(crate::admission::MethodFamily::ToolsCall)
+            .is_ok()
+    );
 }
 
 #[test]
 fn downstream_context_preserves_supplied_http_trace_id() {
-    let context = DownstreamCallContext::http_for_client_with_trace(
+    let context = DownstreamCallContext::http(
         "session-a",
         RequestId::from(NumberOrString::Number(1)),
         ClientType::ClaudeCode,
-        Arc::<str>::from("4bf92f3577b34da6a3ce929d0e0e4736"),
-    );
+    )
+    .with_trace_id(Arc::<str>::from("4bf92f3577b34da6a3ce929d0e0e4736"));
 
     assert_eq!(
         context.trace_id.as_ref(),
@@ -134,24 +110,22 @@ fn downstream_context_preserves_supplied_http_trace_id() {
 #[test]
 fn client_metadata_never_changes_principal_identity() {
     let request = RequestId::from(NumberOrString::Number(1));
-    let original = DownstreamCallContext::stdio_for_client(
+    let original = DownstreamCallContext::ipc(
         "process-instance",
         request.clone(),
         ClientType::Unknown,
+        None,
     );
-    let changed = DownstreamCallContext::stdio_for_client(
-        "process-instance",
-        request,
-        ClientType::ClaudeCode,
-    )
-    .with_client_metadata("forged-client", "999");
+    let changed =
+        DownstreamCallContext::ipc("process-instance", request, ClientType::ClaudeCode, None)
+            .with_client_metadata("forged-client", "999");
     assert_eq!(original.principal, changed.principal);
     assert_ne!(original.client_metadata, changed.client_metadata);
 }
 
-fn router_with_git_commit_tool() -> ToolRouter {
+pub(super) fn router_with_git_commit_tool() -> ToolRouter {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     let mut routes = HashMap::new();
     routes.insert(
         "git__commit".to_string(),
@@ -165,19 +139,7 @@ fn router_with_git_commit_tool() -> ToolRouter {
                 Cow::Borrowed("Create a git commit"),
                 Arc::new(serde_json::Map::new()),
             )]),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -196,6 +158,33 @@ fn a_listed_tool_gives_its_own_name_and_says_when_it_is_not_read_only() {
 }
 
 #[test]
+fn a_lost_call_is_sent_again_only_on_the_servers_word() {
+    use rmcp::model::ToolAnnotations;
+    let resend = |declared: Option<ToolAnnotations>, inferred: Option<ToolAnnotations>| {
+        let mut snapshot = (**router_with_git_commit_tool().cache.load()).clone();
+        snapshot.tool_risk_inventory.insert(
+            "git__commit".to_string(),
+            ToolRisk {
+                upstream_declared: declared,
+                plug_inferred: inferred.clone(),
+                effective: inferred,
+            },
+        );
+        snapshot.may_resend("git__commit")
+    };
+    let mut read_only = ToolAnnotations::default();
+    read_only.read_only_hint = Some(true);
+    let mut idempotent = ToolAnnotations::default();
+    idempotent.idempotent_hint = Some(true);
+    assert!(resend(Some(read_only.clone()), None));
+    assert!(resend(Some(idempotent.clone()), None));
+    assert!(!resend(Some(ToolAnnotations::default()), None));
+    // Plug's guess from the tool's name is not the server's word.
+    assert!(!resend(None, Some(read_only)));
+    assert!(!resend(None, Some(idempotent)));
+}
+
+#[test]
 fn a_watch_takes_the_servers_word_over_the_tools_name() {
     use rmcp::model::ToolAnnotations;
     let hint = |read_only| {
@@ -208,11 +197,11 @@ fn a_watch_takes_the_servers_word_over_the_tools_name() {
         let mut snapshot = (**router.cache.load()).clone();
         snapshot.tool_risk_inventory.insert(
             "git__commit".to_string(),
-            crate::ipc::IpcToolRiskInfo::from_annotations(
-                declared.map(hint).as_ref(),
-                None,
-                effective.map(hint).as_ref(),
-            ),
+            ToolRisk {
+                upstream_declared: declared.map(hint),
+                plug_inferred: None,
+                effective: effective.map(hint),
+            },
         );
         router.cache.store(Arc::new(snapshot));
         router
@@ -228,61 +217,32 @@ fn a_watch_takes_the_servers_word_over_the_tools_name() {
     assert_eq!(with(None, None), Some(false));
 }
 
-#[test]
-fn get_info_returns_correct_server_info() {
+/// A router serving one upstream whose resources the test can change.
+async fn router_with_resource_server(
+    resources: &[&str],
+) -> (Arc<ToolRouter>, Arc<SubscribableUpstreamState>) {
     let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(sm, test_router_config());
-    let info = handler.get_info();
-
-    assert_eq!(info.server_info.name, "plug");
-    assert_eq!(info.server_info.title.as_deref(), Some("Plug"));
-    assert_eq!(
-        info.server_info.description.as_deref(),
-        Some("MCP multiplexer")
-    );
-    assert_eq!(
-        info.server_info.website_url.as_deref(),
-        Some("https://github.com/cyberpapiii/plug")
-    );
-    let icons = info.server_info.icons.as_ref().expect("plug icons");
-    assert_plug_icons_sequence(icons);
-    assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
-    assert_eq!(info.protocol_version.as_str(), LATEST_PROTOCOL_VERSION);
-    assert!(info.capabilities.tools.is_none());
-    assert!(info.capabilities.resources.is_none());
-}
-
-fn assert_plug_icons_sequence(icons: &[Icon]) {
-    let expected_sizes = ["16x16", "32x32", "64x64", "128x128", "256x256", "512x512"];
-    assert_eq!(icons.len(), expected_sizes.len() + 1);
-
-    for (icon, expected_size) in icons.iter().zip(expected_sizes) {
-        assert!(icon.src.starts_with("data:image/png;base64,"));
-        assert_eq!(icon.mime_type.as_deref(), Some("image/png"));
-        assert_eq!(
-            icon.sizes
-                .as_ref()
-                .and_then(|sizes| sizes.first())
-                .map(String::as_str),
-            Some(expected_size)
-        );
-    }
-
-    let svg = icons.last().expect("svg fallback icon");
-    assert!(svg.src.starts_with("data:image/svg+xml;base64,"));
-    assert_eq!(svg.mime_type.as_deref(), Some("image/svg+xml"));
-    assert_eq!(svg.sizes.as_deref(), Some(&["any".to_string()][..]));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
+    let state = SubscribableUpstreamState::new(resources);
+    sm.replace_server(
+        "mock",
+        connect_subscribable_upstream("mock", Arc::clone(&state)).await,
+    )
+    .await;
+    router.refresh_tools().await;
+    (router, state)
 }
 
 #[tokio::test(start_paused = true)]
-async fn schedule_tool_list_changed_refresh_debounces_bursts() {
-    let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(sm, test_router_config()));
+async fn a_burst_of_upstream_list_notices_refreshes_once() {
+    let (router, state) = router_with_resource_server(&["memory://old"]).await;
     let mut rx = router.subscribe_notifications();
+    let lists_before = state.list_count();
 
-    router.schedule_tool_list_changed_refresh();
-    router.schedule_tool_list_changed_refresh();
-    router.schedule_tool_list_changed_refresh();
+    state.set_resources(&["memory://new"]);
+    router.schedule_catalog_refresh();
+    router.schedule_catalog_refresh();
+    router.schedule_catalog_refresh();
 
     tokio::task::yield_now().await;
     assert!(
@@ -298,25 +258,26 @@ async fn schedule_tool_list_changed_refresh_debounces_bursts() {
     );
 
     tokio::time::advance(Duration::from_millis(1)).await;
-    let notification = rx.recv().await.expect("tool list changed notification");
-    assert_eq!(notification, ProtocolNotification::ToolListChanged);
+    let notification = rx.recv().await.expect("resource list changed notification");
+    assert_eq!(notification, ProtocolNotification::ResourceListChanged);
     assert!(
         rx.try_recv().is_err(),
         "burst should coalesce into a single notification"
     );
+    assert_eq!(state.list_count(), lists_before + 1);
 }
 
 #[tokio::test(start_paused = true)]
 async fn refresh_task_releases_in_progress_flag_for_subsequent_refresh() {
-    let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(sm, test_router_config()));
+    let (router, state) = router_with_resource_server(&["memory://a"]).await;
     let mut rx = router.subscribe_notifications();
 
     // First refresh cycle.
-    router.schedule_tool_list_changed_refresh();
+    state.set_resources(&["memory://b"]);
+    router.schedule_catalog_refresh();
     tokio::time::advance(LIST_CHANGED_REFRESH_DEBOUNCE).await;
     let first = rx.recv().await.expect("first notification");
-    assert_eq!(first, ProtocolNotification::ToolListChanged);
+    assert_eq!(first, ProtocolNotification::ResourceListChanged);
 
     // After the cycle completes the in-progress flag must be released —
     // a wedged flag (the regression) would silently drop every future
@@ -331,32 +292,83 @@ async fn refresh_task_releases_in_progress_flag_for_subsequent_refresh() {
 
     // A second schedule must therefore spawn a fresh task and publish
     // again.
-    router.schedule_tool_list_changed_refresh();
+    state.set_resources(&["memory://c"]);
+    router.schedule_catalog_refresh();
     tokio::time::advance(LIST_CHANGED_REFRESH_DEBOUNCE).await;
     let second = rx.recv().await.expect("second notification");
-    assert_eq!(second, ProtocolNotification::ToolListChanged);
+    assert_eq!(second, ProtocolNotification::ResourceListChanged);
 }
 
+/// An upstream's notice that turns out to change nothing tells no client
+/// anything, and a list that changed without a notice (a server gone, a
+/// reload) is told all the same.
 #[tokio::test]
-async fn refresh_tools_with_no_servers() {
-    let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(sm, test_router_config());
-    handler.refresh_tools().await;
+async fn clients_hear_of_exactly_the_lists_a_refresh_changed() {
+    let (router, state) = router_with_resource_server(&["memory://a"]).await;
+    let mut rx = router.subscribe_notifications();
+    let heard = |rx: &mut broadcast::Receiver<ProtocolNotification>| {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>()
+    };
 
-    let tools = handler.router().list_tools();
-    assert!(tools.is_empty());
-}
-
-#[tokio::test]
-async fn tool_router_list_tools_returns_arc() {
-    let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
     router.refresh_tools().await;
+    assert_eq!(heard(&mut rx), Vec::new());
 
-    let tools1 = router.list_tools();
-    let tools2 = router.list_tools();
-    // Both should point to the same allocation (Arc)
-    assert!(Arc::ptr_eq(&tools1, &tools2));
+    state.set_resources(&["memory://a", "memory://b"]);
+    router.refresh_tools().await;
+    assert_eq!(
+        heard(&mut rx),
+        vec![ProtocolNotification::ResourceListChanged]
+    );
+
+    *state.templates.lock().unwrap() = vec!["memory://{id}".to_string()];
+    router.refresh_tools().await;
+    assert_eq!(
+        heard(&mut rx),
+        vec![ProtocolNotification::ResourceListChanged]
+    );
+
+    router.server_manager.stop_server("mock").await;
+    router.refresh_tools().await;
+    assert_eq!(
+        heard(&mut rx),
+        vec![ProtocolNotification::ResourceListChanged]
+    );
+}
+
+/// Turning Plug's own search tool off changes what a Bridge client is
+/// listed though no upstream tool changed.
+#[tokio::test]
+async fn hiding_a_meta_tool_tells_clients_their_tool_list_changed() {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(
+        sm,
+        RouterConfig {
+            lazy_tools: LazyToolsConfig {
+                mode: crate::types::LazyToolSetting::Bridge,
+                ..LazyToolsConfig::default()
+            },
+            ..RouterConfig::default()
+        },
+    ));
+    router.refresh_tools().await;
+    let listed = || {
+        router
+            .list_tools_for_client_session(ClientType::Unknown, None, None)
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(listed(), vec!["plug__search_tools".to_string()]);
+    let mut rx = router.subscribe_notifications();
+
+    router.set_disabled_tools(&["plug__search_tools".to_string()]);
+    router.refresh_tools().await;
+    assert_eq!(listed(), Vec::<String>::new());
+    assert_eq!(
+        rx.try_recv().ok(),
+        Some(ProtocolNotification::ToolListChanged)
+    );
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]
@@ -397,26 +409,6 @@ fn priority_sort_orders_correctly() {
         Arc::new(serde_json::Map::new()),
     );
     assert_eq!(priority_sort(&d, &a, &priority), std::cmp::Ordering::Less);
-}
-
-#[test]
-fn disabled_tool_patterns_support_exact_and_wildcard_matches() {
-    assert!(is_disabled_tool(
-        &["slack__search_messages".into()],
-        "Slack__search_messages"
-    ));
-    assert!(is_disabled_tool(
-        &["slack__*".into()],
-        "Slack__search_messages"
-    ));
-    assert!(is_disabled_tool(
-        &["*search*".into()],
-        "Slack__search_messages"
-    ));
-    assert!(!is_disabled_tool(
-        &["gmail__*".into()],
-        "Slack__search_messages"
-    ));
 }
 
 #[test]
@@ -546,13 +538,16 @@ fn apply_canonical_tool_title_creates_annotation_title_when_missing() {
     );
 }
 
+/// Every client in `TOOL_LIMITS` is served at most its ceiling, with no
+/// other edit, and only while `tool_filter_enabled` is on.
 #[test]
-fn list_tools_for_client_returns_correct_counts() {
-    let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
-
-    // Manually set up a snapshot with 150 tools
-    let tools: Vec<Tool> = (0..150)
+fn every_client_ceiling_is_enforced_while_filtering_is_on() {
+    let most = crate::clients::TOOL_LIMITS
+        .iter()
+        .map(|entry| entry.limit)
+        .max()
+        .expect("a ceiling");
+    let tools: Vec<Tool> = (0..most + 1)
         .map(|i| {
             Tool::new(
                 Cow::Owned(format!("tool_{i:03}")),
@@ -562,107 +557,39 @@ fn list_tools_for_client_returns_correct_counts() {
         })
         .collect();
 
-    let tools_devin = Arc::new(tools.iter().take(100).cloned().collect::<Vec<_>>());
-    let tools_copilot = Arc::new(tools.iter().take(128).cloned().collect::<Vec<_>>());
-    let tools_all = Arc::new(tools);
-
-    router.cache.store(Arc::new(
-        RouterSnapshot {
-            routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            tools_all,
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin,
-            tools_copilot,
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
-        }
-        .with_indexes(),
-    ));
-
-    assert_eq!(router.list_tools_for_client(ClientType::Devin).len(), 100);
-    assert_eq!(
-        router
-            .list_tools_for_client(ClientType::VSCodeCopilot)
-            .len(),
-        128
-    );
+    let router = ToolRouter::new(Arc::new(ServerManager::new()), RouterConfig::default());
+    store_plain_tools_snapshot(&router, tools.clone());
+    for entry in crate::clients::TOOL_LIMITS {
+        assert_eq!(
+            router.list_tools_for_client(entry.client).len(),
+            entry.limit,
+            "{}",
+            entry.client
+        );
+    }
     assert_eq!(
         router.list_tools_for_client(ClientType::ClaudeCode).len(),
-        150
+        most + 1
     );
-    assert_eq!(router.list_tools_for_client(ClientType::Cursor).len(), 150);
-}
 
-#[test]
-fn list_tools_for_client_ignores_empty_filtered_views_when_filtering_disabled() {
-    // Pins the invariant the refresh_tools() filtered-view gate depends on:
-    // when `tool_filter_enabled` is false, `refresh_tools()` no longer
-    // populates `tools_devin` / `tools_copilot` (they're left empty).
-    // `list_tools_for_client_session` must still return the FULL catalog for
-    // Devin/Copilot in that case — it has to return `tools_all` early
-    // before ever reading those two fields.
-    let sm = Arc::new(ServerManager::new());
-    let config = RouterConfig {
-        tool_filter_enabled: false,
-        ..test_router_config()
-    };
-    let router = ToolRouter::new(sm, config);
-
-    let tools: Vec<Tool> = (0..150)
-        .map(|i| {
-            Tool::new(
-                Cow::Owned(format!("tool_{i:03}")),
-                Cow::Owned(format!("Tool {i}")),
-                Arc::new(serde_json::Map::new()),
-            )
-        })
-        .collect();
-
-    // Simulate what refresh_tools() now produces when filtering is
-    // disabled: tools_devin/tools_copilot stay empty.
-    router.cache.store(Arc::new(
-        RouterSnapshot {
-            routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            tools_all: Arc::new(tools),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
-        }
-        .with_indexes(),
-    ));
-
-    assert_eq!(
-        router
-            .list_tools_for_client_session(ClientType::Devin, None, None)
-            .len(),
-        150,
-        "Devin must still see the full catalog, not the empty pre-cached view"
+    let unfiltered = ToolRouter::new(
+        Arc::new(ServerManager::new()),
+        RouterConfig {
+            tool_filter_enabled: false,
+            ..RouterConfig::default()
+        },
     );
-    assert_eq!(
-        router
-            .list_tools_for_client_session(ClientType::VSCodeCopilot, None, None)
-            .len(),
-        150,
-        "Copilot must still see the full catalog, not the empty pre-cached view"
-    );
+    store_plain_tools_snapshot(&unfiltered, tools);
+    for entry in crate::clients::TOOL_LIMITS {
+        assert_eq!(
+            unfiltered
+                .list_tools_for_client_session(entry.client, None, None)
+                .len(),
+            most + 1,
+            "{}",
+            entry.client
+        );
+    }
 }
 
 fn store_plain_tools_snapshot(router: &ToolRouter, tools: Vec<Tool>) {
@@ -677,23 +604,64 @@ fn store_plain_tools_snapshot(router: &ToolRouter, tools: Vec<Tool>) {
     router.cache.store(Arc::new(
         RouterSnapshot {
             routes,
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
             tools_all: Arc::new(tools),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
+}
+
+/// A start or reload that finds a server needs sign-in tells clients, as
+/// recovery and the token refresh loop do. A start that fails otherwise
+/// does not.
+#[test]
+fn a_start_that_needs_sign_in_tells_clients() {
+    let router = ToolRouter::linked(RouterConfig::default());
+    let mut rx = router.subscribe_notifications();
+    let config = crate::config::ServerConfig {
+        transport: crate::config::TransportType::Http,
+        url: Some("https://example.com/mcp".to_string()),
+        auth: Some("oauth".to_string()),
+        oauth_client_id: Some("test-client".to_string()),
+        ..Default::default()
+    };
+
+    router.server_manager.record_start_failure(
+        "notion",
+        &config,
+        &anyhow::anyhow!("connection refused"),
+    );
+    assert!(rx.try_recv().is_err());
+
+    router.server_manager.record_start_failure(
+        "notion",
+        &config,
+        &anyhow::anyhow!(
+            "AuthRequired(AuthRequiredError {{ www_authenticate_header: \"Bearer\" }})"
+        ),
+    );
+    assert_eq!(
+        rx.try_recv().ok(),
+        Some(ProtocolNotification::AuthStateChanged {
+            server_id: Arc::from("notion"),
+            new_state: crate::types::ServerHealth::AuthRequired,
+        })
+    );
+}
+
+/// The app keeps its tool list while the revision matches the one it read,
+/// so a daemon that publishes as often as the one before it must not land
+/// on that one's number.
+#[tokio::test]
+async fn catalog_revisions_of_two_daemons_never_meet() {
+    let revisions = || async {
+        let router = ToolRouter::new(Arc::new(ServerManager::new()), RouterConfig::default());
+        let before = router.catalog_revision();
+        router.refresh_tools().await;
+        assert_ne!(router.catalog_revision(), before);
+        router.catalog_revision()
+    };
+    assert_ne!(revisions().await, revisions().await);
 }
 
 #[test]
@@ -713,7 +681,7 @@ fn standard_client_sees_full_catalog_when_filtering_disabled_and_unknown_is_lazy
     let config = RouterConfig {
         tool_filter_enabled: false,
         lazy_tools,
-        ..test_router_config()
+        ..RouterConfig::default()
     };
     let router = ToolRouter::new(sm, config);
     let tools: Vec<Tool> = (0..3)
@@ -748,7 +716,7 @@ fn standard_client_sees_full_catalog_when_filtering_disabled_and_unknown_is_lazy
 #[test]
 fn search_tools_returns_matches() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     // Set up a snapshot with named tools
     let tools = vec![
@@ -787,19 +755,7 @@ fn search_tools_returns_matches() {
         RouterSnapshot {
             routes,
             tools_all: Arc::new(tools),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -831,7 +787,7 @@ fn search_tools_returns_matches() {
 #[test]
 fn search_index_scores_match_direct_scoring_and_follow_the_snapshot() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     let mut titled = Tool::new(
         Cow::Borrowed("Git_Hub__Create-PR"),
         Cow::Borrowed("Open a Pull Request on GitHub"),
@@ -905,8 +861,10 @@ fn search_index_scores_match_direct_scoring_and_follow_the_snapshot() {
 #[test]
 fn meta_tool_mode_lists_only_meta_tools() {
     let sm = Arc::new(ServerManager::new());
-    let mut config = test_router_config();
-    config.meta_tool_mode = true;
+    let config = RouterConfig {
+        meta_tool_mode: true,
+        ..Default::default()
+    };
     let router = ToolRouter::new(sm, config);
 
     let tools = vec![Tool::new(
@@ -925,19 +883,7 @@ fn meta_tool_mode_lists_only_meta_tools() {
         RouterSnapshot {
             routes,
             tools_all: Arc::new(tools),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -958,29 +904,16 @@ fn meta_tool_mode_lists_only_meta_tools() {
 #[test]
 fn client_lazy_bridge_policy_lists_meta_tools_for_opencode() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     router.cache.store(Arc::new(
         RouterSnapshot {
-            routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
             tools_all: Arc::new(vec![Tool::new(
                 Cow::Borrowed("git__commit"),
                 Cow::Borrowed("Create a git commit"),
                 Arc::new(serde_json::Map::new()),
             )]),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -1001,7 +934,7 @@ fn client_lazy_bridge_policy_lists_meta_tools_for_opencode() {
 #[test]
 fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let mut routes = HashMap::new();
     routes.insert(
@@ -1016,24 +949,12 @@ fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
                 Cow::Borrowed("Create a git commit"),
                 Arc::new(serde_json::Map::new()),
             )]),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
 
-    let session_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "client-a");
+    let session_key = DownstreamTransport::Ipc.lazy_session_key("client-a");
     assert_eq!(
         router
             .list_tools_for_client_session(ClientType::OpenCode, Some(&session_key), None)
@@ -1043,11 +964,8 @@ fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
 
     let mut args = serde_json::Map::new();
     args.insert("query".to_string(), serde_json::json!("commit"));
-    let downstream = DownstreamCallContext::stdio_for_client(
-        "client-a",
-        RequestId::Number(1),
-        ClientType::OpenCode,
-    );
+    let downstream =
+        DownstreamCallContext::ipc("client-a", RequestId::Number(1), ClientType::OpenCode, None);
     router
         .handle_search_tools(Some(args), Some(&downstream))
         .expect("search and load tool");
@@ -1064,7 +982,7 @@ fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
 #[test]
 fn bridge_search_keeps_session_working_set_bounded() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let mut routes = HashMap::new();
     let tools = (0..(BRIDGE_WORKING_SET_MAX_TOOLS + 5))
@@ -1082,28 +1000,13 @@ fn bridge_search_keeps_session_working_set_bounded() {
         RouterSnapshot {
             routes,
             tools_all: Arc::new(tools),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
 
-    let downstream = DownstreamCallContext::stdio_for_client(
-        "client-a",
-        RequestId::Number(1),
-        ClientType::OpenCode,
-    );
+    let downstream =
+        DownstreamCallContext::ipc("client-a", RequestId::Number(1), ClientType::OpenCode, None);
     for index in 0..(BRIDGE_WORKING_SET_MAX_TOOLS + 5) {
         let mut args = serde_json::Map::new();
         args.insert(
@@ -1116,7 +1019,7 @@ fn bridge_search_keeps_session_working_set_bounded() {
             .expect("search and load tool");
     }
 
-    let session_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "client-a");
+    let session_key = DownstreamTransport::Ipc.lazy_session_key("client-a");
     let visible =
         router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key), None);
     let names = visible
@@ -1134,7 +1037,7 @@ fn bridge_search_keeps_session_working_set_bounded() {
 #[test]
 fn bridge_search_publish_tool_list_changed_for_newly_loaded_matches() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let mut routes = HashMap::new();
     routes.insert(
@@ -1149,29 +1052,14 @@ fn bridge_search_publish_tool_list_changed_for_newly_loaded_matches() {
                 Cow::Borrowed("Create a git commit"),
                 Arc::new(serde_json::Map::new()),
             )]),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
 
     let mut notifications = router.subscribe_notifications();
-    let downstream = DownstreamCallContext::stdio_for_client(
-        "client-a",
-        RequestId::Number(1),
-        ClientType::OpenCode,
-    );
+    let downstream =
+        DownstreamCallContext::ipc("client-a", RequestId::Number(1), ClientType::OpenCode, None);
     let mut args = serde_json::Map::new();
     args.insert("query".to_string(), serde_json::json!("commit"));
     router
@@ -1180,7 +1068,7 @@ fn bridge_search_publish_tool_list_changed_for_newly_loaded_matches() {
     assert_eq!(
         notifications.try_recv().expect("search notification"),
         ProtocolNotification::ToolListChangedFor {
-            target: NotificationTarget::Stdio {
+            target: NotificationTarget::Ipc {
                 client_id: Arc::from("client-a"),
             },
         }
@@ -1200,7 +1088,7 @@ fn bridge_search_publish_tool_list_changed_for_newly_loaded_matches() {
 #[tokio::test]
 async fn bridge_session_rejects_unloaded_direct_tool_call() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let mut routes = HashMap::new();
     routes.insert(
@@ -1215,24 +1103,12 @@ async fn bridge_session_rejects_unloaded_direct_tool_call() {
                 Cow::Borrowed("Create a git commit"),
                 Arc::new(serde_json::Map::new()),
             )]),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
 
-    let session_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "client-a");
+    let session_key = DownstreamTransport::Ipc.lazy_session_key("client-a");
     router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key), None);
 
     let err = router
@@ -1240,10 +1116,11 @@ async fn bridge_session_rejects_unloaded_direct_tool_call() {
             "git__commit",
             None,
             None,
-            Some(DownstreamCallContext::stdio_for_client(
+            Some(DownstreamCallContext::ipc(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
+                None,
             )),
         )
         .await
@@ -1260,10 +1137,11 @@ async fn bridge_session_rejects_unloaded_direct_tool_call_before_tools_list() {
             "git__commit",
             None,
             None,
-            Some(DownstreamCallContext::stdio_for_client(
+            Some(DownstreamCallContext::ipc(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
+                None,
             )),
         )
         .await
@@ -1283,10 +1161,11 @@ async fn bridge_session_rejects_unloaded_task_tool_call() {
             None,
             TaskOwner::new(Arc::<str>::from("stdio:client-a")),
             None,
-            Some(DownstreamCallContext::stdio_for_client(
+            Some(DownstreamCallContext::ipc(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
+                None,
             )),
         )
         .await
@@ -1308,10 +1187,11 @@ async fn bridge_session_rejects_task_wrapped_search_meta_tool() {
             None,
             TaskOwner::new(Arc::<str>::from("stdio:client-a")),
             None,
-            Some(DownstreamCallContext::stdio_for_client(
+            Some(DownstreamCallContext::ipc(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
+                None,
             )),
         )
         .await
@@ -1331,10 +1211,11 @@ async fn bridge_session_rejects_invoke_wrapper_as_unknown_tool() {
             "plug__invoke_tool",
             Some(args),
             None,
-            Some(DownstreamCallContext::stdio_for_client(
+            Some(DownstreamCallContext::ipc(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
+                None,
             )),
         )
         .await
@@ -1346,9 +1227,9 @@ async fn bridge_session_rejects_invoke_wrapper_as_unknown_tool() {
 #[tokio::test]
 async fn disabled_bridge_search_tool_is_not_visible_or_callable() {
     let sm = Arc::new(ServerManager::new());
-    let mut config = test_router_config();
-    config.disabled_tools = vec!["plug__search_tools".to_string()];
-    let router = ToolRouter::new(sm, config);
+    let router = ToolRouter::new(sm, RouterConfig::default());
+    router.set_disabled_tools(&["plug__search_tools".to_string()]);
+    router.refresh_tools().await;
 
     assert!(
         router
@@ -1364,10 +1245,11 @@ async fn disabled_bridge_search_tool_is_not_visible_or_callable() {
             "plug__search_tools",
             Some(args),
             None,
-            Some(DownstreamCallContext::stdio_for_client(
+            Some(DownstreamCallContext::ipc(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
+                None,
             )),
         )
         .await
@@ -1378,7 +1260,7 @@ async fn disabled_bridge_search_tool_is_not_visible_or_callable() {
 #[test]
 fn synthesized_capabilities_include_tasks_when_tools_exist() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let mut routes = HashMap::new();
     routes.insert(
@@ -1394,24 +1276,12 @@ fn synthesized_capabilities_include_tasks_when_tools_exist() {
         RouterSnapshot {
             routes,
             tools_all: Arc::new(tools),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
 
-    let caps = router.synthesized_capabilities();
+    let caps = router.synthesized_capabilities_for_client(ClientType::Unknown);
     assert!(crate::protocol::legacy_tasks_capability(&caps));
 }
 
@@ -1443,59 +1313,59 @@ fn detect_tool_definition_drift_reports_changed_tools_only() {
     );
 }
 
-// -----------------------------------------------------------------------
-// Session error classification tests
-// -----------------------------------------------------------------------
-
 #[test]
-fn is_session_error_transport_closed() {
+fn only_a_lost_connection_is_a_lost_session_and_only_a_refused_one_proves_the_call_never_arrived() {
     use rmcp::service::ServiceError;
-    assert!(is_session_error(&ServiceError::TransportClosed));
-}
-
-#[test]
-fn a_closed_connection_does_not_prove_the_call_never_arrived() {
-    use rmcp::service::ServiceError;
-    // The server may have taken the call before the connection closed, so
-    // this alone never licenses sending a tool call a second time.
-    assert!(!never_reached_server(&ServiceError::TransportClosed));
-}
-
-#[test]
-fn is_session_error_mcp_error_not_session() {
-    use rmcp::service::ServiceError;
-    // Application-level MCP error should NOT trigger reconnect
-    let mcp_err = McpError::internal_error("tool failed".to_string(), None);
-    assert!(!is_session_error(&ServiceError::McpError(mcp_err)));
-}
-
-#[test]
-fn is_session_error_timeout_not_session() {
-    use rmcp::service::ServiceError;
-    // Timeouts should NOT trigger reconnect
-    assert!(!is_session_error(&ServiceError::Timeout {
-        timeout: Duration::from_secs(30),
-    }));
-}
-
-#[test]
-fn is_session_error_cancelled_not_session() {
-    use rmcp::service::ServiceError;
-    assert!(!is_session_error(&ServiceError::Cancelled {
-        reason: Some("test".to_string()),
-    }));
-}
-
-#[test]
-fn is_session_error_unexpected_response_not_session() {
-    use rmcp::service::ServiceError;
-    assert!(!is_session_error(&ServiceError::UnexpectedResponse));
+    let send_failure = |message: &str| {
+        ServiceError::TransportSend(rmcp::transport::DynamicTransportError::from_parts(
+            "test",
+            std::any::TypeId::of::<()>(),
+            message.to_string().into(),
+        ))
+    };
+    let cases = [
+        (
+            send_failure("HTTP 404: Session not found"),
+            Some(LostSession::NeverArrived),
+        ),
+        (
+            send_failure("Connection refused (os error 61)"),
+            Some(LostSession::NeverArrived),
+        ),
+        (
+            send_failure("connection reset by peer"),
+            Some(LostSession::MayHaveArrived),
+        ),
+        (
+            send_failure("Broken pipe"),
+            Some(LostSession::MayHaveArrived),
+        ),
+        (
+            ServiceError::TransportClosed,
+            Some(LostSession::MayHaveArrived),
+        ),
+        (send_failure("invalid header value"), None),
+        (
+            ServiceError::McpError(McpError::internal_error("tool failed", None)),
+            None,
+        ),
+        (
+            ServiceError::Timeout {
+                timeout: Duration::from_secs(30),
+            },
+            None,
+        ),
+        (ServiceError::UnexpectedResponse, None),
+    ];
+    for (error, expected) in cases {
+        assert_eq!(LostSession::of(&error), expected, "{error}");
+    }
 }
 
 #[test]
 fn case_insensitive_route_lookup() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let mut routes = HashMap::new();
     routes.insert(
@@ -1509,20 +1379,7 @@ fn case_insensitive_route_lookup() {
     router.cache.store(Arc::new(
         RouterSnapshot {
             routes,
-            tools_all: Arc::new(Vec::new()),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -1539,15 +1396,18 @@ fn case_insensitive_route_lookup() {
 #[tokio::test(start_paused = true)]
 async fn call_tool_times_out_waiting_for_semaphore() {
     let server_manager = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(server_manager.clone(), test_router_config());
+    let router = ToolRouter::new(server_manager.clone(), RouterConfig::default());
 
     let upstream =
         connect_subscribable_upstream("busy-server", SubscribableUpstreamState::new(&[])).await;
     server_manager.replace_server("busy-server", upstream).await;
 
-    server_manager.semaphores.insert(
-        "busy-server".to_string(),
-        Arc::new(tokio::sync::Semaphore::new(0)),
+    server_manager.apply_live_settings(
+        "busy-server",
+        &crate::config::ServerConfig {
+            max_concurrent: 0,
+            ..Default::default()
+        },
     );
 
     let mut routes = HashMap::new();
@@ -1558,20 +1418,7 @@ async fn call_tool_times_out_waiting_for_semaphore() {
     router.cache.store(Arc::new(
         RouterSnapshot {
             routes,
-            tools_all: Arc::new(Vec::new()),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
@@ -1593,7 +1440,7 @@ async fn queued_tool_call_resolves_reconnected_upstream_after_permit() {
     let server_manager = Arc::new(ServerManager::new());
     let router = Arc::new(ToolRouter::new(
         Arc::clone(&server_manager),
-        test_router_config(),
+        RouterConfig::default(),
     ));
     let old_state = SubscribableUpstreamState::new(&[]);
     let old_upstream = connect_subscribable_upstream("queued-server", Arc::clone(&old_state)).await;
@@ -1601,10 +1448,16 @@ async fn queued_tool_call_resolves_reconnected_upstream_after_permit() {
         .replace_server("queued-server", old_upstream)
         .await;
 
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
-    server_manager
-        .semaphores
-        .insert("queued-server".to_string(), Arc::clone(&semaphore));
+    server_manager.apply_live_settings(
+        "queued-server",
+        &crate::config::ServerConfig {
+            max_concurrent: 0,
+            ..Default::default()
+        },
+    );
+    let semaphore = server_manager
+        .call_slots("queued-server")
+        .expect("queued-server has slots");
     publish_tool_route_snapshot(&router, "Queued__tool", "queued-server");
 
     let call_router = Arc::clone(&router);
@@ -1614,10 +1467,11 @@ async fn queued_tool_call_resolves_reconnected_upstream_after_permit() {
                 "Queued__tool",
                 None,
                 None,
-                Some(DownstreamCallContext::stdio_for_client(
+                Some(DownstreamCallContext::ipc(
                     "queued-client",
                     RequestId::Number(1),
                     ClientType::Unknown,
+                    None,
                 )),
             )
             .await
@@ -1652,7 +1506,7 @@ async fn queued_tool_call_resolves_reconnected_upstream_after_permit() {
 #[test]
 fn list_tools_page_for_client_uses_cursor_pagination() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     let tools: Vec<Tool> = (0..750)
         .map(|index| {
             Tool::new(
@@ -1664,58 +1518,72 @@ fn list_tools_page_for_client_uses_cursor_pagination() {
         .collect();
     router.cache.store(Arc::new(
         RouterSnapshot {
-            routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            tools_devin: Arc::new(tools.iter().take(100).cloned().collect()),
-            tools_copilot: Arc::new(tools.iter().take(128).cloned().collect()),
             tools_all: Arc::new(tools),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         }
         .with_indexes(),
     ));
 
-    let first = router.list_tools_page_for_client(ClientType::Unknown, Some(Default::default()));
+    let first = router
+        .list_tools_page_for_client_session(
+            ClientType::Unknown,
+            None,
+            None,
+            Some(Default::default()),
+        )
+        .unwrap();
     assert_eq!(first.tools.len(), 500);
     assert_eq!(first.next_cursor.as_deref(), Some("500"));
 
     let mut second_request = PaginatedRequestParams::default();
     second_request.cursor = first.next_cursor;
-    let second = router.list_tools_page_for_client(ClientType::Unknown, Some(second_request));
+    let second = router
+        .list_tools_page_for_client_session(ClientType::Unknown, None, None, Some(second_request))
+        .unwrap();
     assert_eq!(second.tools.len(), 250);
     assert!(second.next_cursor.is_none());
 }
 
 #[test]
 fn paginated_result_returns_mid_cursor_page_from_borrowed_slice() {
-    // `paginated_result` now takes `&[T]` instead of an owned `Vec<T>`; this
-    // pins that a mid-cursor page sliced from a borrowed input still returns
-    // the same items and next_cursor as the old owned-Vec implementation.
     let items: Vec<i32> = (0..750).collect();
 
     let mut request = PaginatedRequestParams::default();
     request.cursor = Some("500".to_string());
 
-    let (page, next_cursor) = paginated_result(&items, Some(request), |page, next_cursor| {
-        (page, next_cursor)
-    });
+    let (page, next_cursor) =
+        paginated_result("tools/list", &items, Some(request), |page, next_cursor| {
+            (page, next_cursor)
+        })
+        .unwrap();
 
     assert_eq!(page, items[500..750].to_vec());
     assert!(next_cursor.is_none());
 }
 
+/// A cursor Plug never gave out is refused, so a client that follows it is
+/// not sent back to the first page forever. One past the end, left by items
+/// that went away between pages, is the last page.
+#[test]
+fn a_page_for_an_unknown_cursor_is_refused_and_one_past_the_end_is_empty() {
+    let items: Vec<i32> = (0..10).collect();
+    let page = |cursor: &str| {
+        let mut request = PaginatedRequestParams::default();
+        request.cursor = Some(cursor.to_string());
+        paginated_result("tools/list", &items, Some(request), |page, next| {
+            (page, next)
+        })
+    };
+
+    let error = page("not-a-cursor").unwrap_err();
+    assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert_eq!(page("500").unwrap(), (Vec::new(), None));
+}
+
 #[tokio::test]
 async fn route_upstream_progress_publishes_targeted_notification() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     let mut rx = router.subscribe_notifications();
     let progress_token = ProgressToken(NumberOrString::String(Arc::from("progress-1")));
 
@@ -1723,9 +1591,11 @@ async fn route_upstream_progress_publishes_targeted_notification() {
         .register_active_call(
             42,
             ActiveCallRecord {
-                downstream: DownstreamCallContext::stdio(
+                downstream: DownstreamCallContext::ipc(
                     Arc::from("client-1"),
                     RequestId::from(NumberOrString::Number(1)),
+                    crate::types::ClientType::Unknown,
+                    None,
                 ),
                 upstream_server_id: "upstream".to_string(),
                 upstream_request_id: None,
@@ -1750,7 +1620,7 @@ async fn route_upstream_progress_publishes_targeted_notification() {
         ProtocolNotification::Progress { target, params } => {
             assert_eq!(
                 target,
-                NotificationTarget::Stdio {
+                NotificationTarget::Ipc {
                     client_id: Arc::from("client-1"),
                 }
             );
@@ -1764,21 +1634,21 @@ async fn route_upstream_progress_publishes_targeted_notification() {
 #[test]
 fn synthesized_capabilities_advertises_subscribe_when_upstream_supports_it() {
     let sm = Arc::new(ServerManager::new());
-    let config = test_router_config();
+    let config = RouterConfig::default();
     let router = ToolRouter::new(sm, config);
 
     // No upstreams → no resources capability at all
-    let caps = router.synthesized_capabilities();
+    let caps = router.synthesized_capabilities_for_client(ClientType::Unknown);
     assert!(caps.resources.is_none());
 }
 
 #[test]
 fn resource_subscription_registry_lifecycle() {
     let sm = Arc::new(ServerManager::new());
-    let config = test_router_config();
+    let config = RouterConfig::default();
     let router = ToolRouter::new(sm, config);
 
-    let target = NotificationTarget::Stdio {
+    let target = NotificationTarget::Ipc {
         client_id: Arc::from("test-client"),
     };
 
@@ -1786,14 +1656,19 @@ fn resource_subscription_registry_lifecycle() {
     assert_eq!(router.resource_subscriptions.len(), 0);
 
     // Insert directly (bypassing upstream check for unit test)
-    router
-        .resource_subscriptions
-        .insert_active_for_test("file:///test", target.clone());
+    router.resource_subscriptions.insert_active_for_test(
+        "file:///test",
+        Some("files"),
+        target.clone(),
+    );
     assert_eq!(router.resource_subscriptions.len(), 1);
 
     // Route notification should publish to subscriber
     let mut rx = router.subscribe_notifications();
-    router.route_upstream_resource_updated(ResourceUpdatedNotificationParam::new("file:///test"));
+    router.route_upstream_resource_updated(
+        "files",
+        ResourceUpdatedNotificationParam::new("file:///test"),
+    );
 
     match rx.try_recv() {
         Ok(ProtocolNotification::ResourceUpdated {
@@ -1806,39 +1681,25 @@ fn resource_subscription_registry_lifecycle() {
     }
 
     // Route notification for unsubscribed URI → no notification
-    router.route_upstream_resource_updated(ResourceUpdatedNotificationParam::new("file:///other"));
+    router.route_upstream_resource_updated(
+        "files",
+        ResourceUpdatedNotificationParam::new("file:///other"),
+    );
     assert!(rx.try_recv().is_err());
 }
 
 #[test]
 fn synthesized_capabilities_no_completions_without_upstream() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
-    let caps = router.synthesized_capabilities();
+    let router = ToolRouter::new(sm, RouterConfig::default());
+    let caps = router.synthesized_capabilities_for_client(ClientType::Unknown);
     assert!(caps.completions.is_none());
-}
-
-#[test]
-fn complete_request_params_serde_roundtrip() {
-    let params = CompleteRequestParams::new(
-        Reference::for_prompt("test-prompt"),
-        ArgumentInfo::new("arg1", "partial"),
-    );
-
-    let json = serde_json::to_value(&params).unwrap();
-    let deserialized: CompleteRequestParams = serde_json::from_value(json).unwrap();
-    assert_eq!(deserialized.argument.name, "arg1");
-    assert_eq!(deserialized.argument.value, "partial");
-    match &deserialized.r#ref {
-        Reference::Prompt(p) => assert_eq!(p.name, "test-prompt"),
-        other => panic!("expected Prompt reference, got {other:?}"),
-    }
 }
 
 #[test]
 fn route_upstream_logging_message_publishes_with_server_prefix() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     // Default level is Warning, so send a warning-level message
     let mut rx = router.subscribe_logging();
 
@@ -1863,7 +1724,7 @@ fn route_upstream_logging_message_publishes_with_server_prefix() {
 #[test]
 fn route_upstream_logging_message_filters_below_threshold() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     let mut rx = router.subscribe_logging();
 
     // Default level is Warning — debug should be filtered
@@ -1878,7 +1739,7 @@ fn route_upstream_logging_message_filters_below_threshold() {
 #[test]
 fn set_client_log_level_changes_effective_level() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     // Default is Warning
     assert_eq!(router.log_level(), LoggingLevel::Warning);
@@ -1903,7 +1764,7 @@ fn set_client_log_level_changes_effective_level() {
 #[test]
 fn route_upstream_logging_respects_changed_level() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     let mut rx = router.subscribe_logging();
 
     // Lower threshold to Debug
@@ -1927,7 +1788,7 @@ fn route_upstream_logging_respects_changed_level() {
 #[test]
 fn logging_channel_is_separate_from_control_channel() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     let mut control_rx = router.subscribe_notifications();
     let mut logging_rx = router.subscribe_logging();
 
@@ -1968,16 +1829,16 @@ fn logging_channel_is_separate_from_control_channel() {
 #[test]
 fn synthesized_capabilities_includes_logging_when_upstream_supports_it() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     // Without any upstream servers, no logging capability
-    let caps = router.synthesized_capabilities();
+    let caps = router.synthesized_capabilities_for_client(ClientType::Unknown);
     assert!(caps.logging.is_none());
 }
 
 // ── Roots cache tests ──────────────────────────────────────────────
 
-/// Helper to construct `Root` (which is `#[non_exhaustive]` in rmcp 1.1).
+/// Helper to construct `Root`, which rmcp marks `#[non_exhaustive]`.
 fn make_root(uri: &str, name: Option<&str>) -> Root {
     serde_json::from_value(serde_json::json!({
         "uri": uri,
@@ -1989,7 +1850,7 @@ fn make_root(uri: &str, name: Option<&str>) -> Root {
 #[test]
 fn list_roots_union_empty_when_no_clients() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let result = router.list_roots_union();
     assert!(result.roots.is_empty());
@@ -1998,9 +1859,9 @@ fn list_roots_union_empty_when_no_clients() {
 #[test]
 fn set_roots_for_target_returns_true_on_first_insert() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
-    let target = NotificationTarget::Stdio {
+    let target = NotificationTarget::Ipc {
         client_id: Arc::from("client-1"),
     };
     let roots = vec![make_root("file:///project-a", Some("Project A"))];
@@ -2011,9 +1872,9 @@ fn set_roots_for_target_returns_true_on_first_insert() {
 #[test]
 fn set_roots_for_target_returns_false_when_unchanged() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
-    let target = NotificationTarget::Stdio {
+    let target = NotificationTarget::Ipc {
         client_id: Arc::from("client-1"),
     };
     let roots = vec![make_root("file:///project-a", Some("Project A"))];
@@ -2026,9 +1887,9 @@ fn set_roots_for_target_returns_false_when_unchanged() {
 #[test]
 fn set_roots_for_target_returns_true_when_changed() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
-    let target = NotificationTarget::Stdio {
+    let target = NotificationTarget::Ipc {
         client_id: Arc::from("client-1"),
     };
     let roots_a = vec![make_root("file:///project-a", Some("Project A"))];
@@ -2041,9 +1902,9 @@ fn set_roots_for_target_returns_true_when_changed() {
 #[test]
 fn clear_roots_for_target_returns_true_when_existed() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
-    let target = NotificationTarget::Stdio {
+    let target = NotificationTarget::Ipc {
         client_id: Arc::from("client-1"),
     };
     let roots = vec![make_root("file:///project-a", None)];
@@ -2055,9 +1916,9 @@ fn clear_roots_for_target_returns_true_when_existed() {
 #[test]
 fn clear_roots_for_target_returns_false_when_not_existed() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
-    let target = NotificationTarget::Stdio {
+    let target = NotificationTarget::Ipc {
         client_id: Arc::from("client-nonexistent"),
     };
     assert!(!router.clear_roots_for_target(&target));
@@ -2066,10 +1927,10 @@ fn clear_roots_for_target_returns_false_when_not_existed() {
 #[test]
 fn list_roots_union_deduplicates_by_uri() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     // Client 1 has roots A and B
-    let target1 = NotificationTarget::Stdio {
+    let target1 = NotificationTarget::Ipc {
         client_id: Arc::from("client-1"),
     };
     router.set_roots_for_target(
@@ -2105,9 +1966,9 @@ fn list_roots_union_deduplicates_by_uri() {
 #[test]
 fn list_roots_union_is_sorted_by_uri() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
-    let target = NotificationTarget::Stdio {
+    let target = NotificationTarget::Ipc {
         client_id: Arc::from("client-1"),
     };
     router.set_roots_for_target(
@@ -2134,9 +1995,9 @@ fn list_roots_union_is_sorted_by_uri() {
 #[test]
 fn clear_roots_removes_from_union() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
-    let target1 = NotificationTarget::Stdio {
+    let target1 = NotificationTarget::Ipc {
         client_id: Arc::from("client-1"),
     };
     let target2 = NotificationTarget::Http {
@@ -2160,7 +2021,7 @@ fn clear_roots_removes_from_union() {
 #[test]
 fn test_upstream_request_lookup_requires_active_call() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let result = router.active_call_for_upstream_request(
         "unknown-server",
@@ -2178,15 +2039,17 @@ fn test_upstream_request_lookup_requires_active_call() {
 #[test]
 fn test_upstream_request_lookup_uses_request_id_not_server_uniqueness() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     router
         .register_active_call(
             1,
             ActiveCallRecord {
-                downstream: DownstreamCallContext::stdio(
+                downstream: DownstreamCallContext::ipc(
                     Arc::from("client-a"),
                     RequestId::from(NumberOrString::Number(1)),
+                    crate::types::ClientType::Unknown,
+                    None,
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
@@ -2203,6 +2066,7 @@ fn test_upstream_request_lookup_uses_request_id_not_server_uniqueness() {
                 downstream: DownstreamCallContext::http(
                     Arc::from("session-b"),
                     RequestId::from(NumberOrString::Number(2)),
+                    crate::types::ClientType::Unknown,
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: Some(RequestId::from(NumberOrString::Number(202))),
@@ -2227,16 +2091,18 @@ fn test_upstream_request_lookup_uses_request_id_not_server_uniqueness() {
 #[test]
 fn test_route_upstream_progress_restores_downstream_token() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(sm, test_router_config()));
+    let router = Arc::new(ToolRouter::new(sm, RouterConfig::default()));
     let mut rx = router.subscribe_notifications();
 
     router
         .register_active_call(
             1,
             ActiveCallRecord {
-                downstream: DownstreamCallContext::stdio(
+                downstream: DownstreamCallContext::ipc(
                     Arc::from("client-a"),
                     RequestId::from(NumberOrString::Number(1)),
+                    crate::types::ClientType::Unknown,
+                    None,
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
@@ -2265,7 +2131,7 @@ fn test_route_upstream_progress_restores_downstream_token() {
         ProtocolNotification::Progress { target, params } => {
             assert_eq!(
                 target,
-                NotificationTarget::Stdio {
+                NotificationTarget::Ipc {
                     client_id: Arc::from("client-a"),
                 }
             );
@@ -2281,15 +2147,17 @@ fn test_route_upstream_progress_restores_downstream_token() {
 #[test]
 fn test_anonymous_upstream_cancellation_preserves_active_call() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     router
         .register_active_call(
             1,
             ActiveCallRecord {
-                downstream: DownstreamCallContext::stdio(
+                downstream: DownstreamCallContext::ipc(
                     Arc::from("client-a"),
                     RequestId::from(NumberOrString::Number(1)),
+                    crate::types::ClientType::Unknown,
+                    None,
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
@@ -2312,15 +2180,17 @@ fn test_anonymous_upstream_cancellation_preserves_active_call() {
 #[test]
 fn test_attach_upstream_request_id_preserves_pending_cancel_reason() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     router
         .register_active_call(
             1,
             ActiveCallRecord {
-                downstream: DownstreamCallContext::stdio(
+                downstream: DownstreamCallContext::ipc(
                     Arc::from("client-a"),
                     RequestId::from(NumberOrString::Number(1)),
+                    crate::types::ClientType::Unknown,
+                    None,
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: None,
@@ -2360,15 +2230,17 @@ fn test_attach_upstream_request_id_preserves_pending_cancel_reason() {
 #[test]
 fn test_register_active_call_uses_upstream_progress_token_for_lookup() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     router
         .register_active_call(
             1,
             ActiveCallRecord {
-                downstream: DownstreamCallContext::stdio(
+                downstream: DownstreamCallContext::ipc(
                     Arc::from("client-a"),
                     RequestId::from(NumberOrString::Number(1)),
+                    crate::types::ClientType::Unknown,
+                    None,
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: Some(RequestId::from(NumberOrString::Number(42))),
@@ -2407,223 +2279,6 @@ fn test_register_active_call_uses_upstream_progress_token_for_lookup() {
 }
 
 #[test]
-fn test_downstream_context_notification_target() {
-    assert_eq!(
-        DownstreamCallContext::stdio(
-            Arc::from("client-a"),
-            RequestId::from(NumberOrString::Number(1))
-        )
-        .notification_target(),
-        NotificationTarget::Stdio {
-            client_id: Arc::from("client-a"),
-        },
-    );
-}
-
-/// The IPC identity split (KTD3): an IPC downstream context has a first-class
-/// `Ipc` notification target and an `ipc:` lazy-session-key namespace, distinct
-/// from the `Stdio` masquerade it replaced. A stdio and an IPC client with the
-/// same id now resolve to different lazy buckets and different targets — the
-/// correctness win the split delivers.
-#[test]
-fn ipc_context_has_distinct_identity_from_stdio() {
-    let ipc = DownstreamCallContext::ipc_for_client(
-        Arc::from("sess-1"),
-        RequestId::from(NumberOrString::Number(1)),
-        ClientType::Unknown,
-    );
-    assert_eq!(
-        ipc.notification_target(),
-        NotificationTarget::Ipc {
-            client_id: Arc::from("sess-1"),
-        },
-    );
-
-    // Distinct lazy-session-key namespaces: a stdio and an IPC client sharing an
-    // id no longer collide in the lazy working-set map.
-    let ipc_key = ToolRouter::lazy_session_key(DownstreamTransport::Ipc, "sess-1");
-    let stdio_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "sess-1");
-    assert_eq!(ipc_key, "ipc:sess-1");
-    assert_ne!(ipc_key, stdio_key);
-    // A reconnecting IPC client with the same session id resolves to the same
-    // namespaced key — its working set is not orphaned by the namespace change.
-    assert_eq!(
-        ToolRouter::lazy_session_key(DownstreamTransport::Ipc, "sess-1"),
-        ipc_key,
-    );
-}
-
-// ── dispatch::dispatch_tools_call characterization (U1) ──────────────────
-//
-// These pin the shared adapter's contract before the three transports are
-// migrated onto it (U2/U3/U4). End-to-end behavior across every transport is
-// covered by the integration suites and the parity matrix (U6); here we prove
-// the sync/task branch decision and error propagation in isolation.
-
-/// Mock transport context for exercising `dispatch_tools_call` without a live
-/// transport. `supports_tasks` is configurable so we can prove the task-gate.
-struct MockDownstream {
-    supports_tasks: bool,
-}
-
-impl crate::dispatch::DownstreamContext for MockDownstream {
-    fn downstream_call_context(&self) -> DownstreamCallContext {
-        DownstreamCallContext::stdio_for_client(
-            Arc::<str>::from("test-client"),
-            RequestId::from(NumberOrString::Number(1)),
-            ClientType::Unknown,
-        )
-    }
-
-    fn supports_tasks(&self) -> bool {
-        self.supports_tasks
-    }
-
-    fn task_owner(&self) -> Result<TaskOwner, McpError> {
-        Ok(TaskOwner::new(Arc::<str>::from("test-owner")))
-    }
-}
-
-/// OAuth-backed transport context whose tool scope is intentionally narrower
-/// than its task scope. Task-wrapped tools/call must pass both checks.
-struct ScopedTaskDownstream {
-    scopes: std::collections::BTreeSet<String>,
-}
-
-impl crate::dispatch::DownstreamContext for ScopedTaskDownstream {
-    fn downstream_call_context(&self) -> DownstreamCallContext {
-        DownstreamCallContext::http_for_client_with_trace(
-            "session-scoped",
-            RequestId::from(NumberOrString::Number(1)),
-            ClientType::Unknown,
-            Arc::<str>::from("00000000000000000000000000000001"),
-        )
-        .with_authorization(
-            crate::types::PrincipalId::downstream_oauth(
-                "https://issuer.example",
-                "client-a",
-                "https://plug.example/mcp",
-            ),
-            self.scopes.clone(),
-        )
-    }
-
-    fn supports_tasks(&self) -> bool {
-        true
-    }
-
-    fn task_owner(&self) -> Result<TaskOwner, McpError> {
-        Ok(TaskOwner::new(
-            crate::types::PrincipalId::downstream_oauth(
-                "https://issuer.example",
-                "client-a",
-                "https://plug.example/mcp",
-            )
-            .owner_key(),
-        ))
-    }
-}
-
-/// Build a router with a single route to a server that has no registered
-/// upstream. The sync path then fails with `ServerUnavailable`, while the task
-/// path falls through to a local passthrough task and succeeds — making the two
-/// branches observably distinct.
-fn router_with_unrouted_single_route() -> Arc<ToolRouter> {
-    let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(sm, test_router_config()));
-    let mut routes = HashMap::new();
-    routes.insert(
-        "Mock__tool".to_string(),
-        ("mock-server".to_string(), "tool".to_string()),
-    );
-    router.cache.store(Arc::new(
-        RouterSnapshot {
-            routes,
-            tools_all: Arc::new(Vec::new()),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
-        }
-        .with_indexes(),
-    ));
-    router
-}
-
-#[tokio::test]
-async fn dispatch_tools_call_empty_name_returns_tool_not_found() {
-    let router = router_with_unrouted_single_route();
-    let ctx = MockDownstream {
-        supports_tasks: true,
-    };
-    let params = CallToolRequestParams::new("");
-
-    let err = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
-        .await
-        .expect_err("empty tool name must error");
-
-    // Canonical shape: an unknown/empty tool name routes to ToolNotFound
-    // (the stdio/HTTP behavior, now shared), which maps to METHOD_NOT_FOUND.
-    assert_eq!(err.code, ErrorCode::METHOD_NOT_FOUND);
-}
-
-#[tokio::test]
-async fn dispatch_tools_call_rejects_hostile_extensions_before_route_effects() {
-    let router = router_with_unrouted_single_route();
-    let ctx = MockDownstream {
-        supports_tasks: false,
-    };
-
-    for (key, value) in [
-        ("plug.dev/legacy-task-support", serde_json::json!(true)),
-        (
-            "attacker.example/authorization",
-            serde_json::json!("Bearer stolen"),
-        ),
-        ("attacker.example/value", serde_json::json!("Bearer stolen")),
-    ] {
-        let mut params = CallToolRequestParams::new("Mock__tool");
-        params
-            .meta
-            .get_or_insert_with(Default::default)
-            .insert(key.to_string(), value);
-        let error = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
-            .await
-            .expect_err("hostile metadata must fail before route lookup");
-        assert_eq!(error.code, ErrorCode::INVALID_PARAMS, "hostile key: {key}");
-        assert!(
-            !error.message.to_lowercase().contains("unavailable"),
-            "a route effect occurred before extension admission for {key}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn dispatch_tools_call_rejects_oversized_request_state_before_route_effects() {
-    let router = router_with_unrouted_single_route();
-    let ctx = MockDownstream {
-        supports_tasks: false,
-    };
-    let mut params = CallToolRequestParams::new("Mock__tool");
-    params.request_state = Some("x".repeat(4 * 1024 + 1));
-
-    let error = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
-        .await
-        .expect_err("oversized requestState must fail before route lookup");
-    assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-    assert!(!error.message.to_lowercase().contains("unavailable"));
-}
-
-#[test]
 fn mrtr_pair_policy_activates_only_native_modern_rounds() {
     use crate::protocol::ProtocolEra::{Legacy, Modern};
 
@@ -2640,148 +2295,6 @@ fn mrtr_pair_policy_activates_only_native_modern_rounds() {
     assert!(!mrtr_pair_supported(Modern, Modern, false, true));
 }
 
-#[tokio::test]
-async fn hostile_task_extension_is_rejected_before_durable_record_creation() {
-    let router = router_with_unrouted_single_route();
-    let ctx = MockDownstream {
-        supports_tasks: true,
-    };
-    let mut params = CallToolRequestParams::new("Mock__tool");
-    let meta = params.meta.get_or_insert_with(Default::default);
-    meta.insert(
-        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
-        serde_json::json!({}),
-    );
-    meta.insert(
-        "attacker.example/principal".to_string(),
-        serde_json::json!("someone-else"),
-    );
-
-    let error = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
-        .await
-        .expect_err("hostile task metadata must fail before durable creation");
-    assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-    assert_eq!(
-        router
-            .task_count_for_owner(&TaskOwner::new(Arc::<str>::from("test-owner")))
-            .await,
-        0
-    );
-}
-
-#[test]
-fn admitted_extension_policy_is_identical_for_all_protocol_pair_rows() {
-    let source = MetaObject::from(
-        serde_json::json!({
-            "example.test/typed": {
-                "boolean": true,
-                "number": 7,
-                "array": [null, "value"]
-            },
-            "traceparent": "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01"
-        })
-        .as_object()
-        .unwrap()
-        .clone(),
-    );
-    for downstream in [
-        crate::protocol::ProtocolEra::Legacy,
-        crate::protocol::ProtocolEra::Modern,
-    ] {
-        for upstream in [
-            crate::protocol::ProtocolEra::Legacy,
-            crate::protocol::ProtocolEra::Modern,
-        ] {
-            let admitted = crate::types::ExtensionEnvelope::from_peer_meta(Some(&source))
-                .unwrap()
-                .into_meta()
-                .unwrap();
-            assert_eq!(admitted, source, "pair {downstream:?} -> {upstream:?}");
-        }
-    }
-}
-
-#[tokio::test]
-async fn dispatch_tools_call_task_param_with_task_support_creates_task() {
-    let router = router_with_unrouted_single_route();
-    let ctx = MockDownstream {
-        supports_tasks: true,
-    };
-    let mut params = CallToolRequestParams::new("Mock__tool");
-    params.meta.get_or_insert_with(Default::default).insert(
-        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
-        serde_json::json!({}),
-    );
-
-    let outcome = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
-        .await
-        .expect("task-augmented call should enqueue a local passthrough task");
-
-    assert!(
-        matches!(outcome, crate::dispatch::ToolCallOutcome::TaskCreated(_)),
-        "expected TaskCreated outcome, got {outcome:?}"
-    );
-    let activity = router.activity_snapshot(&crate::activity::ActivityFilter::default());
-    assert_eq!(activity.len(), 1);
-    assert_eq!(activity[0].method, "tools/call");
-    assert_eq!(
-        activity[0].outcome,
-        crate::activity::ActivityOutcome::Success
-    );
-}
-
-#[tokio::test]
-async fn dispatch_tools_call_task_param_requires_task_scope_before_creating_record() {
-    let router = router_with_unrouted_single_route();
-    let ctx = ScopedTaskDownstream {
-        scopes: std::collections::BTreeSet::from(["tools:read".to_string()]),
-    };
-    let owner =
-        crate::dispatch::DownstreamContext::task_owner(&ctx).expect("stable principal owner");
-    let mut params = CallToolRequestParams::new("Mock__tool");
-    params.meta.get_or_insert_with(Default::default).insert(
-        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
-        serde_json::json!({}),
-    );
-
-    let err = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
-        .await
-        .expect_err("tools scope alone must not authorize durable task creation");
-
-    assert_eq!(err.code, ErrorCode(-32005));
-    assert_eq!(router.task_count_for_owner(&owner).await, 0);
-    let activity = router.activity_snapshot(&crate::activity::ActivityFilter::default());
-    assert_eq!(activity.len(), 1);
-    assert_eq!(activity[0].outcome, crate::activity::ActivityOutcome::Error);
-}
-
-#[tokio::test]
-async fn dispatch_tools_call_task_param_without_task_support_takes_sync_path() {
-    let router = router_with_unrouted_single_route();
-    // stdio-like: cannot return a task result, so a task-augmented call must
-    // fall through to the synchronous path (preserving today's behavior).
-    let ctx = MockDownstream {
-        supports_tasks: false,
-    };
-    let mut params = CallToolRequestParams::new("Mock__tool");
-    params.meta.get_or_insert_with(Default::default).insert(
-        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
-        serde_json::json!({}),
-    );
-
-    // expect_err is itself the branch-distinction proof: the task path returns
-    // Ok(TaskCreated) (see the sibling test), so an Err means the sync path ran.
-    let err = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
-        .await
-        .expect_err("sync path with no upstream must error, not create a task");
-
-    // And it is specifically the sync path's no-upstream ServerUnavailable error.
-    assert!(
-        err.message.to_lowercase().contains("unavailable"),
-        "expected a sync-path ServerUnavailable error, got {err:?}"
-    );
-}
-
 // ─── refresh_tools ↔ subscription race tests ────────────────────────────────
 //
 // These drive `refresh_tools` itself against in-process duplex-connected
@@ -2792,7 +2305,6 @@ async fn dispatch_tools_call_task_param_without_task_support_takes_sync_path() {
 use rmcp::ServiceExt as _;
 
 use crate::server::{UpstreamClientHandler, UpstreamServer};
-use crate::types::ServerHealth;
 
 /// Async gate: `wait()` parks until `open()`. Same shape as the registry
 /// unit tests' Gate, but per-URI on the upstream side.
@@ -2831,8 +2343,10 @@ impl SubGate {
 /// Shared state backing a `SubscribableUpstreamHandler`: the resource list
 /// it serves (mutable between refreshes to flip routes) and per-URI
 /// subscribe/unsubscribe call logs plus gates.
-struct SubscribableUpstreamState {
+pub(crate) struct SubscribableUpstreamState {
     resources: std::sync::Mutex<Vec<String>>,
+    templates: std::sync::Mutex<Vec<String>>,
+    completed_refs: std::sync::Mutex<Vec<String>>,
     list_calls: std::sync::atomic::AtomicUsize,
     list_gate: std::sync::Mutex<Option<Arc<SubGate>>>,
     list_entered: tokio::sync::Notify,
@@ -2843,17 +2357,19 @@ struct SubscribableUpstreamState {
     subscribe_errors: std::sync::Mutex<HashSet<String>>,
     subscribe_entered: tokio::sync::Notify,
     unsubscribe_entered: tokio::sync::Notify,
-    tool_calls: std::sync::atomic::AtomicUsize,
+    pub(crate) tool_calls: std::sync::atomic::AtomicUsize,
     tool_gate: std::sync::Mutex<Option<Arc<SubGate>>>,
     tool_entered: tokio::sync::Notify,
-    tool_requires_input: std::sync::atomic::AtomicBool,
+    pub(crate) tool_requires_input: std::sync::atomic::AtomicBool,
     tool_growing_input: std::sync::atomic::AtomicBool,
 }
 
 impl SubscribableUpstreamState {
-    fn new(resources: &[&str]) -> Arc<Self> {
+    pub(crate) fn new(resources: &[&str]) -> Arc<Self> {
         Arc::new(Self {
             resources: std::sync::Mutex::new(resources.iter().map(|uri| uri.to_string()).collect()),
+            templates: std::sync::Mutex::new(Vec::new()),
+            completed_refs: std::sync::Mutex::new(Vec::new()),
             list_calls: std::sync::atomic::AtomicUsize::new(0),
             list_gate: std::sync::Mutex::new(None),
             list_entered: tokio::sync::Notify::new(),
@@ -2977,6 +2493,35 @@ impl ServerHandler for SubscribableUpstreamHandler {
                     .collect(),
             ))
         }
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
+        let templates = self.state.templates.lock().unwrap().clone();
+        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(
+            templates
+                .iter()
+                .map(|uri| ResourceTemplate::new(uri.as_str(), uri.as_str()))
+                .collect(),
+        )))
+    }
+
+    fn complete(
+        &self,
+        request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CompleteResult, McpError>> + Send + '_ {
+        if let Reference::Resource(resource) = &request.r#ref {
+            self.state
+                .completed_refs
+                .lock()
+                .unwrap()
+                .push(resource.uri.clone());
+        }
+        std::future::ready(Ok(CompleteResult::default()))
     }
 
     fn subscribe(
@@ -3120,7 +2665,7 @@ async fn connect_subscribable_upstream(
     let handler = Arc::new(UpstreamClientHandler::new_for_tests(
         Arc::from(name.to_string()),
         Arc::clone(&tools),
-        std::sync::Weak::new(),
+        crate::server::no_events(),
     ));
     let client = handler
         .serve(client_transport)
@@ -3134,23 +2679,12 @@ async fn connect_subscribable_upstream(
     capabilities.resources = Some(resources);
 
     UpstreamServer {
-        name: name.to_string(),
-        config: subscribable_test_server_config(),
-        client,
-        tools,
         capabilities,
-        upstream: None,
-        protocol_era: crate::protocol::ProtocolEra::Legacy,
-        selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
-        protocol_gate_state: 0,
-        connection: crate::server::ConnectionGeneration::new(),
-        health: ServerHealth::Healthy,
-        child_pid: None,
-        stderr_tail: None,
+        ..UpstreamServer::for_tests(name.to_string(), client, tools)
     }
 }
 
-async fn connect_modern_tool_upstream(
+pub(crate) async fn connect_modern_tool_upstream(
     name: &str,
     state: Arc<SubscribableUpstreamState>,
 ) -> UpstreamServer {
@@ -3166,7 +2700,7 @@ async fn connect_modern_tool_upstream(
     let handler = Arc::new(UpstreamClientHandler::new_for_tests_with_protocol(
         Arc::from(name.to_string()),
         Arc::clone(&tools),
-        std::sync::Weak::new(),
+        crate::server::no_events(),
         rmcp::model::ProtocolVersion::V_2026_07_28,
     ));
     let client = handler
@@ -3174,52 +2708,14 @@ async fn connect_modern_tool_upstream(
         .await
         .expect("connect modern tool upstream test client");
     UpstreamServer {
-        name: name.to_string(),
-        config: subscribable_test_server_config(),
-        client,
-        tools,
-        capabilities: ServerCapabilities::default(),
-        upstream: None,
         protocol_era: crate::protocol::ProtocolEra::Modern,
-        selected_protocol_version: crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION.to_string(),
-        protocol_gate_state: 0,
-        connection: crate::server::ConnectionGeneration::new(),
-        health: ServerHealth::Healthy,
-        child_pid: None,
-        stderr_tail: None,
-    }
-}
-
-fn subscribable_test_server_config() -> crate::config::ServerConfig {
-    crate::config::ServerConfig {
-        command: Some("fake".to_string()),
-        args: Vec::new(),
-        env: HashMap::new(),
-        enabled: true,
-        transport: crate::config::TransportType::Stdio,
-        protocol_mode: Default::default(),
-        url: None,
-        auth_token: None,
-        auth: None,
-        oauth_client_id: None,
-        oauth_scopes: None,
-        timeout_secs: 30,
-        call_timeout_secs: 30,
-        max_concurrent: 1,
-        health_check_interval_secs: 60,
-        circuit_breaker_enabled: false,
-        enrichment: false,
-        tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
-        sandbox: None,
-        spec: None,
-        operations: Vec::new(),
-        token_in: None,
+        selected_protocol_version: crate::protocol::MODERN_PROTOCOL_VERSION.to_string(),
+        ..UpstreamServer::for_tests(name.to_string(), client, tools)
     }
 }
 
 fn sub_target(id: &str) -> NotificationTarget {
-    NotificationTarget::Stdio {
+    NotificationTarget::Ipc {
         client_id: Arc::from(id),
     }
 }
@@ -3227,7 +2723,7 @@ fn sub_target(id: &str) -> NotificationTarget {
 #[tokio::test]
 async fn overlapping_refreshes_share_one_trailing_pass_and_publish_fresh_catalog() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&["memory://old"]);
     sm.replace_server(
         "mock",
@@ -3275,14 +2771,14 @@ async fn overlapping_refreshes_share_one_trailing_pass_and_publish_fresh_catalog
     assert_eq!(state.list_count(), 3, "initial + active + trailing");
     assert!(
         router
-            .list_resources()
+            .list_resources_for_client(None)
             .iter()
             .any(|resource| resource.uri == "memory://new"),
         "trailing pass must publish catalog state newer than active pass"
     );
     assert!(
         !router
-            .list_resources()
+            .list_resources_for_client(None)
             .iter()
             .any(|resource| resource.uri == "memory://old")
     );
@@ -3291,7 +2787,7 @@ async fn overlapping_refreshes_share_one_trailing_pass_and_publish_fresh_catalog
 #[tokio::test]
 async fn cancelled_refresh_leader_does_not_wedge_waiting_refresh() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&["memory://old"]);
     sm.replace_server(
         "mock",
@@ -3332,7 +2828,7 @@ async fn cancelled_refresh_leader_does_not_wedge_waiting_refresh() {
         .unwrap();
     assert!(
         router
-            .list_resources()
+            .list_resources_for_client(None)
             .iter()
             .any(|resource| resource.uri == "memory://recovered")
     );
@@ -3343,21 +2839,8 @@ async fn cancelled_refresh_leader_does_not_wedge_waiting_refresh() {
 /// none of the pass's own reconciliation — classify, rebind, sweep — runs).
 fn publish_route_snapshot(router: &ToolRouter, uri: &str, server_id: &str) {
     router.replace_snapshot(RouterSnapshot {
-        routes: HashMap::new(),
-        routes_lower: HashMap::new(),
-        tools_by_name: HashMap::new(),
-        tools_by_name_lower: HashMap::new(),
-        tools_all: Arc::new(Vec::new()),
-        meta_tools_all: Arc::new(build_meta_tools()),
-        tools_devin: Arc::new(Vec::new()),
-        tools_copilot: Arc::new(Vec::new()),
-        resources_all: Arc::new(Vec::new()),
-        resource_templates_all: Arc::new(Vec::new()),
-        prompts_all: Arc::new(Vec::new()),
         resource_routes: HashMap::from([(uri.to_string(), server_id.to_string())]),
-        prompt_routes: HashMap::new(),
-        tool_definition_fingerprints: HashMap::new(),
-        tool_risk_inventory: HashMap::new(),
+        ..Default::default()
     });
 }
 
@@ -3376,24 +2859,11 @@ fn publish_tool_route_snapshot_with_original(
             tool.to_string(),
             (server_id.to_string(), original_name.to_string()),
         )]),
-        tools_all: Arc::new(Vec::new()),
-        meta_tools_all: Arc::new(build_meta_tools()),
-        tools_devin: Arc::new(Vec::new()),
-        tools_copilot: Arc::new(Vec::new()),
-        resources_all: Arc::new(Vec::new()),
-        resource_templates_all: Arc::new(Vec::new()),
-        prompts_all: Arc::new(Vec::new()),
-        resource_routes: HashMap::new(),
-        routes_lower: HashMap::new(),
-        tools_by_name: HashMap::new(),
-        tools_by_name_lower: HashMap::new(),
-        prompt_routes: HashMap::new(),
-        tool_definition_fingerprints: HashMap::new(),
-        tool_risk_inventory: HashMap::new(),
+        ..Default::default()
     });
 }
 
-fn publish_tool_route_snapshot_with_metadata(
+pub(crate) fn publish_tool_route_snapshot_with_metadata(
     router: &ToolRouter,
     tool: &str,
     server_id: &str,
@@ -3409,33 +2879,21 @@ fn publish_tool_route_snapshot_with_metadata(
             Cow::Borrowed(description),
             Arc::new(serde_json::Map::new()),
         )]),
-        meta_tools_all: Arc::new(build_meta_tools()),
-        tools_devin: Arc::new(Vec::new()),
-        tools_copilot: Arc::new(Vec::new()),
-        resources_all: Arc::new(Vec::new()),
-        resource_templates_all: Arc::new(Vec::new()),
-        prompts_all: Arc::new(Vec::new()),
-        resource_routes: HashMap::new(),
-        routes_lower: HashMap::new(),
-        tools_by_name: HashMap::new(),
-        tools_by_name_lower: HashMap::new(),
-        prompt_routes: HashMap::new(),
-        tool_definition_fingerprints: HashMap::new(),
-        tool_risk_inventory: HashMap::new(),
+        ..Default::default()
     });
 }
 
 #[tokio::test]
 async fn native_continuation_rejects_route_replacement_before_second_invocation() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&[]);
     let mut first = connect_subscribable_upstream("modern", Arc::clone(&state)).await;
     first.protocol_era = crate::protocol::ProtocolEra::Modern;
     sm.replace_server("modern", first).await;
     publish_tool_route_snapshot(&router, "Modern__tool", "modern");
 
-    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(99));
+    let principal = crate::types::PrincipalId::daemon_ipc(uuid::Uuid::from_u128(99));
     let mut params = CallToolRequestParams::new("Modern__tool");
     let input_requests = InputRequests::from_iter([(
         "answer".to_string(),
@@ -3483,17 +2941,17 @@ async fn native_continuation_rejects_route_replacement_before_second_invocation(
     replacement.protocol_era = crate::protocol::ProtocolEra::Modern;
     sm.replace_server("modern", replacement).await;
 
-    let context = DownstreamCallContext::ipc_for_client(
+    let context = DownstreamCallContext::ipc(
         "modern-client",
         RequestId::from(NumberOrString::Number(2)),
         ClientType::Unknown,
+        None,
     )
     .with_local_principal(principal)
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+        crate::protocol::MODERN_PROTOCOL_VERSION,
+    );
     let error = router
         .call_tool_round_with_context(params, None, Some(context))
         .await
@@ -3508,13 +2966,13 @@ async fn native_continuation_rejects_route_replacement_before_second_invocation(
 #[tokio::test]
 async fn native_continuation_rejects_same_upstream_arc_tool_remap_before_invocation() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&[]);
     let upstream = connect_modern_tool_upstream("modern", Arc::clone(&state)).await;
     sm.replace_server("modern", upstream).await;
     publish_tool_route_snapshot_with_original(&router, "Modern__tool", "modern", "old_tool");
 
-    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(100));
+    let principal = crate::types::PrincipalId::daemon_ipc(uuid::Uuid::from_u128(100));
     let mut params = CallToolRequestParams::new("Modern__tool");
     let input_requests = InputRequests::from_iter([(
         "answer".to_string(),
@@ -3560,17 +3018,17 @@ async fn native_continuation_rejects_same_upstream_arc_tool_remap_before_invocat
 
     // The server Arc is unchanged; only the exposed-name mapping moved.
     publish_tool_route_snapshot_with_original(&router, "Modern__tool", "modern", "new_tool");
-    let context = DownstreamCallContext::ipc_for_client(
+    let context = DownstreamCallContext::ipc(
         "modern-client",
         RequestId::from(NumberOrString::Number(3)),
         ClientType::Unknown,
+        None,
     )
     .with_local_principal(principal)
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+        crate::protocol::MODERN_PROTOCOL_VERSION,
+    );
     let error = router
         .call_tool_round_with_context(params, None, Some(context))
         .await
@@ -3585,15 +3043,15 @@ async fn native_continuation_rejects_same_upstream_arc_tool_remap_before_invocat
 #[tokio::test]
 async fn full_continuation_count_and_byte_capacity_prevents_upstream_invocation() {
     let sm = Arc::new(ServerManager::new());
-    let quotas = crate::protocol::AdmissionQuotas::new(crate::protocol::AdmissionQuotaConfig {
+    let quotas = crate::admission::AdmissionQuotas::new(crate::admission::AdmissionQuotaConfig {
         continuations: 1,
         continuation_bytes: MRTR_MAX_BYTES,
         per_principal_divisor: 1,
         ..Default::default()
     });
-    let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
+    let router = Arc::new(ToolRouter::new_with_quotas(
         Arc::clone(&sm),
-        test_router_config(),
+        RouterConfig::default(),
         quotas,
     ));
     let state = SubscribableUpstreamState::new(&[]);
@@ -3601,22 +3059,22 @@ async fn full_continuation_count_and_byte_capacity_prevents_upstream_invocation(
     sm.replace_server("modern", upstream).await;
     publish_tool_route_snapshot(&router, "Modern__tool", "modern");
 
-    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(101));
+    let principal = crate::types::PrincipalId::daemon_ipc(uuid::Uuid::from_u128(101));
     let _full = router
         .continuation_registry
         .reserve(&principal, MRTR_MAX_BYTES)
         .unwrap();
-    let context = DownstreamCallContext::ipc_for_client(
+    let context = DownstreamCallContext::ipc(
         "modern-client",
         RequestId::from(NumberOrString::Number(4)),
         ClientType::Unknown,
+        None,
     )
     .with_local_principal(principal)
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+        crate::protocol::MODERN_PROTOCOL_VERSION,
+    );
     let error = router
         .call_tool_round_with_context(
             CallToolRequestParams::new("Modern__tool"),
@@ -3635,7 +3093,7 @@ async fn full_continuation_count_and_byte_capacity_prevents_upstream_invocation(
 #[tokio::test]
 async fn default_oauth_grant_allows_plain_tool_call_to_modern_upstream() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&[]);
     let upstream = connect_modern_tool_upstream("modern", Arc::clone(&state)).await;
     sm.replace_server("modern", upstream).await;
@@ -3643,20 +3101,19 @@ async fn default_oauth_grant_allows_plain_tool_call_to_modern_upstream() {
 
     let principal =
         crate::types::PrincipalId::downstream_oauth("https://issuer.example", "client", "plug");
-    let context = DownstreamCallContext::http_for_client(
+    let context = DownstreamCallContext::http(
         "modern-session",
         RequestId::from(NumberOrString::Number(9)),
         ClientType::Unknown,
     )
     .with_authorization(
         principal,
-        crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES.map(str::to_string),
+        crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES.map(str::to_string),
     )
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+        crate::protocol::MODERN_PROTOCOL_VERSION,
+    );
 
     let response = router
         .call_tool_round_with_context(
@@ -3678,7 +3135,7 @@ async fn default_oauth_grant_allows_plain_tool_call_to_modern_upstream() {
 #[tokio::test]
 async fn native_modern_upstream_completes_a_real_two_round_tool_call() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&[]);
     state
         .tool_requires_input
@@ -3687,18 +3144,18 @@ async fn native_modern_upstream_completes_a_real_two_round_tool_call() {
     sm.replace_server("modern", upstream).await;
     publish_tool_route_snapshot(&router, "Modern__tool", "modern");
 
-    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(102));
-    let context = DownstreamCallContext::ipc_for_client(
+    let principal = crate::types::PrincipalId::daemon_ipc(uuid::Uuid::from_u128(102));
+    let context = DownstreamCallContext::ipc(
         "modern-client",
         RequestId::from(NumberOrString::Number(5)),
         ClientType::Unknown,
+        None,
     )
     .with_local_principal(principal.clone())
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+        crate::protocol::MODERN_PROTOCOL_VERSION,
+    );
     let first = router
         .call_tool_round_with_context(
             CallToolRequestParams::new("Modern__tool"),
@@ -3743,7 +3200,7 @@ async fn native_modern_upstream_completes_a_real_two_round_tool_call() {
 #[tokio::test]
 async fn continuation_keeps_max_byte_reservation_across_larger_second_input_required() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&[]);
     state
         .tool_requires_input
@@ -3755,18 +3212,18 @@ async fn continuation_keeps_max_byte_reservation_across_larger_second_input_requ
     sm.replace_server("modern", upstream).await;
     publish_tool_route_snapshot(&router, "Modern__tool", "modern");
 
-    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(103));
-    let context = DownstreamCallContext::ipc_for_client(
+    let principal = crate::types::PrincipalId::daemon_ipc(uuid::Uuid::from_u128(103));
+    let context = DownstreamCallContext::ipc(
         "modern-client",
         RequestId::from(NumberOrString::Number(8)),
         ClientType::Unknown,
+        None,
     )
     .with_local_principal(principal)
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+        crate::protocol::MODERN_PROTOCOL_VERSION,
+    );
 
     let first = router
         .call_tool_round_with_context(
@@ -3822,7 +3279,7 @@ async fn continuation_keeps_max_byte_reservation_across_larger_second_input_requ
 #[tokio::test]
 async fn oauth_revocation_while_upstream_response_is_paused_cannot_park_state() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&[]);
     state
         .tool_requires_input
@@ -3836,7 +3293,7 @@ async fn oauth_revocation_while_upstream_response_is_paused_cannot_park_state() 
     let principal =
         crate::types::PrincipalId::downstream_oauth("https://issuer.example", "client", "plug");
     let lifecycle = crate::downstream_oauth::PrincipalLifecycleLease::active_for_tests();
-    let context = DownstreamCallContext::http_for_client(
+    let context = DownstreamCallContext::http(
         "modern-session",
         RequestId::from(NumberOrString::Number(6)),
         ClientType::Unknown,
@@ -3851,9 +3308,8 @@ async fn oauth_revocation_while_upstream_response_is_paused_cannot_park_state() 
     .with_principal_lifecycle(lifecycle.clone())
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+        crate::protocol::MODERN_PROTOCOL_VERSION,
+    );
     let request_router = Arc::clone(&router);
     let request = tokio::spawn(async move {
         request_router
@@ -3882,15 +3338,15 @@ async fn oauth_revocation_while_upstream_response_is_paused_cannot_park_state() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_refresh_after_final_precheck_cannot_publish_parked_state() {
     let sm = Arc::new(ServerManager::new());
-    let quotas = crate::protocol::AdmissionQuotas::new(crate::protocol::AdmissionQuotaConfig {
+    let quotas = crate::admission::AdmissionQuotas::new(crate::admission::AdmissionQuotaConfig {
         continuations: 1,
         continuation_bytes: MRTR_MAX_BYTES,
         per_principal_divisor: 1,
         ..Default::default()
     });
-    let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
+    let router = Arc::new(ToolRouter::new_with_quotas(
         Arc::clone(&sm),
-        test_router_config(),
+        RouterConfig::default(),
         quotas,
     ));
     let state = SubscribableUpstreamState::new(&[]);
@@ -3905,18 +3361,18 @@ async fn snapshot_refresh_after_final_precheck_cannot_publish_parked_state() {
         release: Arc::new(std::sync::Barrier::new(2)),
     });
     router.set_continuation_insert_gate(Some(Arc::clone(&gate)));
-    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(105));
-    let context = DownstreamCallContext::ipc_for_client(
+    let principal = crate::types::PrincipalId::daemon_ipc(uuid::Uuid::from_u128(105));
+    let context = DownstreamCallContext::ipc(
         "modern-client",
         RequestId::from(NumberOrString::Number(10)),
         ClientType::Unknown,
+        None,
     )
     .with_local_principal(principal.clone())
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+        crate::protocol::MODERN_PROTOCOL_VERSION,
+    );
     let request_router = Arc::clone(&router);
     let request = tokio::spawn(async move {
         request_router
@@ -3949,15 +3405,15 @@ async fn snapshot_refresh_after_final_precheck_cannot_publish_parked_state() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ipc_principal_cleanup_after_final_precheck_cannot_publish_parked_state() {
     let sm = Arc::new(ServerManager::new());
-    let quotas = crate::protocol::AdmissionQuotas::new(crate::protocol::AdmissionQuotaConfig {
+    let quotas = crate::admission::AdmissionQuotas::new(crate::admission::AdmissionQuotaConfig {
         continuations: 1,
         continuation_bytes: MRTR_MAX_BYTES,
         per_principal_divisor: 1,
         ..Default::default()
     });
-    let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
+    let router = Arc::new(ToolRouter::new_with_quotas(
         Arc::clone(&sm),
-        test_router_config(),
+        RouterConfig::default(),
         quotas,
     ));
     let state = SubscribableUpstreamState::new(&[]);
@@ -3972,18 +3428,18 @@ async fn ipc_principal_cleanup_after_final_precheck_cannot_publish_parked_state(
         release: Arc::new(std::sync::Barrier::new(2)),
     });
     router.set_continuation_insert_gate(Some(Arc::clone(&gate)));
-    let principal = crate::types::PrincipalId::daemon_ipc_registry("ipc-client-race");
-    let context = DownstreamCallContext::ipc_for_client(
+    let principal = crate::downstream_identity::ipc_registry_principal("ipc-client-race");
+    let context = DownstreamCallContext::ipc(
         "modern-client",
         RequestId::from(NumberOrString::Number(11)),
         ClientType::Unknown,
+        None,
     )
     .with_local_principal(principal.clone())
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+        crate::protocol::MODERN_PROTOCOL_VERSION,
+    );
     let request_router = Arc::clone(&router);
     let request = tokio::spawn(async move {
         request_router
@@ -4016,27 +3472,23 @@ async fn ipc_principal_cleanup_after_final_precheck_cannot_publish_parked_state(
 #[tokio::test]
 async fn legacy_task_to_modern_upstream_is_rejected_before_task_or_tool_effect() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&[]);
     let mut upstream = connect_subscribable_upstream("modern", Arc::clone(&state)).await;
     upstream.protocol_era = crate::protocol::ProtocolEra::Modern;
     sm.replace_server("modern", upstream).await;
     publish_tool_route_snapshot(&router, "Modern__tool", "modern");
-    let ctx = MockDownstream {
-        supports_tasks: true,
-    };
-    let owner = crate::dispatch::DownstreamContext::task_owner(&ctx).unwrap();
-    let mut params = CallToolRequestParams::new("Modern__tool");
-    params.meta.get_or_insert_with(Default::default).insert(
-        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
-        serde_json::json!({}),
+    let downstream = DownstreamCallContext::ipc(
+        "test-client",
+        RequestId::Number(1),
+        ClientType::Unknown,
+        None,
     );
 
-    let error = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
-        .await
+    let error = router
+        .ensure_tool_round_supported("Modern__tool", &downstream, false, true)
         .expect_err("legacy task cannot target a modern upstream");
     assert_eq!(error.code, ErrorCode::METHOD_NOT_FOUND);
-    assert_eq!(router.task_count_for_owner(&owner).await, 0);
     assert_eq!(
         state.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
         0
@@ -4046,18 +3498,21 @@ async fn legacy_task_to_modern_upstream_is_rejected_before_task_or_tool_effect()
 #[tokio::test]
 async fn invoke_meta_tool_applies_pair_suppression_to_resolved_target() {
     let sm = Arc::new(ServerManager::new());
-    let mut config = test_router_config();
-    config.meta_tool_mode = true;
+    let config = RouterConfig {
+        meta_tool_mode: true,
+        ..Default::default()
+    };
     let router = Arc::new(ToolRouter::new(Arc::clone(&sm), config));
     let state = SubscribableUpstreamState::new(&[]);
     let mut upstream = connect_subscribable_upstream("modern", Arc::clone(&state)).await;
     upstream.protocol_era = crate::protocol::ProtocolEra::Modern;
     sm.replace_server("modern", upstream).await;
     publish_tool_route_snapshot(&router, "Modern__tool", "modern");
-    let context = DownstreamCallContext::ipc_for_client(
+    let context = DownstreamCallContext::ipc(
         "legacy-client",
         RequestId::from(NumberOrString::Number(7)),
         ClientType::Unknown,
+        None,
     );
     let arguments = serde_json::Map::from_iter([
         ("tool_name".to_string(), serde_json::json!("Modern__tool")),
@@ -4078,8 +3533,10 @@ async fn invoke_meta_tool_applies_pair_suppression_to_resolved_target() {
 #[tokio::test]
 async fn invoke_meta_tool_suppresses_modern_to_modern_input_required_before_invocation() {
     let sm = Arc::new(ServerManager::new());
-    let mut config = test_router_config();
-    config.meta_tool_mode = true;
+    let config = RouterConfig {
+        meta_tool_mode: true,
+        ..Default::default()
+    };
     let router = Arc::new(ToolRouter::new(Arc::clone(&sm), config));
     let state = SubscribableUpstreamState::new(&[]);
     state
@@ -4088,17 +3545,19 @@ async fn invoke_meta_tool_suppresses_modern_to_modern_input_required_before_invo
     let upstream = connect_modern_tool_upstream("modern", Arc::clone(&state)).await;
     sm.replace_server("modern", upstream).await;
     publish_tool_route_snapshot(&router, "Modern__tool", "modern");
-    let context = DownstreamCallContext::ipc_for_client(
+    let context = DownstreamCallContext::ipc(
         "modern-client",
         RequestId::from(NumberOrString::Number(9)),
         ClientType::Unknown,
+        None,
     )
-    .with_local_principal(crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(104)))
+    .with_local_principal(crate::types::PrincipalId::daemon_ipc(
+        uuid::Uuid::from_u128(104),
+    ))
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+        crate::protocol::MODERN_PROTOCOL_VERSION,
+    );
     let arguments = serde_json::Map::from_iter([
         ("tool_name".to_string(), serde_json::json!("Modern__tool")),
         ("arguments".to_string(), serde_json::json!({})),
@@ -4115,6 +3574,69 @@ async fn invoke_meta_tool_suppresses_modern_to_modern_input_required_before_invo
     );
 }
 
+/// Reading, completing and subscribing find a resource's server the same
+/// way: through a template it advertises, or the server a skill URI names.
+#[tokio::test]
+async fn templated_and_skill_uris_subscribe_and_complete_where_they_read() {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
+    let state = SubscribableUpstreamState::new(&["skill://refunds/SKILL.md"]);
+    state
+        .templates
+        .lock()
+        .unwrap()
+        .push("memory://notes/{id}".to_string());
+    sm.replace_server(
+        "notes",
+        connect_subscribable_upstream("notes", Arc::clone(&state)).await,
+    )
+    .await;
+    router.refresh_tools().await;
+
+    router
+        .subscribe_resource("memory://notes/7", sub_target("a"), None)
+        .await
+        .expect("a URI the template matches subscribes");
+    router
+        .subscribe_resource("skill://notes/refunds/notes.md", sub_target("a"), None)
+        .await
+        .expect("an unlisted skill file subscribes on its server");
+    assert_eq!(state.subscribe_count("memory://notes/7"), 1);
+    assert_eq!(state.subscribe_count("skill://refunds/notes.md"), 1);
+
+    // A refresh keeps both: their URIs still resolve to the same server.
+    router.refresh_tools().await;
+    assert_eq!(state.unsubscribe_count("memory://notes/7"), 0);
+    assert_eq!(state.unsubscribe_count("skill://refunds/notes.md"), 0);
+    let unsubscribed = state.unsubscribe_entered.notified();
+    router
+        .unsubscribe_resource("memory://notes/7", &sub_target("a"))
+        .await
+        .unwrap();
+    unsubscribed.await;
+    assert_eq!(state.unsubscribe_count("memory://notes/7"), 1);
+
+    for uri in ["memory://notes/7", "skill://notes/refunds/notes.md"] {
+        router
+            .complete_request(
+                CompleteRequestParams::new(
+                    Reference::for_resource(uri),
+                    ArgumentInfo::new("id", "7"),
+                ),
+                None,
+            )
+            .await
+            .expect("completion finds the server a read finds");
+    }
+    assert_eq!(
+        *state.completed_refs.lock().unwrap(),
+        vec![
+            "memory://notes/7".to_string(),
+            "skill://refunds/notes.md".to_string()
+        ]
+    );
+}
+
 /// Race manifestation 1 (rebind side): a last-member unsubscribe lands
 /// while a `refresh_tools` pass that will rebind the URI is still inside
 /// its (pre-publish) prune phase, so the rebind reaches a zero-member
@@ -4124,7 +3646,7 @@ async fn invoke_meta_tool_suppresses_modern_to_modern_input_required_before_invo
 #[tokio::test]
 async fn refresh_rebind_with_racing_last_unsubscribe_leaves_no_orphan() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
 
     let old_state = SubscribableUpstreamState::new(&["memory://x", "memory://y"]);
     let new_state = SubscribableUpstreamState::new(&[]);
@@ -4225,7 +3747,7 @@ async fn setup_subscribe_racing_prune() -> (
     Arc<SubscribableUpstreamState>,
 ) {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
 
     let old_state = SubscribableUpstreamState::new(&["memory://x"]);
     sm.replace_server(
@@ -4289,9 +3811,8 @@ async fn setup_subscribe_racing_prune() -> (
     (sm, router, old_state)
 }
 
-/// Prune-side race, downstream-unsubscribe ending: B's later unsubscribe
-/// used to fail "resource not found" (route gone) without touching the
-/// registry. It must now drain via the recorded owner.
+/// Prune-side race, downstream-unsubscribe ending: B's later unsubscribe,
+/// with the route gone, drains via the recorded owner.
 #[tokio::test]
 async fn racing_subscriber_unsubscribes_cleanly_after_route_vanishes() {
     let (_sm, router, old_state) = setup_subscribe_racing_prune().await;
@@ -4314,7 +3835,7 @@ async fn racing_subscriber_unsubscribes_cleanly_after_route_vanishes() {
         "the drain must unsubscribe the recorded old owner"
     );
 
-    // With neither an entry nor a route left, the historical error stands.
+    // With neither an entry nor a route left, it is an error.
     let err = router
         .unsubscribe_resource("memory://x", &sub_target("b"))
         .await
@@ -4324,8 +3845,8 @@ async fn racing_subscriber_unsubscribes_cleanly_after_route_vanishes() {
 
 /// Prune-side race, next-refresh ending: the following refresh pass
 /// classifies the surviving routeless entry as a prune with no old server
-/// id (upstream fallback `None`). It used to remove the entry with no
-/// upstream unsubscribe ever sent; the recorded owner must drain it.
+/// id (upstream fallback `None`). The recorded owner must drain it, so an
+/// upstream unsubscribe is sent.
 #[tokio::test]
 async fn next_refresh_prunes_routeless_entry_via_recorded_owner() {
     let (_sm, router, old_state) = setup_subscribe_racing_prune().await;
@@ -4354,7 +3875,7 @@ async fn setup_refresh_parked_pre_publish() -> (
     tokio::task::JoinHandle<()>,
 ) {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
 
     let old_state = SubscribableUpstreamState::new(&["memory://x", "memory://y"]);
     let new_state = SubscribableUpstreamState::new(&[]);
@@ -4397,7 +3918,7 @@ async fn setup_refresh_parked_pre_publish() -> (
     (sm, router, old_state, new_state, gate_y, refresh)
 }
 
-/// Defect arm 1 (classify owner/route drift): a FIRST subscriber for x
+/// Owner/route drift: a FIRST subscriber for x
 /// lands entirely inside the parked pass's pre-publish window, resolves
 /// the OLD snapshot, and binds to the old owner. The pass classified
 /// before the entry existed, so pure old-vs-new route diffing would
@@ -4466,7 +3987,10 @@ async fn first_subscribe_during_refresh_window_heals_in_same_refresh() {
     // Notification-relevant invariant: an upstream resources/updated for x
     // still fans out to the surviving member.
     let mut rx = router.subscribe_notifications();
-    router.route_upstream_resource_updated(ResourceUpdatedNotificationParam::new("memory://x"));
+    router.route_upstream_resource_updated(
+        "new",
+        ResourceUpdatedNotificationParam::new("memory://x"),
+    );
     match rx.try_recv() {
         Ok(ProtocolNotification::ResourceUpdated { target, params }) => {
             assert_eq!(target, sub_target("a"));
@@ -4476,7 +4000,7 @@ async fn first_subscribe_during_refresh_window_heals_in_same_refresh() {
     }
 }
 
-/// Defect arm 2 (post-subscribe self-check): the first subscriber for x
+/// Post-subscribe self-check: the first subscriber for x
 /// resolves the OLD snapshot pre-publish, but its upstream subscribe call
 /// is still parked on the old server when the refresh publishes the new
 /// snapshot (x -> "new"). When the call lands, the entry's owner is
@@ -4540,10 +4064,8 @@ async fn first_subscribe_straddling_publish_rebinds_via_self_check() {
 
 /// Routeless-entry-gains-route-elsewhere variant: the racing-subscriber
 /// setup leaves an entry recorded on "old" with no route at all. When a
-/// later refresh routes the URI to a DIFFERENT server ("c"), classify's
-/// old None arm used to do nothing (it only pruned when the new snapshot
-/// also lacked the URI) — owner-vs-route mismatch unreconciled forever.
-/// The recorded owner must now drive a rebind onto "c".
+/// later refresh routes the URI to a DIFFERENT server ("c"), the recorded
+/// owner must drive a rebind onto "c".
 #[tokio::test]
 async fn routeless_entry_gaining_route_elsewhere_is_rebound() {
     let (sm, router, old_state) = setup_subscribe_racing_prune().await;
@@ -4591,7 +4113,7 @@ async fn setup_two_owner_router() -> (
     Arc<SubscribableUpstreamState>,
 ) {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
 
     let old_state = SubscribableUpstreamState::new(&["memory://x"]);
     let new_state = SubscribableUpstreamState::new(&[]);
@@ -4615,7 +4137,7 @@ async fn setup_two_owner_router() -> (
     (sm, router, old_state, new_state)
 }
 
-/// Defect arm (caller cancellation): the heal must not ride the caller's
+/// Caller cancellation: the heal must not ride the caller's
 /// cancellable request future. A subscribe whose upstream confirmation is
 /// still parked when a refresh publish moves the URI — and whose
 /// downstream caller is then aborted — has no self-check left to run. The
@@ -4686,7 +4208,7 @@ async fn caller_cancelled_subscribe_still_heals_via_post_confirm_hook() {
     );
 }
 
-/// Defect arm (retry doesn't heal): a retry/second subscriber against an
+/// A retry or second subscriber against an
 /// already-skewed entry resolves the NEW route, so a self-check comparing
 /// the caller-resolved server against the published route sees nothing
 /// wrong. The self-check must compare the entry's RECORDED owner instead
@@ -4742,11 +4264,11 @@ async fn retry_subscribe_heals_stale_recorded_owner() {
     );
 }
 
-/// Defect arm (silent success on failed migration): the self-check heal
+/// A failed migration is not a silent success: the self-check heal
 /// unsubscribes the stale owner and, when the new owner's subscribe fails,
-/// the transition prunes the entry — the old contract returned Ok with no
-/// live subscription anywhere. The caller must now get an error, and a
-/// fresh subscribe afterwards must succeed cleanly against the new owner.
+/// the transition prunes the entry, leaving no live subscription anywhere.
+/// The caller must get an error, and a fresh subscribe afterwards must
+/// succeed cleanly against the new owner.
 #[tokio::test]
 async fn failed_heal_migration_propagates_error_to_subscriber() {
     let (_sm, router, old_state, new_state) = setup_two_owner_router().await;
@@ -4804,7 +4326,7 @@ async fn failed_heal_migration_propagates_error_to_subscriber() {
 #[test]
 fn dropping_router_releases_subscription_registry() {
     let server_manager = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(server_manager, test_router_config());
+    let router = ToolRouter::new(server_manager, RouterConfig::default());
     let registry = Arc::downgrade(&router.resource_subscriptions);
 
     drop(router);
@@ -4857,7 +4379,7 @@ fn router_with_client_blocks(config: RouterConfig) -> ToolRouter {
 }
 
 fn context_for(client_key: Option<&str>) -> DownstreamCallContext {
-    DownstreamCallContext::stdio_for_client("client-a", RequestId::Number(1), ClientType::Unknown)
+    DownstreamCallContext::ipc("client-a", RequestId::Number(1), ClientType::Unknown, None)
         .with_client_key(client_key)
 }
 
@@ -4873,8 +4395,10 @@ fn result_text(result: &CallToolResult) -> String {
 
 #[test]
 fn a_client_with_an_allow_list_gets_only_what_is_on_it() {
-    let mut config = test_router_config();
-    config.tool_filter_enabled = false;
+    let config = RouterConfig {
+        tool_filter_enabled: false,
+        ..Default::default()
+    };
     let router = router_with_client_blocks(config);
     let allowed_tool = |server: &str, tool: &str| crate::config::AllowedTool {
         server: server.to_string(),
@@ -4942,8 +4466,10 @@ fn a_client_with_an_allow_list_gets_only_what_is_on_it() {
 
 #[test]
 fn a_blocked_client_is_not_listed_what_it_is_kept_from() {
-    let mut config = test_router_config();
-    config.tool_filter_enabled = false;
+    let config = RouterConfig {
+        tool_filter_enabled: false,
+        ..Default::default()
+    };
     let router = router_with_client_blocks(config);
     let listed = |client_key: Option<&str>| {
         tool_names(&router.list_tools_for_client_session(ClientType::ClaudeCode, None, client_key))
@@ -4959,30 +4485,27 @@ fn a_blocked_client_is_not_listed_what_it_is_kept_from() {
         );
     }
 
-    let page = router.list_tools_page_for_client_session(
-        ClientType::ClaudeCode,
-        None,
-        Some("cursor"),
-        None,
-    );
+    let page = router
+        .list_tools_page_for_client_session(ClientType::ClaudeCode, None, Some("cursor"), None)
+        .unwrap();
     assert_eq!(tool_names(&page.tools), ["slack__post"]);
 
-    assert!(
+    let sees_commit = |client_key| {
         router
-            .get_tool_definition("git__commit", Some("cursor"))
-            .is_none()
-    );
-    assert!(
-        router
-            .get_tool_definition("git__commit", Some("pi"))
-            .is_some()
-    );
+            .list_tools_for_client_session(ClientType::ClaudeCode, None, Some(client_key))
+            .iter()
+            .any(|tool| tool.name == "git__commit")
+    };
+    assert!(!sees_commit("cursor"));
+    assert!(sees_commit("pi"));
 }
 
 #[tokio::test]
 async fn a_blocked_tool_answers_a_call_as_a_tool_that_does_not_exist() {
-    let mut config = test_router_config();
-    config.tool_filter_enabled = false;
+    let config = RouterConfig {
+        tool_filter_enabled: false,
+        ..Default::default()
+    };
     let router = Arc::new(router_with_client_blocks(config));
     let call = |tool: &'static str, client_key: Option<&'static str>| {
         let router = Arc::clone(&router);
@@ -5047,8 +4570,10 @@ async fn a_blocked_tool_answers_a_call_as_a_tool_that_does_not_exist() {
 
 #[tokio::test]
 async fn the_meta_tools_do_not_reach_around_a_block() {
-    let mut config = test_router_config();
-    config.meta_tool_mode = true;
+    let config = RouterConfig {
+        meta_tool_mode: true,
+        ..Default::default()
+    };
     let router = router_with_client_blocks(config);
     let cursor = context_for(Some("cursor"));
     let pi = context_for(Some("pi"));
@@ -5125,8 +4650,10 @@ async fn the_meta_tools_do_not_reach_around_a_block() {
 
 #[test]
 fn an_allow_list_leaves_a_client_the_tool_it_searches_with() {
-    let mut config = test_router_config();
-    config.meta_tool_mode = true;
+    let config = RouterConfig {
+        meta_tool_mode: true,
+        ..Default::default()
+    };
     let router = router_with_client_blocks(config);
     let mut clients = std::collections::BTreeMap::new();
     clients.insert(
@@ -5151,7 +4678,7 @@ fn an_allow_list_leaves_a_client_the_tool_it_searches_with() {
 
 #[test]
 fn clients_hear_about_a_block_changing_and_about_nothing_else() {
-    let router = ToolRouter::new(Arc::new(ServerManager::new()), test_router_config());
+    let router = ToolRouter::new(Arc::new(ServerManager::new()), RouterConfig::default());
     let mut notifications = router.subscribe_notifications();
     let mut clients = std::collections::BTreeMap::new();
 
@@ -5298,6 +4825,12 @@ fn a_block_on_a_tool_covers_a_watch_of_it_and_survives_a_rename() {
         Some(("git".to_string(), "commit".to_string()))
     );
     assert_eq!(router.tool_behind("git__nothing"), None);
+    // An MCP App calls a tool by its server's own name.
+    assert_eq!(
+        router.tool_behind("commit"),
+        Some(("git".to_string(), "commit".to_string()))
+    );
+    assert_eq!(router.server_for_tool("commit").as_deref(), Some("git"));
     assert_eq!(
         router.listed_name("git", "commit").as_deref(),
         Some("git__commit")
@@ -5310,19 +4843,27 @@ fn a_block_on_a_tool_covers_a_watch_of_it_and_survives_a_rename() {
     assert!(!router.client_is_kept_from_a_server(None));
 }
 
+#[test]
+fn applying_settings_says_when_the_catalog_must_be_rebuilt() {
+    let router = ToolRouter::new(Arc::new(ServerManager::new()), RouterConfig::default());
+    let mut config = crate::config::Config::default();
+    assert!(!router.apply_config(&config));
+
+    config.disabled_tools = vec!["Git__*".to_string()];
+    assert!(router.apply_config(&config));
+    assert!(!router.apply_config(&config), "nothing changed");
+    config.disabled_tools = vec!["git__*".to_string()];
+    assert!(
+        !router.apply_config(&config),
+        "patterns match ignoring case"
+    );
+}
+
 /// Two servers, each with a resource, a resource template, and a prompt.
 /// `cursor` is kept from `git`.
 fn router_with_blocked_resources_and_prompts() -> Arc<ToolRouter> {
-    let router = ToolRouter::new(Arc::new(ServerManager::new()), test_router_config());
+    let router = ToolRouter::new(Arc::new(ServerManager::new()), RouterConfig::default());
     router.replace_snapshot(RouterSnapshot {
-        routes: HashMap::new(),
-        routes_lower: HashMap::new(),
-        tools_by_name: HashMap::new(),
-        tools_by_name_lower: HashMap::new(),
-        tools_all: Arc::new(Vec::new()),
-        meta_tools_all: Arc::new(build_meta_tools()),
-        tools_devin: Arc::new(Vec::new()),
-        tools_copilot: Arc::new(Vec::new()),
         resources_all: Arc::new(vec![
             Resource::new("git://log", "git__log"),
             Resource::new("slack://inbox", "slack__inbox"),
@@ -5351,8 +4892,7 @@ fn router_with_blocked_resources_and_prompts() -> Arc<ToolRouter> {
                 ("slack".to_string(), "digest".to_string()),
             ),
         ]),
-        tool_definition_fingerprints: HashMap::new(),
-        tool_risk_inventory: HashMap::new(),
+        ..Default::default()
     });
     let mut clients = std::collections::BTreeMap::new();
     clients.insert(
@@ -5371,32 +4911,45 @@ fn a_blocked_client_is_not_listed_the_resources_and_prompts_of_that_server() {
     let router = router_with_blocked_resources_and_prompts();
 
     let blocked = Some("cursor");
-    let resources = router.list_resources_page(None, blocked).resources;
+    let resources = router.list_resources_page(None, blocked).unwrap().resources;
     assert_eq!(resources.len(), 1);
     assert_eq!(resources[0].uri, "slack://inbox");
     let templates = router
         .list_resource_templates_page(None, blocked)
+        .unwrap()
         .resource_templates;
     assert_eq!(templates.len(), 1);
     assert_eq!(templates[0].uri_template, "slack://channel/{id}");
-    let prompts = router.list_prompts_page(None, blocked).prompts;
+    let prompts = router.list_prompts_page(None, blocked).unwrap().prompts;
     assert_eq!(prompts.len(), 1);
     assert_eq!(prompts[0].name, "slack__digest");
 
     // No entry, and no key at all, both get everything.
     for unblocked in [Some("claude-code"), None] {
         assert_eq!(
-            router.list_resources_page(None, unblocked).resources.len(),
+            router
+                .list_resources_page(None, unblocked)
+                .unwrap()
+                .resources
+                .len(),
             2
         );
         assert_eq!(
             router
                 .list_resource_templates_page(None, unblocked)
+                .unwrap()
                 .resource_templates
                 .len(),
             2
         );
-        assert_eq!(router.list_prompts_page(None, unblocked).prompts.len(), 2);
+        assert_eq!(
+            router
+                .list_prompts_page(None, unblocked)
+                .unwrap()
+                .prompts
+                .len(),
+            2
+        );
     }
 }
 
@@ -5483,24 +5036,29 @@ async fn a_blocked_resource_or_prompt_answers_as_one_that_does_not_exist() {
 #[test]
 fn a_client_kept_from_a_server_stops_hearing_its_resource_updates() {
     let router = router_with_blocked_resources_and_prompts();
-    let cursor = NotificationTarget::Stdio {
+    let cursor = NotificationTarget::Ipc {
         client_id: Arc::from("cursor-session"),
     };
-    let zed = NotificationTarget::Stdio {
+    let zed = NotificationTarget::Ipc {
         client_id: Arc::from("zed-session"),
     };
     // Both subscribed before `cursor` was kept from `git`.
     for (target, key) in [(&cursor, "cursor"), (&zed, "zed")] {
-        router
-            .resource_subscriptions
-            .insert_active_for_test("git://log", target.clone());
+        router.resource_subscriptions.insert_active_for_test(
+            "git://log",
+            Some("git"),
+            target.clone(),
+        );
         router
             .subscriber_client_keys
             .insert(target.clone(), key.to_string());
     }
     let mut notifications = router.subscribe_notifications();
     let mut heard = |router: &ToolRouter| {
-        router.route_upstream_resource_updated(ResourceUpdatedNotificationParam::new("git://log"));
+        router.route_upstream_resource_updated(
+            "git",
+            ResourceUpdatedNotificationParam::new("git://log"),
+        );
         let mut targets = Vec::new();
         while let Ok(notification) = notifications.try_recv() {
             if let ProtocolNotification::ResourceUpdated { target, .. } = notification {
@@ -5517,4 +5075,156 @@ fn a_client_kept_from_a_server_stops_hearing_its_resource_updates() {
     let both = heard(&router);
     assert_eq!(both.len(), 2);
     assert!(both.contains(&cursor) && both.contains(&zed));
+}
+
+#[test]
+fn a_server_cannot_say_another_servers_resource_changed() {
+    use crate::server::UpstreamEvents as _;
+    let router = router_with_blocked_resources_and_prompts();
+    let zed = NotificationTarget::Ipc {
+        client_id: Arc::from("zed-session"),
+    };
+    // One entry the subscribe recorded an owner for, one known only by route.
+    router
+        .resource_subscriptions
+        .insert_active_for_test("git://log", Some("git"), zed.clone());
+    router
+        .resource_subscriptions
+        .insert_active_for_test("git://commit/1", None, zed.clone());
+    router
+        .subscriber_client_keys
+        .insert(zed.clone(), "zed".to_string());
+    let mut notifications = router.subscribe_notifications();
+    let mut heard = |server: &str, uri: &str| {
+        router.resource_updated(server, ResourceUpdatedNotificationParam::new(uri));
+        let mut uris = Vec::new();
+        while let Ok(notification) = notifications.try_recv() {
+            if let ProtocolNotification::ResourceUpdated { params, .. } = notification {
+                uris.push(params.uri);
+            }
+        }
+        uris
+    };
+
+    assert!(heard("other", "git://log").is_empty());
+    assert!(heard("other", "git://commit/1").is_empty());
+    assert_eq!(heard("git", "git://log"), vec!["git://log".to_string()]);
+    assert_eq!(
+        heard("git", "git://commit/1"),
+        vec!["git://commit/1".to_string()]
+    );
+}
+
+/// An upstream that takes requests and never answers them.
+struct SilentUpstreamHandler;
+
+impl ServerHandler for SilentUpstreamHandler {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::default())
+    }
+
+    fn complete(
+        &self,
+        _request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CompleteResult, McpError>> + Send + '_ {
+        std::future::pending()
+    }
+
+    fn set_level(
+        &self,
+        _request: SetLevelRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        std::future::pending()
+    }
+
+    fn subscribe(
+        &self,
+        _request: SubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        std::future::pending()
+    }
+
+    fn unsubscribe(
+        &self,
+        _request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        std::future::pending()
+    }
+}
+
+async fn connect_silent_upstream(name: &str) -> UpstreamServer {
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let server = SilentUpstreamHandler
+            .serve(server_transport)
+            .await
+            .expect("start silent upstream test server");
+        let _ = server.waiting().await;
+    });
+    let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+    let handler = Arc::new(UpstreamClientHandler::new_for_tests(
+        Arc::from(name.to_string()),
+        Arc::clone(&tools),
+        crate::server::no_events(),
+    ));
+    let client = handler
+        .serve(client_transport)
+        .await
+        .expect("connect silent upstream test client");
+    let mut capabilities = ServerCapabilities::default();
+    capabilities.logging = Some(serde_json::Map::new());
+    let mut resources = rmcp::model::ResourcesCapability::default();
+    resources.subscribe = Some(true);
+    capabilities.resources = Some(resources);
+    UpstreamServer {
+        capabilities,
+        ..UpstreamServer::for_tests(name.to_string(), client, tools)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn requests_to_an_upstream_that_never_answers_end_at_its_call_timeout() {
+    let sm = Arc::new(ServerManager::new());
+    let router = ToolRouter::new(Arc::clone(&sm), RouterConfig::default());
+    sm.replace_server("silent", connect_silent_upstream("silent").await)
+        .await;
+    let mut snapshot = (*router.cache.load_full()).clone();
+    snapshot.prompt_routes.insert(
+        "silent__greet".to_string(),
+        ("silent".to_string(), "greet".to_string()),
+    );
+    router.cache.store(Arc::new(snapshot));
+    let call_timeout = Duration::from_secs(30);
+
+    let started = tokio::time::Instant::now();
+    let error = router
+        .complete_request(
+            CompleteRequestParams::new(
+                Reference::for_prompt("silent__greet"),
+                ArgumentInfo::new("name", "a"),
+            ),
+            None,
+        )
+        .await
+        .expect_err("a completion nobody answers fails");
+    assert!(error.message.contains("timed out"), "{error:?}");
+    assert_eq!(started.elapsed(), call_timeout);
+
+    let started = tokio::time::Instant::now();
+    router.forward_set_level_to_upstreams().await;
+    assert_eq!(started.elapsed(), call_timeout);
+
+    use subscriptions::UpstreamResourceOps as _;
+    let upstream = sm.get_upstream("silent").expect("silent upstream");
+    for answer in [
+        upstream.subscribe_resource("file:///notes").await,
+        upstream.unsubscribe_resource("file:///notes").await,
+    ] {
+        let error = answer.expect_err("a subscription change nobody answers fails");
+        assert!(error.message.contains("timed out"), "{error:?}");
+    }
 }

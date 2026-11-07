@@ -1,7 +1,6 @@
 import Foundation
 
-/// The three things a newcomer does, and how far along they are. Pure value,
-/// so what counts as done can be tested without a daemon.
+/// The three things a newcomer does, and how far along they are.
 struct FirstRunGuide: Equatable, Sendable {
     enum Step: String, CaseIterable, Identifiable, Sendable {
         case server, client, activity
@@ -125,17 +124,9 @@ extension AppModel {
     var setupCount: SetupCount {
         SetupCount(
             servers: snapshot.configuredServers.count,
-            clients: connectableApps.filter(\.linked).count,
+            clients: actions.connectableApps.filter(\.linked).count,
             events: snapshot.events?.count ?? 0
         )
     }
 
-    /// Where this Mac is in the three steps.
-    var firstRunGuide: FirstRunGuide {
-        FirstRunGuide(
-            serverCount: snapshot.configuredServers.count,
-            clientCount: connectableApps.filter { $0.linked || $0.live }.count + snapshot.downstreamClients.count,
-            hasActivity: !activities.isEmpty
-        )
-    }
 }

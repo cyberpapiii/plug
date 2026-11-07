@@ -1,10 +1,40 @@
-#![allow(clippy::mutable_key_type)]
-
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use serde::Serialize;
 
 use crate::config::{Config, TransportType};
+
+/// Every check's identifier. The CLI adds the checks that need a running
+/// Plug, so it names them from here, where their titles are.
+pub mod check {
+    pub const CONFIG_EXISTS: &str = "config_exists";
+    pub const CONFIG_PERMISSIONS: &str = "config_permissions";
+    pub const KEYS_IN_CONFIG: &str = "keys_in_config";
+    pub const PORT_AVAILABLE: &str = "port_available";
+    pub const ENV_VARS: &str = "env_vars";
+    pub const SERVER_BINARIES: &str = "server_binaries";
+    pub const CLIENT_LIMITS: &str = "client_limits";
+    pub const PID_STALENESS: &str = "pid_staleness";
+    pub const RUNTIME_HEALTH: &str = "runtime_health";
+    pub const CLIENT_CONFIGS: &str = "client_configs";
+    pub const SERVER_CONNECTIVITY: &str = "server_connectivity";
+    pub const HTTP_AUTH: &str = "http_auth";
+    pub const DOWNSTREAM_OAUTH_OWNER: &str = "downstream_oauth_owner";
+    pub const DOWNSTREAM_OAUTH_CLIENTS: &str = "downstream_oauth_clients";
+    pub const OAUTH_CONFIG: &str = "oauth_config";
+    pub const OAUTH_TOKENS: &str = "oauth_tokens";
+    pub const AUTH_AVAILABILITY: &str = "auth_availability";
+    pub const RUNTIME_AUTH_MISSING: &str = "runtime_auth_missing";
+    pub const RUNTIME_AUTH_REAUTH: &str = "runtime_auth_reauth";
+    pub const RUNTIME_AUTH_DEGRADED: &str = "runtime_auth_degraded";
+    pub const RUNTIME_DEGRADED: &str = "runtime_degraded";
+    pub const RUNTIME_FAILURES: &str = "runtime_failures";
+    pub const RUNTIME_AVAILABILITY: &str = "runtime_availability";
+    pub const CODESIGN_IDENTITY: &str = "codesign_identity";
+    pub const UNIFIED_INSTALL: &str = "unified_install";
+    pub const DOCTOR_INTERPRETATION: &str = "doctor_interpretation";
+}
 
 /// Status of a single diagnostic check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -28,27 +58,30 @@ impl CheckResult {
     /// identifier (`config_permissions`); the CLI and the app both show this.
     pub fn title(&self) -> String {
         let title = match self.name.as_str() {
-            "config_exists" => "Settings file",
-            "config_permissions" => "Settings file is private",
-            "keys_in_config" => "Keys kept in the Keychain",
-            "port_available" => "Network port",
-            "env_vars" => "Server keys",
-            "server_binaries" => "Server programs",
-            "tool_collisions" => "Tool names",
-            "client_limits" => "Tools a client can take",
-            "pid_staleness" | "runtime_health" => "Background service",
-            "client_configs" => "Client setup",
-            "server_connectivity" => "Servers responding",
-            "http_auth" | "downstream_oauth_owner" => "Remote access",
-            "downstream_oauth_clients" => "Remote clients",
-            "oauth_config" | "oauth_tokens" | "auth_availability" => "Stored sign-ins",
-            "runtime_auth_missing" | "runtime_auth_reauth" | "runtime_auth_degraded" => {
-                "Server sign-ins"
+            check::CONFIG_EXISTS => "Settings file",
+            check::CONFIG_PERMISSIONS => "Settings file is private",
+            check::KEYS_IN_CONFIG => "Keys kept in the Keychain",
+            check::PORT_AVAILABLE => "Network port",
+            check::ENV_VARS => "Server keys",
+            check::SERVER_BINARIES => "Server programs",
+            check::CLIENT_LIMITS => "Tools a client can take",
+            check::PID_STALENESS | check::RUNTIME_HEALTH => "Background service",
+            check::CLIENT_CONFIGS => "Client setup",
+            check::SERVER_CONNECTIVITY => "Servers responding",
+            check::HTTP_AUTH | check::DOWNSTREAM_OAUTH_OWNER => "Remote access",
+            check::DOWNSTREAM_OAUTH_CLIENTS => "Remote clients",
+            check::OAUTH_CONFIG | check::OAUTH_TOKENS | check::AUTH_AVAILABILITY => {
+                "Stored sign-ins"
             }
-            "runtime_degraded" | "runtime_failures" | "runtime_availability" => "Servers",
-            "codesign_identity" => "App signature",
-            "unified_install" => "Installation",
-            "doctor_interpretation" => "Summary",
+            check::RUNTIME_AUTH_MISSING
+            | check::RUNTIME_AUTH_REAUTH
+            | check::RUNTIME_AUTH_DEGRADED => "Server sign-ins",
+            check::RUNTIME_DEGRADED | check::RUNTIME_FAILURES | check::RUNTIME_AVAILABILITY => {
+                "Servers"
+            }
+            check::CODESIGN_IDENTITY => "App signature",
+            check::UNIFIED_INSTALL => "Installation",
+            check::DOCTOR_INTERPRETATION => "Summary",
             other => return other.replace('_', " "),
         };
         title.to_string()
@@ -93,7 +126,6 @@ impl DoctorReport {
 
 /// Run all diagnostic checks and return an aggregated report.
 pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
-    // Run independent checks concurrently
     let (
         config_exists,
         config_perms,
@@ -101,8 +133,6 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         env_vars,
         binaries,
         connectivity,
-        collisions,
-        limits,
         pid,
         clients,
         http_auth,
@@ -112,15 +142,13 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         codesign,
     ) = tokio::join!(
         check_config_exists(config_path),
-        check_config_permissions(config, config_path),
+        check_config_permissions(config_path),
         check_port_available(config),
-        check_env_vars(config),
+        check_env_vars(config, config_path),
         check_server_binaries(config),
         check_server_connectivity(config),
-        check_tool_collisions(config),
-        check_client_limits(config),
         check_pid_staleness(),
-        check_client_configs(),
+        check_client_configs(&config.http),
         check_http_auth(config),
         check_downstream_oauth_owner(config),
         check_oauth_config(config),
@@ -135,8 +163,7 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         port,
         env_vars,
         binaries,
-        collisions,
-        limits,
+        check_client_limits(&config.http),
         pid,
         clients,
         connectivity,
@@ -151,7 +178,7 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
 }
 
 async fn check_downstream_oauth_owner(config: &Config) -> CheckResult {
-    let state_dir = crate::config::config_dir().join("downstream_oauth");
+    let state_dir = crate::paths::downstream_oauth_dir();
     check_downstream_oauth_owner_with_state_dir(config, &state_dir).await
 }
 
@@ -159,7 +186,7 @@ async fn check_downstream_oauth_owner_with_state_dir(
     config: &Config,
     state_dir: &Path,
 ) -> CheckResult {
-    let name = "downstream_oauth_owner".to_string();
+    let name = check::DOWNSTREAM_OAUTH_OWNER.to_string();
     let Some(oauth) =
         crate::downstream_oauth::DownstreamOauthConfig::from_http_config(&config.http)
     else {
@@ -213,9 +240,9 @@ async fn check_downstream_oauth_owner_with_state_dir(
     }
 }
 
-/// Check 1: config file exists and is valid TOML.
+/// Whether the config file exists and is valid TOML.
 async fn check_config_exists(config_path: &Path) -> CheckResult {
-    let name = "config_exists".to_string();
+    let name = check::CONFIG_EXISTS.to_string();
 
     if !config_path.exists() {
         return CheckResult {
@@ -257,11 +284,10 @@ fn toml_parse(contents: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Keys written in the config file, which the Keychain would keep better.
-/// Reads the file as written: after `$VAR` expansion every value looks typed.
-fn check_keys_in_config(config_path: &Path) -> CheckResult {
-    let name = "keys_in_config".to_string();
-    let mut found: Vec<String> = crate::operator::load_editable_config(config_path)
+/// Keys written in the config file, as `<server>.<field>`. Reads the file as
+/// written: after `$VAR` expansion every value looks typed.
+fn keys_written(config_path: &Path) -> Vec<String> {
+    let mut found: Vec<String> = crate::config::load_editable_config(config_path)
         .map(|config| {
             let stores = crate::secrets::Stores::from_config(&config.secrets);
             config
@@ -277,6 +303,13 @@ fn check_keys_in_config(config_path: &Path) -> CheckResult {
         })
         .unwrap_or_default();
     found.sort();
+    found
+}
+
+/// Keys written in the config file, which the Keychain would keep better.
+fn check_keys_in_config(config_path: &Path) -> CheckResult {
+    let name = check::KEYS_IN_CONFIG.to_string();
+    let found = keys_written(config_path);
     if found.is_empty() {
         CheckResult {
             name,
@@ -294,9 +327,9 @@ fn check_keys_in_config(config_path: &Path) -> CheckResult {
     }
 }
 
-/// Check 2: config file permissions (Unix only).
-async fn check_config_permissions(config: &Config, config_path: &Path) -> CheckResult {
-    let name = "config_permissions".to_string();
+/// Whether a config file that holds keys is private.
+async fn check_config_permissions(config_path: &Path) -> CheckResult {
+    let name = check::CONFIG_PERMISSIONS.to_string();
 
     if !config_path.exists() {
         return CheckResult {
@@ -307,18 +340,11 @@ async fn check_config_permissions(config: &Config, config_path: &Path) -> CheckR
         };
     }
 
-    #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         match std::fs::metadata(config_path) {
             Ok(meta) => {
                 let mode = meta.permissions().mode() & 0o777;
-                let has_secrets = config.servers.values().any(|s| {
-                    s.auth_token.is_some()
-                        || s.env.values().any(|v| {
-                            v.contains("KEY") || v.contains("TOKEN") || v.contains("SECRET")
-                        })
-                });
+                let has_secrets = !keys_written(config_path).is_empty();
 
                 if has_secrets && (mode & 0o077) != 0 {
                     CheckResult {
@@ -346,34 +372,20 @@ async fn check_config_permissions(config: &Config, config_path: &Path) -> CheckR
             },
         }
     }
-
-    #[cfg(not(unix))]
-    {
-        let _ = config;
-        CheckResult {
-            name,
-            status: CheckStatus::Pass,
-            message: "Permission check skipped (non-Unix)".to_string(),
-            fix_suggestion: None,
-        }
-    }
 }
 
-/// Check 3: port 3282 (or configured port) is available.
+/// Whether the configured HTTP port is free, or held by Plug itself.
 async fn check_port_available(config: &Config) -> CheckResult {
-    let name = "port_available".to_string();
+    let name = check::PORT_AVAILABLE.to_string();
     let addr = format!("{}:{}", config.http.bind_address, config.http.port);
 
     match tokio::net::TcpListener::bind(&addr).await {
-        Ok(_listener) => {
-            // Listener is dropped here, releasing the port
-            CheckResult {
-                name,
-                status: CheckStatus::Pass,
-                message: format!("Port {} is available", config.http.port),
-                fix_suggestion: None,
-            }
-        }
+        Ok(_listener) => CheckResult {
+            name,
+            status: CheckStatus::Pass,
+            message: format!("Port {} is available", config.http.port),
+            fix_suggestion: None,
+        },
         Err(e) => {
             if let Some(pid) = running_daemon_pid() {
                 CheckResult {
@@ -400,27 +412,24 @@ async fn check_port_available(config: &Config) -> CheckResult {
     }
 }
 
-/// Check 4: all env vars referenced in server configs are set.
-/// Core plug vars (PLUG_*) cause Fail; third-party server vars only Warn.
-async fn check_env_vars(config: &Config) -> CheckResult {
-    let name = "env_vars".to_string();
+/// Whether every `$NAME` the config uses is set. One in Plug's own settings
+/// fails, since Plug would not start with it; one in a server only warns.
+async fn check_env_vars(config: &Config, config_path: &Path) -> CheckResult {
+    let name = check::ENV_VARS.to_string();
     let mut core_missing: Vec<String> = Vec::new();
     let mut third_party_missing: Vec<String> = Vec::new();
+    let vars = crate::config::env::env_source(config_path);
 
-    crate::config::visit_env_expandable_fields(config, |server_name, field, value| {
-        for var in extract_env_refs(value) {
-            if std::env::var(&var).is_ok() {
+    crate::config::for_each_expandable(&mut config.clone(), |server_name, field, value| {
+        for var in crate::config::env::env_refs(value) {
+            if vars.contains_key(&var) {
                 continue;
             }
-            let message = if let Some(server_name) = server_name {
-                format!("{server_name}.{field} references ${var}")
-            } else {
-                format!("config.{field} references ${var}")
-            };
-            if server_name.is_some_and(|server_name| !server_name.starts_with("plug")) {
-                third_party_missing.push(message);
-            } else {
-                core_missing.push(message);
+            match server_name {
+                Some(server_name) => {
+                    third_party_missing.push(format!("{server_name}.{field} references ${var}"))
+                }
+                None => core_missing.push(format!("config.{field} references ${var}")),
             }
         }
     });
@@ -456,31 +465,30 @@ async fn check_env_vars(config: &Config) -> CheckResult {
     }
 }
 
-/// Extract `$VAR_NAME` references from a string.
-fn extract_env_refs(input: &str) -> Vec<String> {
-    crate::config::expand::extract_env_refs(input)
-}
-
-/// Check 5: each stdio server's command binary is found in PATH.
+/// Whether each stdio server's command is found in PATH.
 async fn check_server_binaries(config: &Config) -> CheckResult {
-    let login_path = crate::server::stdio_login_path().await;
+    let login_path = crate::server::path::stdio_login_path().await;
     server_binaries_result(
         config,
-        |binary| which(binary, login_path),
-        crate::server::resolve_without_login_shell,
+        |command| {
+            let path = crate::server::path::resolve_stdio_command(command, login_path);
+            path.is_file().then_some(path)
+        },
+        crate::server::path::resolve_without_login_shell,
     )
 }
 
-/// `resolve` finds a binary the way this shell does. `resolve_fallback` finds
-/// it the way the daemon does when its login-shell PATH probe fails, which
-/// happens after a reboot on a slow login. A binary only the first finds is a
-/// server that will not start after some reboots, so it earns a warning.
+/// `resolve` finds a server's whole `command` the way the daemon does.
+/// `resolve_fallback` finds a bare name the way the daemon does when its
+/// login-shell PATH probe fails, which happens after a reboot on a slow login.
+/// A name only the first finds is a server that will not start after some
+/// reboots, so it earns a warning.
 fn server_binaries_result(
     config: &Config,
     resolve: impl Fn(&str) -> Option<std::path::PathBuf>,
     resolve_fallback: impl Fn(&str) -> Option<std::path::PathBuf>,
 ) -> CheckResult {
-    let name = "server_binaries".to_string();
+    let name = check::SERVER_BINARIES.to_string();
     let mut missing: Vec<String> = Vec::new();
     let mut login_shell_only: Vec<String> = Vec::new();
     let check_fallback = cfg!(target_os = "macos");
@@ -494,27 +502,23 @@ fn server_binaries_result(
         if !matches!(server.transport, TransportType::Stdio) {
             continue;
         }
-        if let Some(ref cmd) = server.command {
-            // Extract the actual binary name (first word, skip env var refs)
-            let binary = cmd.split_whitespace().next().unwrap_or(cmd);
-            if binary.starts_with('$') {
-                continue; // Skip env var references
+        let Some(command) = server.command.as_deref() else {
+            continue;
+        };
+        // An unset `$NAME` is the env var check's to report.
+        if command.starts_with('$') {
+            continue;
+        }
+        match resolve(command) {
+            None => missing.push(format!("{server_name}: {command}")),
+            Some(found)
+                if check_fallback
+                    && crate::server::path::is_bare_name(command)
+                    && resolve_fallback(command).is_none() =>
+            {
+                login_shell_only.push(format!("{server_name}: {command} ({})", found.display()));
             }
-            // Check if it's an absolute path
-            if binary.starts_with('/') || binary.starts_with('.') {
-                if !Path::new(binary).exists() {
-                    missing.push(format!("{server_name}: {binary}"));
-                }
-            } else {
-                match resolve(binary) {
-                    None => missing.push(format!("{server_name}: {binary}")),
-                    Some(found) if check_fallback && resolve_fallback(binary).is_none() => {
-                        login_shell_only
-                            .push(format!("{server_name}: {binary} ({})", found.display()));
-                    }
-                    Some(_) => {}
-                }
-            }
+            Some(_) => {}
         }
     }
 
@@ -547,147 +551,31 @@ fn server_binaries_result(
     }
 }
 
-/// Simple which-like lookup in PATH.
-fn which(binary: &str, login_path: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
-    let path = crate::server::resolve_stdio_command(binary, login_path);
-    path.is_file().then_some(path)
-}
-
-/// Check 6: detect tools with the same name from different servers.
-async fn check_tool_collisions(config: &Config) -> CheckResult {
-    let name = "tool_collisions".to_string();
-
-    let message = if config.enable_prefix {
-        "Tool prefixing is enabled — collisions are avoided".to_string()
-    } else {
-        "Tool prefixing is disabled; duplicate names fall back to server-qualified names"
-            .to_string()
-    };
-
-    CheckResult {
-        name,
-        status: CheckStatus::Pass,
-        message,
-        fix_suggestion: None,
-    }
-}
-
-/// A published ceiling on how many MCP tools one client will accept at once.
-struct ClientToolLimit {
-    client: &'static str,
-    /// `ExportTarget` name, so the ceiling is only raised for a client that is
-    /// actually pointed at plug.
-    target: &'static str,
-    limit: usize,
-    /// Date this entry was last checked against `source`, `YYYY-MM-DD`.
-    verified: &'static str,
-    /// The page that was read. Primary vendor documentation where one exists.
-    source: &'static str,
-}
-
-/// Known per-client tool ceilings.
-///
-/// These are other products' limits, not plug's. They move when those products
-/// move, and a number compiled in here goes stale silently — nothing fails, the
-/// check just starts asserting something untrue. That already happened once:
-/// the table shipped on 2026-03-04 with `("Cursor", 40)` and was still claiming
-/// it five months later, long after Cursor had dropped the cap.
-///
-/// So every entry carries the date it was last checked and the page that was
-/// read. Re-verify before trusting one, and move `verified` when you do. A
-/// client that publishes no fixed ceiling does not belong in this table —
-/// omitting it is the accurate answer, and inventing a number to fill the row
-/// is how the Cursor entry got there.
-///
-/// Deliberately absent, each confirmed 2026-08-08:
-/// - **Cursor.** Older versions warned above roughly 40-50 tools. Current
-///   versions use Dynamic Context Discovery and publish no ceiling;
-///   <https://cursor.com/docs/context/mcp> states no limit.
-/// - **Claude Code, Codex CLI, Grok Build.** No published ceiling.
-/// - **Devin.** The `devin` target writes `~/.config/devin/mcp_config.json`,
-///   which the Devin CLI and Devin Desktop's default agent read, and neither
-///   publishes a ceiling;
-///   <https://docs.devin.ai/cli/extensibility/mcp/configuration> (2026-10-03).
-///   Cascade, the desktop app's legacy agent, caps at 100
-///   (<https://docs.devin.ai/desktop/cascade/mcp>), but it reads the old
-///   Windsurf file that plug no longer writes, so a linked `devin` target says
-///   nothing about Cascade. `ClientType::Devin` still carries that 100 for the
-///   session filter, keyed on the `windsurf-client` identity Cascade reports.
-const KNOWN_CLIENT_TOOL_LIMITS: &[ClientToolLimit] = &[ClientToolLimit {
-    client: "VS Code Copilot",
-    target: "vscode",
-    limit: 128,
-    verified: "2026-08-30",
-    // Hard cap enforced per request; `github.copilot.chat.virtualTools.threshold`
-    // itself caps at 128, and extra tools are deferred behind `activate_*` stubs.
-    source: "https://github.com/microsoft/vscode/issues/290356",
-}];
-
-/// Number of plug entries a client config file declares.
-///
-/// More than one is a duplicate to repair; at least one means the client is
-/// pointed at plug. Shared so both readings come from the same parse.
-fn plug_entry_count(content: &str, extension: Option<&str>) -> usize {
-    match extension {
-        Some("toml") => content
-            .lines()
-            .filter(|l| l.trim() == "[mcp_servers.plug]")
-            .count(),
-        // Goose and Hermes Agent key their servers by name. A link written
-        // by hand in Hermes is often `Plug:`.
-        Some("yaml") | Some("yml") => content
-            .lines()
-            .filter(|l| l.trim().eq_ignore_ascii_case("plug:"))
-            .count(),
-        _ => {
-            let Ok(json) = serde_json::from_str::<serde_json::Value>(content) else {
-                return 0;
-            };
-            let mut count = 0;
-            for key in [
-                "mcpServers",
-                "context_servers",
-                "amp.mcpServers",
-                "mcp_servers",
-            ] {
-                if json.get(key).and_then(|v| v.get("plug")).is_some() {
-                    count += 1;
-                }
-            }
-            for path in [["mcp", "servers"], ["tools", "mcpServers"]] {
-                if json
-                    .get(path[0])
-                    .and_then(|v| v.get(path[1]))
-                    .and_then(|s| s.get("plug"))
-                    .is_some()
-                {
-                    count += 1;
-                }
-            }
-            count
-        }
-    }
+/// Each settings file of `target` that exists, with its scope and contents.
+fn client_files(
+    target: crate::clients::ClientTarget,
+) -> Vec<(crate::clients::Scope, std::path::PathBuf, String)> {
+    [crate::clients::Scope::User, crate::clients::Scope::Project]
+        .into_iter()
+        .filter_map(|scope| Some((scope, target.config_path(scope)?)))
+        .filter_map(|(scope, path)| {
+            let content = std::fs::read_to_string(&path).ok()?;
+            Some((scope, path, content))
+        })
+        .collect()
 }
 
 /// Whether `target`'s own config points at plug, globally or per project.
-fn client_is_linked_to_plug(target: &str) -> bool {
-    let Ok(target_enum) = target.parse::<crate::export::ExportTarget>() else {
-        return false;
-    };
-    [
-        crate::export::default_config_path(target_enum, false),
-        crate::export::default_config_path(target_enum, true),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|path| {
-        std::fs::read_to_string(&path).is_ok_and(|content| {
-            plug_entry_count(&content, path.extension().and_then(|e| e.to_str())) > 0
-        })
-    })
+fn client_is_linked_to_plug(
+    target: crate::clients::ClientTarget,
+    plug: &crate::config::HttpConfig,
+) -> bool {
+    client_files(target)
+        .iter()
+        .any(|(_, _, content)| target.layout().plug_entry_count(content, plug) > 0)
 }
 
-/// Check 7: report published tool ceilings for the clients actually using plug.
+/// Published tool ceilings of the clients actually using plug.
 ///
 /// Doctor never starts a server, so it cannot know how many tools plug merges.
 /// This check used to multiply the enabled-server count by an assumed ten tools
@@ -696,14 +584,22 @@ fn client_is_linked_to_plug(target: &str) -> bool {
 /// large ones hid a real 600. The one thing doctor can read from disk is which
 /// clients are pointed at plug, so that is what it reports. The real total is
 /// `plug status`, which counts tools the servers actually returned.
-async fn check_client_limits(_config: &Config) -> CheckResult {
-    let name = "client_limits".to_string();
-
-    let linked: Vec<&ClientToolLimit> = KNOWN_CLIENT_TOOL_LIMITS
+fn check_client_limits(plug: &crate::config::HttpConfig) -> CheckResult {
+    let linked = crate::clients::TOOL_LIMITS
         .iter()
-        .filter(|entry| client_is_linked_to_plug(entry.target))
+        .filter(|entry| {
+            entry
+                .linked_by
+                .is_some_and(|target| client_is_linked_to_plug(target, plug))
+        })
         .collect();
+    client_limits_result(check::CLIENT_LIMITS.to_string(), linked)
+}
 
+fn client_limits_result(
+    name: String,
+    linked: Vec<&crate::clients::ClientToolLimit>,
+) -> CheckResult {
     if linked.is_empty() {
         return CheckResult {
             name,
@@ -736,17 +632,11 @@ async fn check_client_limits(_config: &Config) -> CheckResult {
     }
 }
 
-/// Check 8: if PID file exists, check if process is actually running.
+/// Whether the process a PID file names is running.
 async fn check_pid_staleness() -> CheckResult {
-    let name = "pid_staleness".to_string();
+    let name = check::PID_STALENESS.to_string();
 
-    let pid_path = directories::ProjectDirs::from("", "", "plug")
-        .map(|dirs| {
-            dirs.runtime_dir()
-                .unwrap_or(dirs.data_dir())
-                .join("plug.pid")
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/plug.pid"));
+    let pid_path = crate::paths::pid_path();
 
     if !pid_path.exists() {
         return CheckResult {
@@ -798,43 +688,27 @@ async fn check_pid_staleness() -> CheckResult {
     }
 }
 
-/// Check if a process with the given PID is running.
 fn is_process_running(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        let result = std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        matches!(result, Ok(status) if status.success())
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
+    let result = std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    matches!(result, Ok(status) if status.success())
 }
 
 fn running_daemon_pid() -> Option<u32> {
-    let pid_path = directories::ProjectDirs::from("", "", "plug")
-        .map(|dirs| {
-            dirs.runtime_dir()
-                .unwrap_or(dirs.data_dir())
-                .join("plug.pid")
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/plug.pid"));
+    let pid_path = crate::paths::pid_path();
     let pid_str = std::fs::read_to_string(pid_path).ok()?;
     let pid = pid_str.trim().parse::<u32>().ok()?;
     is_process_running(pid).then_some(pid)
 }
 
-/// Check 9: try to start and initialize each server (5s timeout).
+/// Whether each enabled remote server's URL accepts a connection.
 async fn check_server_connectivity(config: &Config) -> CheckResult {
     use futures::future::join_all;
 
-    let name = "server_connectivity".to_string();
+    let name = check::SERVER_CONNECTIVITY.to_string();
     // Stdio servers are covered by `server_binaries`; reporting a missing
     // binary here too made one problem show up as two.
     let remote_servers: Vec<(&str, &str)> = config
@@ -855,8 +729,6 @@ async fn check_server_connectivity(config: &Config) -> CheckResult {
         };
     }
 
-    // We don't actually start servers in doctor mode — that would be disruptive.
-    // Instead, we check that each remote URL is reachable.
     let connectivity_checks = remote_servers.iter().map(|(server_name, url)| async move {
         check_http_reachable(url)
             .await
@@ -949,141 +821,108 @@ async fn check_http_reachable(url: &str) -> Result<(), String> {
     Err(last_error.unwrap_or_else(|| "connection failed".to_string()))
 }
 
-/// Check 9: detect duplicate or corrupted plug entries in AI client configs.
-async fn check_client_configs() -> CheckResult {
-    let name = "client_configs".to_string();
+/// Duplicate or unreadable plug entries in client configs.
+async fn check_client_configs(plug: &crate::config::HttpConfig) -> CheckResult {
     let mut issues = Vec::new();
-
-    let all_targets = [
-        "claude-desktop",
-        "claude-code",
-        "cursor",
-        "vscode",
-        "copilot-cli",
-        "devin",
-        "gemini-cli",
-        "codex-cli",
-        "grok-build",
-        "opencode",
-        "zed",
-        "cline",
-        "cline-cli",
-        "roocode",
-        "factory",
-        "nanobot",
-        "junie",
-        "kilo",
-        "pi",
-        "warp",
-        "kiro",
-        "kimi-code",
-        "qwen-code",
-        "antigravity",
-        "goose",
-        "hermes",
-        "amp",
-        "openclaw",
-        "lm-studio",
-        "muse-code",
-    ];
-
-    for target in all_targets {
-        let target_enum: crate::export::ExportTarget = match target.parse() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-
-        // Check both global and project paths (if applicable)
-        let paths = vec![
-            crate::export::default_config_path(target_enum, false),
-            crate::export::default_config_path(target_enum, true),
-        ];
-
-        for path in paths.into_iter().flatten() {
-            if !path.exists() {
-                continue;
-            }
-
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let ext = path.extension().and_then(|e| e.to_str());
-
-            if plug_entry_count(&content, ext) > 1 {
-                issues.push(format!(
-                    "{} (duplicate entries in {})",
-                    target,
-                    path.display()
-                ));
-            }
-
-            // A file plug cannot parse is worth reporting on its own: a
-            // duplicate hiding inside it would go uncounted above.
-            match ext {
-                Some("toml") => {
-                    if let Err(e) = validate_toml_document(&content) {
-                        issues.push(format!(
-                            "{} (invalid TOML in {}: {})",
-                            target,
-                            path.display(),
-                            e
-                        ));
-                    }
-                }
-                Some("yaml") | Some("yml") => {
-                    if let Err(e) = serde_norway::from_str::<serde_norway::Value>(&content) {
-                        issues.push(format!(
-                            "{} (invalid YAML in {}: {})",
-                            target,
-                            path.display(),
-                            e
-                        ));
-                    }
-                }
-                _ => {
-                    if serde_json::from_str::<serde_json::Value>(&content).is_err() {
-                        issues.push(format!("{} (invalid JSON in {})", target, path.display()));
-                    }
-                }
-            }
+    for target in crate::clients::ClientTarget::all() {
+        for (scope, path, content) in client_files(target) {
+            issues.extend(client_file_issues(target, scope, &path, &content, plug));
         }
     }
+    client_configs_result(&issues)
+}
 
+/// One thing wrong with a client's settings file.
+#[derive(Debug, PartialEq, Eq)]
+enum ClientFileIssue {
+    /// More than one Plug entry, which `plug link` leaves as one.
+    Duplicates(String),
+    /// A file that does not parse, which only a person can fix.
+    Unreadable(String),
+}
+
+impl ClientFileIssue {
+    fn text(&self) -> &str {
+        match self {
+            Self::Duplicates(text) | Self::Unreadable(text) => text,
+        }
+    }
+}
+
+fn client_configs_result(issues: &[ClientFileIssue]) -> CheckResult {
+    let name = check::CLIENT_CONFIGS.to_string();
     if issues.is_empty() {
-        CheckResult {
+        return CheckResult {
             name,
             status: CheckStatus::Pass,
             message: "All detected client configurations are healthy".to_string(),
             fix_suggestion: None,
-        }
+        };
+    }
+    let texts: Vec<&str> = issues.iter().map(ClientFileIssue::text).collect();
+    let fix = if issues
+        .iter()
+        .any(|issue| matches!(issue, ClientFileIssue::Unreadable(_)))
+    {
+        "Fix a file that does not parse, then run `plug link <client>` again to leave one Plug entry"
     } else {
-        CheckResult {
-            name,
-            status: CheckStatus::Warn,
-            message: format!("Issues found in client configs: {}", issues.join(", ")),
-            fix_suggestion: Some(
-                "Run `plug repair` to automatically clean up your client configurations"
-                    .to_string(),
-            ),
-        }
+        "Run `plug link <client>` again to leave one Plug entry"
+    };
+    CheckResult {
+        name,
+        status: CheckStatus::Warn,
+        message: format!("Issues found in client configs: {}", texts.join(", ")),
+        fix_suggestion: Some(fix.to_string()),
     }
 }
 
-fn validate_toml_document(content: &str) -> Result<(), toml::de::Error> {
-    toml::from_str::<toml::Value>(content).map(|_| ())
+/// What is wrong with one of `target`'s settings files: more than one Plug
+/// entry in the user file, the only one `plug link` rewrites, or a file that
+/// does not parse.
+fn client_file_issues(
+    target: crate::clients::ClientTarget,
+    scope: crate::clients::Scope,
+    path: &std::path::Path,
+    content: &str,
+    plug: &crate::config::HttpConfig,
+) -> Vec<ClientFileIssue> {
+    let layout = target.layout();
+    let mut issues = Vec::new();
+    let duplicates =
+        scope == crate::clients::Scope::User && layout.plug_entry_count(content, plug) > 1;
+    if duplicates {
+        issues.push(ClientFileIssue::Duplicates(format!(
+            "{} (duplicate entries in {})",
+            target.slug(),
+            path.display()
+        )));
+    }
+    // Two of Plug's entries make a TOML or YAML file unparseable. Where
+    // `plug link` clears them, the rest of the file is what is checked.
+    let checked = if duplicates {
+        layout.without_plug_entries(content)
+    } else {
+        content.into()
+    };
+    if let Err(error) = layout.check_syntax(&checked) {
+        issues.push(ClientFileIssue::Unreadable(format!(
+            "{} ({error} in {})",
+            target.slug(),
+            path.display()
+        )));
+    }
+    issues
 }
 
-/// Check 11: Downstream HTTP auth configuration and token state.
+/// Downstream HTTP auth configuration and token state.
 async fn check_http_auth(config: &Config) -> CheckResult {
-    let name = "http_auth".to_string();
+    let name = check::HTTP_AUTH.to_string();
 
     match config.http.auth_mode {
         crate::config::DownstreamAuthMode::None => CheckResult {
             name,
             status: CheckStatus::Pass,
-            message: if crate::config::http_bind_is_loopback(&config.http.bind_address) {
+            message: if crate::config::is_loopback_host(&config.http.bind_address) {
                 "HTTP auth disabled explicitly (loopback/local-only deployment)".to_string()
             } else {
                 "HTTP auth disabled explicitly".to_string()
@@ -1122,13 +961,7 @@ async fn check_http_auth(config: &Config) -> CheckResult {
             }
         }
         crate::config::DownstreamAuthMode::Auto | crate::config::DownstreamAuthMode::Bearer => {
-            let requires_token =
-                matches!(
-                    config.http.auth_mode,
-                    crate::config::DownstreamAuthMode::Bearer
-                ) || !crate::config::http_bind_is_loopback(&config.http.bind_address);
-
-            if !requires_token {
+            if !config.http.requires_bearer() {
                 return CheckResult {
                     name,
                     status: CheckStatus::Pass,
@@ -1136,6 +969,12 @@ async fn check_http_auth(config: &Config) -> CheckResult {
                     fix_suggestion: None,
                 };
             }
+            let mode = if config.http.auth_mode == crate::config::DownstreamAuthMode::Bearer {
+                "HTTP auth mode is bearer".to_string()
+            } else {
+                "HTTP auth in auto mode resolves to bearer because the server is reachable off this Mac"
+                    .to_string()
+            };
 
             let token_path = crate::auth::http_auth_token_path(config.http.port);
 
@@ -1143,26 +982,17 @@ async fn check_http_auth(config: &Config) -> CheckResult {
                 return CheckResult {
                     name,
                     status: CheckStatus::Warn,
-                    message: match config.http.auth_mode {
-                        crate::config::DownstreamAuthMode::Bearer => format!(
-                            "HTTP auth mode is bearer but the auth token has not been generated yet ({})",
-                            token_path.display()
-                        ),
-                        crate::config::DownstreamAuthMode::Auto => format!(
-                            "HTTP auth in auto mode resolves to bearer for bind {} but the auth token has not been generated yet",
-                            config.http.bind_address
-                        ),
-                        _ => unreachable!("requires_token only applies to auto/bearer"),
-                    },
+                    message: format!(
+                        "{mode}, but the auth token has not been generated yet ({})",
+                        token_path.display()
+                    ),
                     fix_suggestion: Some(
                         "Start Plug (open Plug.app, or run `plug start`) and it generates the token, or change http.auth_mode for your deployment".to_string(),
                     ),
                 };
             }
 
-            #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
                 if let Ok(meta) = std::fs::metadata(&token_path) {
                     let mode = meta.permissions().mode() & 0o777;
                     if mode != 0o600 {
@@ -1186,17 +1016,7 @@ async fn check_http_auth(config: &Config) -> CheckResult {
             CheckResult {
                 name,
                 status: CheckStatus::Pass,
-                message: match config.http.auth_mode {
-                    crate::config::DownstreamAuthMode::Bearer => format!(
-                        "HTTP bearer auth token configured ({})",
-                        token_path.display()
-                    ),
-                    crate::config::DownstreamAuthMode::Auto => format!(
-                        "HTTP auth in auto mode resolves to bearer for bind {}",
-                        config.http.bind_address
-                    ),
-                    _ => unreachable!("requires_token only applies to auto/bearer"),
-                },
+                message: format!("{mode}; the auth token is in {}", token_path.display()),
                 fix_suggestion: None,
             }
         }
@@ -1211,8 +1031,7 @@ async fn check_oauth_metadata_reachable(base_url: &str) -> Result<(), String> {
         "{}/.well-known/oauth-authorization-server",
         base_url.trim_end_matches('/')
     );
-    crate::tls::ensure_rustls_provider_installed();
-    let client = reqwest::Client::builder()
+    let client = crate::tls::http_client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|error| error.to_string())?;
@@ -1242,34 +1061,23 @@ async fn check_oauth_metadata_reachable(base_url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Check OAuth config fields are coherent.
+/// OAuth servers that ask for no scopes. The rules a config must keep to
+/// load are `validate_config`'s, and doctor only sees a config that loaded.
 async fn check_oauth_config(config: &Config) -> CheckResult {
-    let name = "oauth_config".to_string();
+    let name = check::OAUTH_CONFIG.to_string();
+    let mut unscoped: Vec<String> = config
+        .servers
+        .iter()
+        .filter(|(_, server)| {
+            server.is_oauth() && server.oauth_scopes.as_ref().is_none_or(Vec::is_empty)
+        })
+        .map(|(server_name, _)| {
+            format!("server '{server_name}': auth = \"oauth\" but no scopes configured")
+        })
+        .collect();
+    unscoped.sort();
 
-    let mut issues = Vec::new();
-    for (server_name, sc) in &config.servers {
-        if sc.auth.as_deref() != Some("oauth") {
-            continue;
-        }
-
-        if sc.auth_token.is_some() {
-            issues.push(format!(
-                "server '{server_name}': auth = \"oauth\" and auth_token are both set (mutually exclusive)"
-            ));
-        }
-        if matches!(sc.transport, TransportType::Stdio) {
-            issues.push(format!(
-                "server '{server_name}': auth = \"oauth\" on stdio transport (requires http or sse)"
-            ));
-        }
-        if sc.oauth_scopes.is_none() || sc.oauth_scopes.as_ref().is_some_and(|s| s.is_empty()) {
-            issues.push(format!(
-                "server '{server_name}': auth = \"oauth\" but no scopes configured"
-            ));
-        }
-    }
-
-    if issues.is_empty() {
+    if unscoped.is_empty() {
         CheckResult {
             name,
             status: CheckStatus::Pass,
@@ -1279,15 +1087,8 @@ async fn check_oauth_config(config: &Config) -> CheckResult {
     } else {
         CheckResult {
             name,
-            status: if issues
-                .iter()
-                .any(|i| i.contains("mutually exclusive") || i.contains("stdio"))
-            {
-                CheckStatus::Fail
-            } else {
-                CheckStatus::Warn
-            },
-            message: issues.join("; "),
+            status: CheckStatus::Warn,
+            message: unscoped.join("; "),
             fix_suggestion: Some("Check OAuth settings in your config.toml".to_string()),
         }
     }
@@ -1295,12 +1096,12 @@ async fn check_oauth_config(config: &Config) -> CheckResult {
 
 /// Check token status for OAuth-configured servers.
 async fn check_oauth_tokens(config: &Config) -> CheckResult {
-    let name = "oauth_tokens".to_string();
+    let name = check::OAUTH_TOKENS.to_string();
 
     let oauth_servers: Vec<_> = config
         .servers
         .iter()
-        .filter(|(_, sc)| sc.auth.as_deref() == Some("oauth") && sc.enabled)
+        .filter(|(_, sc)| sc.is_oauth() && sc.enabled)
         .collect();
 
     if oauth_servers.is_empty() {
@@ -1316,30 +1117,23 @@ async fn check_oauth_tokens(config: &Config) -> CheckResult {
     // file is the runtime's required mirror, so its presence is expected and
     // not worth a warning; the only problem worth flagging is one other users
     // can read.
-    let tokens_dir = crate::oauth::tokens_dir();
+    let tokens_dir = crate::paths::tokens_dir();
     let mut signed_in = 0usize;
     let mut exposed = Vec::new();
     for (server_name, _) in &oauth_servers {
-        let Ok(safe_name) = crate::config::sanitize_server_name_for_path(server_name) else {
+        let Ok(token_file) = crate::oauth::token_file_path(server_name) else {
             continue;
         };
-        let token_file = tokens_dir.join(format!("{safe_name}.json"));
         let Ok(metadata) = std::fs::metadata(&token_file) else {
             continue;
         };
         signed_in += 1;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o077 != 0 {
-                exposed.push(format!(
-                    "server '{server_name}': token file {} is readable by other users",
-                    token_file.display()
-                ));
-            }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            exposed.push(format!(
+                "server '{server_name}': token file {} is readable by other users",
+                token_file.display()
+            ));
         }
-        #[cfg(not(unix))]
-        let _ = metadata;
     }
 
     if exposed.is_empty() {
@@ -1378,7 +1172,7 @@ fn codesign_fix_suggestion() -> &'static str {
 /// installs should use Plug.app's Developer ID signature; isolated source builds
 /// use the setup sequence in `codesign_fix_suggestion`.
 async fn check_codesign_identity(config: &Config) -> CheckResult {
-    let name = "codesign_identity".to_string();
+    let name = check::CODESIGN_IDENTITY.to_string();
 
     #[cfg(not(target_os = "macos"))]
     {
@@ -1396,7 +1190,7 @@ async fn check_codesign_identity(config: &Config) -> CheckResult {
         let oauth_count = config
             .servers
             .iter()
-            .filter(|(_, sc)| sc.auth.as_deref() == Some("oauth") && sc.enabled)
+            .filter(|(_, sc)| sc.is_oauth() && sc.enabled)
             .count();
 
         if oauth_count == 0 {
@@ -1458,6 +1252,83 @@ fn self_is_adhoc_or_unsigned() -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_duplicate_plug_link_can_clear_is_reported() {
+        use crate::clients::{ClientTarget, Scope};
+        let plug = crate::config::HttpConfig::default();
+        let twice = r#"{"servers":{"plug":{"command":"plug"},"Plug":{"command":"plug"}}}"#;
+        let issues = |scope| {
+            super::client_file_issues(
+                ClientTarget::VSCodeCopilot,
+                scope,
+                std::path::Path::new("mcp.json"),
+                twice,
+                &plug,
+            )
+        };
+        assert_eq!(
+            issues(Scope::User),
+            [super::ClientFileIssue::Duplicates(
+                "vscode (duplicate entries in mcp.json)".to_string()
+            )]
+        );
+        assert!(issues(Scope::Project).is_empty());
+    }
+
+    /// A TOML or YAML file linked twice does not parse, but `plug link`
+    /// fixes it, so doctor says so once and does not call it unreadable.
+    #[test]
+    fn a_file_linked_twice_is_reported_once_with_plug_link_as_the_fix() {
+        use super::ClientFileIssue::{Duplicates, Unreadable};
+        use crate::clients::{ClientTarget, Scope};
+        let plug = crate::config::HttpConfig::default();
+        for (target, twice, broken) in [
+            (
+                ClientTarget::CodexCli,
+                "[mcp_servers.plug]\ncommand = \"a\"\n\n[mcp_servers.other]\ncommand = \"x\"\n\n[mcp_servers.plug]\ncommand = \"b\"\n",
+                "[mcp_servers.plug]\ncommand = \"a\"\n\n[mcp_servers.plug]\ncommand = \"b\"\n\n[broken\n",
+            ),
+            (
+                ClientTarget::Hermes,
+                "mcp_servers:\n  plug:\n    command: a\n  other:\n    command: x\n  plug:\n    command: b\n",
+                "mcp_servers:\n  plug:\n    command: a\n  plug:\n    command: b\nother: [\n",
+            ),
+        ] {
+            let path = std::path::Path::new("settings");
+            let issues =
+                |scope, content| super::client_file_issues(target, scope, path, content, &plug);
+            let user = issues(Scope::User, twice);
+            assert!(
+                matches!(user.as_slice(), [Duplicates(_)]),
+                "{target:?}: {user:?}"
+            );
+            assert_eq!(
+                super::client_configs_result(&user)
+                    .fix_suggestion
+                    .as_deref(),
+                Some("Run `plug link <client>` again to leave one Plug entry")
+            );
+            // `plug link` does not write a project file, so a person fixes it.
+            let project = issues(Scope::Project, twice);
+            assert!(
+                matches!(project.as_slice(), [Unreadable(_)]),
+                "{target:?}: {project:?}"
+            );
+            // Broken apart from Plug's entries, the file is still unreadable.
+            let both = issues(Scope::User, broken);
+            assert!(
+                matches!(both.as_slice(), [Duplicates(_), Unreadable(_)]),
+                "{target:?}: {both:?}"
+            );
+            assert!(
+                super::client_configs_result(&both)
+                    .fix_suggestion
+                    .unwrap()
+                    .starts_with("Fix a file that does not parse")
+            );
+        }
+    }
+
     use std::collections::HashMap;
 
     use super::*;
@@ -1489,29 +1360,7 @@ mod tests {
     fn stdio_server(cmd: &str) -> ServerConfig {
         ServerConfig {
             command: Some(cmd.to_string()),
-            args: vec![],
-            env: HashMap::new(),
-            enabled: true,
-            transport: TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         }
     }
 
@@ -1570,90 +1419,64 @@ auth_token = "keychain:b.token"
 
     #[tokio::test]
     async fn config_exists_valid_toml() {
-        let dir = std::env::temp_dir().join("plug_doctor_test_valid");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("config.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
         std::fs::write(&path, "[http]\nport = 3282\n").unwrap();
 
         let result = check_config_exists(&path).await;
         assert_eq!(result.status, CheckStatus::Pass);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn config_exists_invalid_toml() {
-        let dir = std::env::temp_dir().join("plug_doctor_test_invalid");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("config.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
         std::fs::write(&path, "[invalid toml ===").unwrap();
 
         let result = check_config_exists(&path).await;
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.message.contains("invalid TOML"));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
-
-    #[test]
-    fn client_config_validation_parses_complete_toml_documents() {
-        let document = r#"
-[mcp_servers.plug]
-url = "http://127.0.0.1:3282/mcp"
-
-[mcp_servers.example]
-command = "example-server"
-"#;
-
-        assert!(validate_toml_document(document).is_ok());
-        assert!(validate_toml_document("[broken").is_err());
-    }
-
-    // -- check_config_permissions --
 
     #[tokio::test]
     async fn config_permissions_no_file() {
-        let config = test_config();
-        let result = check_config_permissions(&config, Path::new("/nonexistent/config.toml")).await;
+        let result = check_config_permissions(Path::new("/nonexistent/config.toml")).await;
         assert_eq!(result.status, CheckStatus::Pass);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn config_permissions_warns_on_world_readable_with_secrets() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::env::temp_dir().join("plug_doctor_test_perms");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("config.toml");
-        std::fs::write(&path, "# test").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[servers.test]\ncommand = \"echo\"\nenv = { LOG_LEVEL = \"KEY_TOKEN_SECRET\" }\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let result = check_config_permissions(&path).await;
+        assert_eq!(result.status, CheckStatus::Pass, "a setting is not a key");
 
-        let mut config = test_config();
-        config.servers.insert(
-            "test".to_string(),
-            ServerConfig {
-                auth_token: Some("secret".to_string().into()),
-                ..stdio_server("echo")
-            },
-        );
-
-        let result = check_config_permissions(&config, &path).await;
+        std::fs::write(
+            &path,
+            "[servers.test]\ncommand = \"echo\"\nauth_token = \"secret\"\n",
+        )
+        .unwrap();
+        let result = check_config_permissions(&path).await;
         assert_eq!(result.status, CheckStatus::Warn);
         assert!(result.message.contains("world/group-readable"));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- check_port_available --
 
     #[tokio::test]
-    async fn port_available_on_random_port() {
+    async fn a_port_another_program_holds_fails() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut config = test_config();
-        config.http.port = 49152 + (std::process::id() as u16 % 1000);
+        config.http.bind_address = "127.0.0.1".to_string();
+        config.http.port = held.local_addr().unwrap().port();
         let result = check_port_available(&config).await;
-        // May or may not pass depending on port availability, just check it returns
-        assert!(!result.name.is_empty());
+        assert_eq!(result.status, CheckStatus::Fail, "{}", result.message);
     }
 
     // -- check_env_vars --
@@ -1661,7 +1484,7 @@ command = "example-server"
     #[tokio::test]
     async fn env_vars_all_set() {
         let config = test_config();
-        let result = check_env_vars(&config).await;
+        let result = check_env_vars(&config, Path::new("/nonexistent/plug/config.toml")).await;
         assert_eq!(result.status, CheckStatus::Pass);
     }
 
@@ -1678,7 +1501,7 @@ command = "example-server"
                 ..stdio_server("echo")
             },
         );
-        let result = check_env_vars(&config).await;
+        let result = check_env_vars(&config, Path::new("/nonexistent/plug/config.toml")).await;
         assert_eq!(result.status, CheckStatus::Warn);
         assert!(result.message.contains("PLUG_NONEXISTENT_VAR_XYZ"));
     }
@@ -1686,8 +1509,17 @@ command = "example-server"
     #[tokio::test]
     async fn env_vars_missing_core_fails() {
         let mut config = test_config();
+        config.http.public_base_url = Some("$PLUG_NONEXISTENT_VAR_XYZ".to_string());
+        let result = check_env_vars(&config, Path::new("/nonexistent/plug/config.toml")).await;
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("PLUG_NONEXISTENT_VAR_XYZ"));
+    }
+
+    #[tokio::test]
+    async fn a_server_named_like_plug_only_warns() {
+        let mut config = test_config();
         config.servers.insert(
-            "plug-internal".to_string(),
+            "plugin-x".to_string(),
             ServerConfig {
                 env: HashMap::from([(
                     "API_KEY".to_string(),
@@ -1696,9 +1528,8 @@ command = "example-server"
                 ..stdio_server("echo")
             },
         );
-        let result = check_env_vars(&config).await;
-        assert_eq!(result.status, CheckStatus::Fail);
-        assert!(result.message.contains("PLUG_NONEXISTENT_VAR_XYZ"));
+        let result = check_env_vars(&config, Path::new("/nonexistent/plug/config.toml")).await;
+        assert_eq!(result.status, CheckStatus::Warn);
     }
 
     // -- check_http_auth --
@@ -1716,14 +1547,27 @@ command = "example-server"
     }
 
     #[tokio::test]
+    async fn http_auth_auto_behind_a_tunnel_needs_the_token() {
+        let mut config = test_config();
+        config.http.auth_mode = crate::config::DownstreamAuthMode::Auto;
+        config.http.bind_address = "127.0.0.1".to_string();
+        config.http.public_base_url = Some("https://plug.example.com".to_string());
+        config.http.port = 62003;
+
+        let result = check_http_auth(&config).await;
+        assert!(
+            result.message.contains("resolves to bearer"),
+            "{}",
+            result.message
+        );
+    }
+
+    #[tokio::test]
     async fn http_auth_bearer_on_loopback_warns_when_token_missing() {
         let mut config = test_config();
         config.http.auth_mode = crate::config::DownstreamAuthMode::Bearer;
         config.http.bind_address = "127.0.0.1".to_string();
         config.http.port = 62002;
-
-        let token_path = crate::auth::http_auth_token_path(config.http.port);
-        let _ = std::fs::remove_file(&token_path);
 
         let result = check_http_auth(&config).await;
         assert_eq!(result.status, CheckStatus::Warn);
@@ -1799,11 +1643,7 @@ command = "example-server"
 
     #[tokio::test]
     async fn oauth_without_owner_credential_is_blocking() {
-        let state_dir = std::env::temp_dir().join(format!(
-            "plug-doctor-owner-missing-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let state_dir = crate::paths::test::scratch("doctor-owner-missing");
         let mut config = test_config();
         config.http.auth_mode = crate::config::DownstreamAuthMode::Oauth;
         config.http.public_base_url = Some("https://plug.example.com".to_string());
@@ -1816,16 +1656,11 @@ command = "example-server"
             result.message,
             "Downstream OAuth owner credential missing. Run `plug auth owner enroll`."
         );
-        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[tokio::test]
     async fn owner_credential_is_not_required_when_downstream_oauth_is_disabled() {
-        let state_dir = std::env::temp_dir().join(format!(
-            "plug-doctor-owner-disabled-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let state_dir = crate::paths::test::scratch("doctor-owner-disabled");
         let config = test_config();
 
         let result = check_downstream_oauth_owner_with_state_dir(&config, &state_dir).await;
@@ -1835,16 +1670,11 @@ command = "example-server"
             result.message,
             "Downstream OAuth owner approval is not required"
         );
-        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[tokio::test]
     async fn corrupt_owner_state_fails_without_disclosing_state_contents() {
-        let state_dir = std::env::temp_dir().join(format!(
-            "plug-doctor-owner-corrupt-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let state_dir = crate::paths::test::scratch("doctor-owner-corrupt");
         let mut config = test_config();
         config.http.auth_mode = crate::config::DownstreamAuthMode::Oauth;
         config.http.public_base_url = Some("https://plug.example.com".to_string());
@@ -1879,7 +1709,6 @@ command = "example-server"
                 .as_deref()
                 .is_some_and(|suggestion| suggestion.contains("plug auth owner list"))
         );
-        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[cfg(unix)]
@@ -1887,11 +1716,7 @@ command = "example-server"
     async fn owner_state_permissions_have_an_exact_safe_repair() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let state_dir = std::env::temp_dir().join(format!(
-            "plug-doctor-owner-permissions-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let state_dir = crate::paths::test::scratch("doctor-owner-permissions");
         let mut config = test_config();
         config.http.auth_mode = crate::config::DownstreamAuthMode::Oauth;
         config.http.public_base_url = Some("https://plug.example.com".to_string());
@@ -1910,7 +1735,6 @@ command = "example-server"
             result.fix_suggestion,
             Some(format!("Run: chmod 600 {}", path.display()))
         );
-        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     // -- check_oauth_tokens --
@@ -1924,7 +1748,7 @@ command = "example-server"
             oauth_http_server("https://example.com/mcp"),
         );
 
-        let token_file = crate::oauth::tokens_dir().join(format!("{server_name}.json"));
+        let token_file = crate::oauth::token_file_path(&server_name).unwrap();
         let _ = std::fs::remove_file(&token_file);
 
         let result = check_oauth_tokens(&config).await;
@@ -1947,7 +1771,7 @@ command = "example-server"
             oauth_http_server("https://example.com/mcp"),
         );
 
-        let token_file = crate::oauth::tokens_dir().join(format!("{server_name}.json"));
+        let token_file = crate::oauth::token_file_path(&server_name).unwrap();
         if let Some(parent) = token_file.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -1977,7 +1801,7 @@ command = "example-server"
             oauth_http_server("https://example.com/mcp"),
         );
 
-        let token_file = crate::oauth::tokens_dir().join(format!("{server_name}.json"));
+        let token_file = crate::oauth::token_file_path(&server_name).unwrap();
         if let Some(parent) = token_file.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -2024,6 +1848,35 @@ command = "example-server"
         assert!(result.message.contains("plug_nonexistent_binary_xyz"));
     }
 
+    /// The daemon runs the whole `command`, so a path with a space in it is
+    /// found, and a bare name is not cut at its first word.
+    #[tokio::test]
+    async fn server_binaries_check_the_whole_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let spaced = dir.path().join("My Tools").join("server");
+        std::fs::create_dir_all(spaced.parent().unwrap()).unwrap();
+        std::fs::write(&spaced, "").unwrap();
+        let mut config = test_config();
+        config
+            .servers
+            .insert("spaced".to_string(), stdio_server(spaced.to_str().unwrap()));
+        assert_eq!(
+            check_server_binaries(&config).await.status,
+            CheckStatus::Pass
+        );
+
+        config
+            .servers
+            .insert("split".to_string(), stdio_server("echo hello"));
+        let result = check_server_binaries(&config).await;
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(
+            result.message.contains("split: echo hello"),
+            "{}",
+            result.message
+        );
+    }
+
     /// `node` from a version manager resolves in a shell but not on the PATH
     /// the daemon falls back to when its login-shell probe fails. Doctor used
     /// to pass that; the server then failed after a slow reboot.
@@ -2058,117 +1911,53 @@ command = "example-server"
         }
     }
 
-    // -- check_tool_collisions --
-
-    #[tokio::test]
-    async fn tool_collisions_prefix_enabled() {
-        let config = test_config(); // prefix enabled by default
-        let result = check_tool_collisions(&config).await;
-        assert_eq!(result.status, CheckStatus::Pass);
-    }
-
-    #[tokio::test]
-    async fn tool_collisions_warns_without_prefix() {
-        let mut config = test_config();
-        config.enable_prefix = false;
-        config.servers.insert("a".to_string(), stdio_server("echo"));
-        config.servers.insert("b".to_string(), stdio_server("echo"));
-        let result = check_tool_collisions(&config).await;
-        assert_eq!(result.status, CheckStatus::Pass);
-        assert!(result.message.contains("disabled"));
-        assert!(result.message.contains("duplicate names fall back"));
-    }
-
     // -- check_client_limits --
 
-    #[tokio::test]
-    async fn client_limits_pass_when_no_capped_client_is_linked() {
-        // The suite does not write client configs, so nothing under
-        // KNOWN_CLIENT_TOOL_LIMITS is linked from this environment.
-        let mut config = test_config();
-        for i in 0..50 {
-            config
-                .servers
-                .insert(format!("server_{i}"), stdio_server("echo"));
-        }
-        let result = check_client_limits(&config).await;
-        assert_eq!(
-            result.status,
-            CheckStatus::Pass,
-            "server count must not decide this check: {}",
-            result.message
-        );
-    }
-
-    /// Guards the rule the Cursor entry broke: a client with no published
-    /// ceiling must not be given an invented one.
-    #[tokio::test]
-    async fn no_client_limit_is_asserted_without_a_dated_source() {
-        for entry in KNOWN_CLIENT_TOOL_LIMITS {
-            assert!(
-                entry.source.starts_with("https://"),
-                "{} needs a source URL that can be re-checked",
-                entry.client
-            );
-            let parts: Vec<&str> = entry.verified.split('-').collect();
-            assert!(
-                parts.len() == 3 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())),
-                "{} needs a YYYY-MM-DD verified date, got {:?}",
-                entry.client,
-                entry.verified
-            );
-            assert!(entry.limit > 0, "{} has a meaningless limit", entry.client);
-            assert!(
-                entry.target.parse::<crate::export::ExportTarget>().is_ok(),
-                "{} names an export target that does not exist: {}",
-                entry.client,
-                entry.target
-            );
-        }
+    #[test]
+    fn client_limits_pass_when_no_capped_client_is_linked() {
+        let result = client_limits_result(check::CLIENT_LIMITS.to_string(), Vec::new());
+        assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
     }
 
     #[test]
-    fn plug_entry_count_reads_every_supported_client_layout() {
-        assert_eq!(
-            plug_entry_count("[mcp_servers.plug]\ncommand = \"plug\"\n", Some("toml")),
-            1
+    fn a_linked_capped_client_warns_with_its_source() {
+        let result = client_limits_result(
+            check::CLIENT_LIMITS.to_string(),
+            crate::clients::TOOL_LIMITS.iter().collect(),
         );
-        assert_eq!(plug_entry_count("extensions:\n  plug:\n", Some("yaml")), 1);
-        assert_eq!(plug_entry_count("mcp_servers:\n  Plug:\n", Some("yaml")), 1);
-        assert_eq!(
-            plug_entry_count(r#"{"mcpServers":{"plug":{}}}"#, Some("json")),
-            1
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(
+            result
+                .message
+                .contains(crate::clients::TOOL_LIMITS[0].source)
         );
-        assert_eq!(
-            plug_entry_count(r#"{"mcp":{"servers":{"plug":{}}}}"#, Some("json")),
-            1
-        );
-        assert_eq!(
-            plug_entry_count(r#"{"tools":{"mcpServers":{"plug":{}}}}"#, Some("json")),
-            1
-        );
-
-        // Two locations in one file is the duplicate `plug repair` cleans up.
-        assert_eq!(
-            plug_entry_count(
-                r#"{"mcpServers":{"plug":{}},"mcp":{"servers":{"plug":{}}}}"#,
-                Some("json")
-            ),
-            2
-        );
-
-        assert_eq!(plug_entry_count(r#"{"mcpServers":{"other":{}}}"#, None), 0);
-        assert_eq!(plug_entry_count("not json at all", Some("json")), 0);
     }
 
     // -- check_pid_staleness --
 
     #[tokio::test]
-    async fn pid_staleness_no_file() {
-        // Default path likely doesn't exist in test environment
-        let result = check_pid_staleness().await;
-        // Should be Pass (no PID file) or Warn (stale PID), never Fail
-        assert_ne!(result.status, CheckStatus::Fail);
+    async fn pid_staleness_reads_the_pid_file() {
+        assert_eq!(check_pid_staleness().await.status, CheckStatus::Pass);
+
+        let pid_path = crate::paths::pid_path();
+        std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
+        let running = check_pid_staleness().await;
+        assert_eq!(running.status, CheckStatus::Pass);
+        assert!(
+            running.message.contains("is running"),
+            "{}",
+            running.message
+        );
+
+        // macOS gives out PIDs below 100000.
+        std::fs::write(&pid_path, "99999999").unwrap();
+        let stale = check_pid_staleness().await;
+        assert_eq!(stale.status, CheckStatus::Warn);
+        assert!(stale.message.contains("Stale"), "{}", stale.message);
+
+        std::fs::write(&pid_path, "not a pid").unwrap();
+        assert_eq!(check_pid_staleness().await.status, CheckStatus::Warn);
     }
 
     // -- check_server_connectivity --
@@ -2220,14 +2009,7 @@ command = "example-server"
         );
 
         let result = check_server_connectivity(&config).await;
-        assert_eq!(
-            result.status,
-            if running_daemon_pid().is_some() {
-                CheckStatus::Warn
-            } else {
-                CheckStatus::Fail
-            }
-        );
+        assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.message.contains("remote"));
         assert!(result.message.contains("TCP connect failed"));
     }
@@ -2248,27 +2030,9 @@ command = "example-server"
         );
 
         let result = check_server_connectivity(&config).await;
-        assert_eq!(
-            result.status,
-            if running_daemon_pid().is_some() {
-                CheckStatus::Warn
-            } else {
-                CheckStatus::Fail
-            }
-        );
+        assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.message.contains("remote"));
         assert!(!result.message.contains("local"));
-    }
-
-    // -- extract_env_refs --
-
-    #[test]
-    fn extract_refs_basic() {
-        assert_eq!(extract_env_refs("$HOME/bin"), vec!["HOME"]);
-        assert_eq!(extract_env_refs("$FOO and $BAR"), vec!["FOO", "BAR"]);
-        assert!(extract_env_refs("no vars").is_empty());
-        assert!(extract_env_refs("$(shell)").is_empty());
-        assert!(extract_env_refs("$lowercase").is_empty());
     }
 
     // -- DoctorReport --
@@ -2319,14 +2083,5 @@ command = "example-server"
             fix_suggestion: None,
         }];
         assert_eq!(DoctorReport::from_checks(checks).exit_code, 2);
-    }
-
-    // -- run_doctor integration --
-
-    #[tokio::test]
-    async fn run_doctor_returns_all_checks() {
-        let config = test_config();
-        let report = run_doctor(&config, Path::new("/nonexistent/config.toml")).await;
-        assert_eq!(report.checks.len(), 16);
     }
 }

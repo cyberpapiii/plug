@@ -1,0 +1,26 @@
+{
+  "api_operation_limit": 50,
+  "accounts": [
+    { "server": "workspace", "account": "work", "name": "workspace-work" },
+    { "server": "workspace", "account": "team2", "name": "workspace-team2" },
+    { "server": "workspace", "account": "abcdefghijklmnopqrstuvwx", "name": "workspace-abcdefghijklmnopqrstuvwx" },
+    { "server": "workspace", "account": "abcdefghijklmnopqrstuvwxy", "name": null },
+    { "server": "workspace", "account": "2nd", "name": null },
+    { "server": "workspace", "account": "work-team", "name": null },
+    { "server": "workspace", "account": "work_team", "name": null },
+    { "server": "workspace", "account": "", "name": null }
+  ],
+  "custom_client_prefix": "custom:",
+  "custom_clients": [
+    { "named": "My Bot", "target": "custom:my-bot" },
+    { "named": "  My Tool (v2)! ", "target": "custom:my-tool-v2" },
+    { "named": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "target": "custom:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    { "named": " ?? ", "target": null }
+  ],
+  "refused_custom_targets": [
+    "custom:",
+    "custom:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "custom:My-Bot",
+    "custom:my_bot"
+  ]
+}

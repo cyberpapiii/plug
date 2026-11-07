@@ -1,0 +1,142 @@
+{
+  "duplicates_merged": 0,
+  "new_servers": [
+    {
+      "config": {
+        "args": [
+          "-y",
+          "@github/mcp"
+        ],
+        "auth": null,
+        "auth_token": null,
+        "call_timeout_secs": 300,
+        "circuit_breaker_enabled": true,
+        "command": "npx",
+        "enabled": true,
+        "env": {
+          "GITHUB_TOKEN": "$GITHUB_TOKEN"
+        },
+        "health_check_interval_secs": 60,
+        "max_concurrent": 1,
+        "oauth_client_id": null,
+        "oauth_scopes": null,
+        "protocol": "legacy",
+        "sandbox": null,
+        "timeout_secs": 90,
+        "tool_groups": [],
+        "tool_renames": {},
+        "transport": "stdio",
+        "url": null
+      },
+      "name": "github",
+      "source_name": "Cursor",
+      "source_target": "cursor"
+    },
+    {
+      "config": {
+        "args": [],
+        "auth": null,
+        "auth_token": null,
+        "call_timeout_secs": 300,
+        "circuit_breaker_enabled": true,
+        "command": null,
+        "enabled": true,
+        "env": {},
+        "health_check_interval_secs": 60,
+        "max_concurrent": 1,
+        "oauth_client_id": null,
+        "oauth_scopes": null,
+        "protocol": "legacy",
+        "sandbox": null,
+        "timeout_secs": 30,
+        "tool_groups": [],
+        "tool_renames": {},
+        "transport": "sse",
+        "url": "https://notes.example.com/sse"
+      },
+      "name": "notes",
+      "source_name": "VS Code Copilot",
+      "source_target": "vscode"
+    }
+  ],
+  "scanned": [
+    {
+      "error": null,
+      "servers": [
+        {
+          "config": {
+            "args": [
+              "-y",
+              "@github/mcp"
+            ],
+            "auth": null,
+            "auth_token": null,
+            "call_timeout_secs": 300,
+            "circuit_breaker_enabled": true,
+            "command": "npx",
+            "enabled": true,
+            "env": {
+              "GITHUB_TOKEN": "$GITHUB_TOKEN"
+            },
+            "health_check_interval_secs": 60,
+            "max_concurrent": 1,
+            "oauth_client_id": null,
+            "oauth_scopes": null,
+            "protocol": "legacy",
+            "sandbox": null,
+            "timeout_secs": 90,
+            "tool_groups": [],
+            "tool_renames": {},
+            "transport": "stdio",
+            "url": null
+          },
+          "name": "github",
+          "source_name": "Cursor",
+          "source_target": "cursor"
+        }
+      ],
+      "source_name": "Cursor",
+      "source_target": "cursor"
+    },
+    {
+      "error": null,
+      "servers": [
+        {
+          "config": {
+            "args": [],
+            "auth": null,
+            "auth_token": null,
+            "call_timeout_secs": 300,
+            "circuit_breaker_enabled": true,
+            "command": null,
+            "enabled": true,
+            "env": {},
+            "health_check_interval_secs": 60,
+            "max_concurrent": 1,
+            "oauth_client_id": null,
+            "oauth_scopes": null,
+            "protocol": "legacy",
+            "sandbox": null,
+            "timeout_secs": 30,
+            "tool_groups": [],
+            "tool_renames": {},
+            "transport": "sse",
+            "url": "https://notes.example.com/sse"
+          },
+          "name": "notes",
+          "source_name": "VS Code Copilot",
+          "source_target": "vscode"
+        }
+      ],
+      "source_name": "VS Code Copilot",
+      "source_target": "vscode"
+    },
+    {
+      "error": "settings.json: expected value at line 1 column 1",
+      "servers": [],
+      "source_name": "Zed",
+      "source_target": "zed"
+    }
+  ],
+  "skipped": 1
+}

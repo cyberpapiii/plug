@@ -1,0 +1,43 @@
+{
+  "checks": [
+    {
+      "fix_suggestion": null,
+      "message": "config_exists message",
+      "name": "config_exists",
+      "status": "Pass",
+      "title": "Settings file"
+    },
+    {
+      "fix_suggestion": "Free the port.",
+      "message": "port_available message",
+      "name": "port_available",
+      "status": "Warn",
+      "title": "Network port"
+    },
+    {
+      "fix_suggestion": "Restart it.",
+      "message": "server_connectivity message",
+      "name": "server_connectivity",
+      "status": "Fail",
+      "title": "Servers responding"
+    }
+  ],
+  "exit_code": 1,
+  "unified_install": {
+    "adapter_inspection_complete": true,
+    "adapters": [],
+    "app": null,
+    "app_service_daemon_invocation_verified": true,
+    "client_repair_needed": false,
+    "daemon_executable": null,
+    "daemon_inspection_complete": true,
+    "daemon_version": "0.9.0",
+    "inspection_errors": [],
+    "launchd_inspection_complete": true,
+    "launchd_jobs": [],
+    "linked_clients": [],
+    "ownership": "app_managed",
+    "shadows": [],
+    "shell_resolution": null
+  }
+}

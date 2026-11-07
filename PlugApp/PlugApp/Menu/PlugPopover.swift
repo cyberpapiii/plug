@@ -24,7 +24,6 @@ struct PlugPopover: View {
         let latest = Self.latestCall(model.activities)
         PanelView(
             facts: PanelFacts(
-                verdict: model.verdict,
                 situation: model.situation,
                 serviceEnabled: model.serviceEnabled,
                 stale: model.dataIsStale,
@@ -33,7 +32,7 @@ struct PlugPopover: View {
                 call: latest.map(model.call),
                 callID: latest?.sequence
             ),
-            error: model.actionError,
+            error: model.actions.actionError,
             power: ServicePowerToggle(model: model, run: run).labelsHidden(),
             send: send,
             quit: { run(.quit) }
@@ -53,16 +52,6 @@ struct PlugPopover: View {
         return latest.map { activities[$0] }
     }
 
-    /// The newest tool calls. Listing, pings, and other protocol traffic are
-    /// not what anyone opens the panel to see.
-    static func recentCalls(_ activities: [ActivityEvent], limit: Int) -> [ActivityEvent] {
-        activities
-            .filter { $0.tool?.isEmpty == false }
-            .sorted { $0.sequence > $1.sequence }
-            .prefix(limit)
-            .map { $0 }
-    }
-
     /// Window-opening actions close the menu panel first. Otherwise its
     /// floating window can remain above the sheet or inspector it opened.
     private func send(_ intent: PlugIntent) {
@@ -80,7 +69,6 @@ struct PlugPopover: View {
 /// Everything the panel shows, as plain values, so it can be drawn and
 /// checked without a running Plug.
 struct PanelFacts: Equatable {
-    var verdict: Verdict
     var situation: PlugSituation
     var serviceEnabled = true
     /// The rows are what Plug said last, not what it says now.
@@ -90,6 +78,8 @@ struct PanelFacts: Equatable {
     /// The last tool call, and what tells one call from the next.
     var call: CallFacts?
     var callID: UInt64?
+
+    var verdict: Verdict { PlugVerdict.verdict(for: situation) }
 }
 
 struct PanelView<Power: View>: View {
@@ -102,7 +92,7 @@ struct PanelView<Power: View>: View {
 
     private var situation: PlugSituation { facts.situation }
     private var trouble: PanelTrouble? {
-        facts.serviceEnabled ? PanelTrouble.trouble(for: situation, verdict: facts.verdict) : nil
+        facts.serviceEnabled ? PanelTrouble.trouble(for: situation) : nil
     }
 
     /// Off, stopped, or with no servers, there is nothing under the card to
@@ -152,11 +142,11 @@ struct PanelView<Power: View>: View {
     // MARK: - Header
 
     /// The character is always Plug blue. Its face says how Plug is, and the
-    /// small mark beside it takes the colour of the trouble.
+    /// small mark beside it takes the verdict's colour, as in the window.
     private func header(_ trouble: PanelTrouble?) -> some View {
         let verdict = facts.verdict
         return HStack(spacing: Metric.panelGap) {
-            PlugCharacter(mood: verdict.mood, mark: trouble?.wash?.color ?? StatusColor.needsYou)
+            PlugCharacter(mood: verdict.mood, mark: verdict.markColor)
                 .foregroundStyle(.tint)
                 .frame(width: characterSize, height: characterSize)
             VStack(alignment: .leading, spacing: Metric.hairline) {
@@ -347,7 +337,8 @@ struct PanelTrouble: Equatable {
     /// With several, no fix outranks another.
     var fixIsPrimary: Bool { servers.count == 1 && primary == nil }
 
-    static func trouble(for situation: PlugSituation, verdict: Verdict) -> PanelTrouble? {
+    static func trouble(for situation: PlugSituation) -> PanelTrouble? {
+        let verdict = PlugVerdict.verdict(for: situation)
         guard situation.setup == .ready else { return general(verdict) }
         switch situation.runtime {
         case .running:
@@ -367,7 +358,7 @@ struct PanelTrouble: Equatable {
         }
         let troubled = situation.troubledServers
         guard !troubled.isEmpty else { return nil }
-        let stopped = troubled.contains { $0.health == .down || $0.health == .unknown }
+        let stopped = troubled.contains { $0.health == .down }
         var card = PanelTrouble(
             servers: Array(troubled.prefix(visibleServers)), wash: stopped ? .blocked : .attention
         )

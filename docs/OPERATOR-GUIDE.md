@@ -111,7 +111,7 @@ oauth_scopes = ["tools:read"]
 
 `oauth_scopes` is the set a client may be granted. Leave it out to offer the
 default set (`tools:read`, `resources:read`, `prompts:read`, `completion:use`,
-`tasks:use`, `subscriptions:listen`, `logging:configure`, `logging:read`,
+`tasks:use`, `logging:configure`, `logging:read`,
 `continuations:complete`). `events:subscribe` is never in the default set; add
 it explicitly for [Slack event delivery](slack-mcp-events.md).
 
@@ -237,7 +237,7 @@ Operator inventory:
 
 - `plug tools --output json` includes source metadata, trust boundary, upstream-declared annotations, Plug-inferred annotations, and effective annotations.
 - `plug servers --output json` includes transport/auth/trust metadata. Live daemon output does not serialize secrets.
-- `/_plug/live-sessions` exposes active session inventory for local operator tooling and requires the HMAC request-proof exchange above.
+- `plug clients --output json` lists live sessions, local and HTTP, as the daemon reports them over its socket.
 
 ## Stdio Upstream Sandboxing
 

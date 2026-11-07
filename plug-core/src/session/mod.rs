@@ -3,12 +3,18 @@ mod stateful;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
-use crate::http::error::HttpError;
+pub(crate) use stateful::SessionEnd;
+pub use stateful::SessionStore;
 
-pub use stateful::StatefulSessionStore;
+/// What a session store call can fail with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SessionError {
+    #[error("session not found")]
+    NotFound,
+    #[error("too many sessions")]
+    TooMany,
+}
 
 /// Server-to-client notification payload queued or delivered via SSE.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,13 +69,6 @@ impl SseMessage {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionSendOutcome {
-    Delivered,
-    Queued,
-    SessionNotFound,
-}
-
 /// Which class of broadcast a notification belongs to.
 ///
 /// Targeted notifications (progress, cancellation, resource updates) are not
@@ -87,21 +86,40 @@ pub enum BroadcastKind {
     Logging,
 }
 
+impl BroadcastKind {
+    /// The broadcast class of `notification`, or `None` for one that names
+    /// its client.
+    pub(crate) fn of(notification: &crate::notifications::ProtocolNotification) -> Option<Self> {
+        use crate::notifications::ProtocolNotification as N;
+        match notification {
+            N::ToolListChanged => Some(Self::ToolList),
+            N::ResourceListChanged => Some(Self::ResourceList),
+            N::PromptListChanged => Some(Self::PromptList),
+            N::LoggingMessage { .. }
+            | N::TokenRefreshExchanged { .. }
+            | N::AuthStateChanged { .. } => Some(Self::Logging),
+            N::ToolListChangedFor { .. }
+            | N::Progress { .. }
+            | N::Cancelled { .. }
+            | N::ResourceUpdated { .. } => None,
+        }
+    }
+}
+
 /// Which broadcast notifications a session's principal may observe.
 ///
-/// Computed once at `initialize` from that request's `DownstreamCallContext`,
-/// because initialize is the only point where the whole policy input (era,
-/// transport, principal, scopes, local trust) is in hand; the fan-out task is
-/// shared by every session and has none of it.
+/// Recorded when the session is bound to its caller, at `initialize` or when
+/// a lost session is reopened, because only the request has the principal and
+/// its scopes; the fan-out task is shared by every session and has none of it.
 ///
 /// The default denies everything, and deliberately so. `create_session` makes a
 /// session visible to the fan-out task — which runs on another worker thread —
-/// before `initialize` can record the audience. A notification arriving inside
-/// that window would be buffered by `enqueue_pending` and replayed once the SSE
-/// stream opens, so an admit-by-default would hand it to a client that never
+/// before the session is bound. A notification arriving inside that window
+/// would be buffered by `enqueue_pending` and replayed once the SSE stream
+/// opens, so an admit-by-default would hand it to a client that never
 /// qualified for it. Denying by default makes that window silent instead of
 /// leaky. A loopback listener with no scopes to narrow gets
-/// [`BroadcastAudience::unrestricted`] the moment initialize resolves it.
+/// [`BroadcastAudience::unrestricted`] the moment the session is bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BroadcastAudience {
     pub tools: bool,
@@ -135,25 +153,23 @@ impl BroadcastAudience {
 /// Whether a session's client still has the access it opened the session with.
 pub type AccessCheck = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// Transport type for a downstream client session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DownstreamTransport {
-    Http,
+/// Who a session answers to, recorded once when it opens.
+pub struct SessionBinding {
+    /// The OAuth grant whose token opened the session, when one did.
+    pub grant: Option<GrantBinding>,
+    pub broadcast_audience: BroadcastAudience,
 }
 
-impl std::fmt::Display for DownstreamTransport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Http => write!(f, "http"),
-        }
-    }
+pub struct GrantBinding {
+    pub client_id: String,
+    /// Asked of the grant itself, so the session ends however the grant does.
+    pub still_allowed: AccessCheck,
 }
 
-/// Read-only snapshot of a downstream session for operator inventory.
+/// Read-only snapshot of a downstream HTTP session for operator inventory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownstreamSessionSnapshot {
     pub session_id: String,
-    pub transport: DownstreamTransport,
     pub client_type: crate::types::ClientType,
     /// The OAuth client whose token opened the session, when one did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,81 +182,50 @@ pub struct DownstreamSessionSnapshot {
     pub timeout_seconds: u64,
 }
 
-/// Trait boundary for downstream session storage.
-///
-/// `plug` currently uses a stateful in-memory implementation, but this trait
-/// marks the seam where a stateless or external-backed implementation would fit.
-pub trait SessionStore: Send + Sync {
-    fn create_session(&self) -> Result<String, HttpError>;
-    /// Open a session again under the id its client still holds, after Plug
-    /// restarted or the session timed out. `Ok(true)` when this call opened
-    /// it, `Ok(false)` when it was open already. A session its client closed
-    /// is not reopened.
-    fn reopen_session(&self, _session_id: &str) -> Result<bool, HttpError> {
-        Err(HttpError::SessionNotFound)
+impl From<DownstreamSessionSnapshot> for crate::ipc::IpcLiveSessionInfo {
+    fn from(snapshot: DownstreamSessionSnapshot) -> Self {
+        Self {
+            transport: crate::ipc::LiveSessionTransport::Http,
+            client_id: None,
+            link_target: None,
+            session_id: snapshot.session_id,
+            client_type: snapshot.client_type,
+            client_info: None,
+            adapter_version: None,
+            host: None,
+            client_key: crate::downstream_identity::remote_client_key(
+                snapshot.grant.as_deref(),
+                snapshot.client_type,
+            ),
+            access_key: Some(crate::downstream_identity::remote_access_key(
+                snapshot.grant.as_deref(),
+            )),
+            target: crate::downstream_identity::client_target(None, snapshot.client_type),
+            grant: snapshot.grant,
+            connected_secs: snapshot.connected_seconds,
+            last_activity_secs: Some(snapshot.idle_seconds),
+        }
     }
-    fn validate(&self, session_id: &str) -> Result<(), HttpError>;
-    fn has_live_sse_sender(&self, session_id: &str) -> Result<bool, HttpError>;
-    fn set_sse_sender(
-        &self,
-        session_id: &str,
-        sender: mpsc::Sender<SseEvent>,
-        last_event_id: Option<u64>,
-    ) -> Result<(), HttpError>;
-    fn set_client_type(
-        &self,
-        session_id: &str,
-        client_type: crate::types::ClientType,
-    ) -> Result<(), HttpError>;
-    fn get_client_type(&self, session_id: &str) -> Result<crate::types::ClientType, HttpError>;
-    /// Record the OAuth client whose token opened the session.
-    fn set_grant(&self, session_id: &str, client_id: String) -> Result<(), HttpError>;
-    fn set_broadcast_audience(
-        &self,
-        session_id: &str,
-        audience: BroadcastAudience,
-    ) -> Result<(), HttpError>;
-    /// Give the session a check of whether its client still has access. A
-    /// session whose check says no is ended the next time it is used, sent
-    /// to, or kept alive, whatever took the access away.
-    fn set_access_check(&self, session_id: &str, check: AccessCheck) -> Result<(), HttpError>;
-    fn remove(&self, session_id: &str) -> bool;
-    fn broadcast(&self, message: SseMessage, kind: BroadcastKind) {
-        self.broadcast_where(message, kind, &|_| true);
-    }
-    /// [`SessionStore::broadcast`] to the sessions `allowed` passes, asked
-    /// with the OAuth client that opened each one. Asked at delivery, so a
-    /// rule changed a moment ago already applies.
-    fn broadcast_where(
-        &self,
-        message: SseMessage,
-        kind: BroadcastKind,
-        allowed: &dyn Fn(Option<&str>) -> bool,
-    );
-    fn send_to_live_session(&self, session_id: &str, message: SseMessage) -> SessionSendOutcome;
-    fn remove_replay_events_by_key(&self, session_id: &str, key: &SseReplayKey);
-    fn spawn_cleanup_task(&self, cancel: CancellationToken);
-    fn session_count(&self) -> usize;
+}
 
-    /// Return a read-only snapshot of currently tracked HTTP sessions.
-    fn session_snapshots(&self) -> Vec<DownstreamSessionSnapshot>;
-
-    /// The OAuth client whose token opened `session_id`, when one did.
-    fn grant_of(&self, session_id: &str) -> Option<String> {
-        self.session_snapshots()
-            .into_iter()
-            .find(|session| session.session_id == session_id)
-            .and_then(|session| session.grant)
-    }
-
-    /// End every session `client_id` opened, as when its access is taken
-    /// away: an open stream closes and the session id stops working. Returns
-    /// how many ended.
-    fn end_sessions_of(&self, client_id: &str) -> usize {
-        self.session_snapshots()
-            .into_iter()
-            .filter(|session| session.grant.as_deref() == Some(client_id))
-            .filter(|session| self.remove(&session.session_id))
-            .count()
-    }
+/// Every live downstream session: the daemon's local connectors and the HTTP
+/// sessions in `http`, local first, then by client type and session id.
+pub fn live_sessions(
+    local: Vec<crate::ipc::IpcLiveSessionInfo>,
+    http: &SessionStore,
+) -> Vec<crate::ipc::IpcLiveSessionInfo> {
+    use crate::ipc::LiveSessionTransport;
+    let transport_order = |transport: LiveSessionTransport| match transport {
+        LiveSessionTransport::DaemonProxy => 0,
+        LiveSessionTransport::Http => 1,
+    };
+    let mut sessions = local;
+    sessions.extend(http.snapshots().into_iter().map(Into::into));
+    sessions.sort_by(|a, b| {
+        transport_order(a.transport)
+            .cmp(&transport_order(b.transport))
+            .then(a.client_type.to_string().cmp(&b.client_type.to_string()))
+            .then(a.session_id.cmp(&b.session_id))
+    });
+    sessions
 }

@@ -1,5 +1,6 @@
 import XCTest
 @testable import Plug
+import PlugIPC
 
 /// The verdict is the only thing the menu bar icon, the popover headline, and
 /// the window banner say, so its priority order is the product. These pin it.
@@ -172,7 +173,6 @@ final class PlugVerdictTests: XCTestCase {
         )
         XCTAssertNil(server("Notion", health: .signInNeeded).cancelSignIn)
         XCTAssertEqual(server("Linear", health: .down).fix?.intent, .restartServer("Linear"))
-        XCTAssertEqual(server("Odd", health: .unknown).fix?.intent, .restartServer("Odd"))
         for health in [ServerHealth.working, .starting, .off] {
             XCTAssertNil(server("fine", health: health).fix, "\(health) needs no fix")
         }
@@ -194,13 +194,7 @@ final class PlugVerdictTests: XCTestCase {
     }
 
     func testCharacterWearsTheFaceTheVerdictReads() {
-        XCTAssertEqual(PlugCharacter.Mood(.good), .awake)
-        XCTAssertEqual(PlugCharacter.Mood(.quiet), .asleep)
-        XCTAssertEqual(PlugCharacter.Mood(.busy), .working)
-        XCTAssertEqual(PlugCharacter.Mood(.attention), .needsYou)
-        XCTAssertEqual(PlugCharacter.Mood(.blocked), .alert)
-
-        func mood(_ servers: [ServerFacts]) -> PlugCharacter.Mood {
+        func mood(_ servers: [ServerFacts]) -> PlugMood {
             PlugVerdict.verdict(for: PlugSituation(runtime: .running, servers: servers)).mood
         }
         XCTAssertEqual(mood([]), .curious)
@@ -216,7 +210,7 @@ final class PlugVerdictTests: XCTestCase {
     }
 
     private func trouble(_ situation: PlugSituation) -> PanelTrouble? {
-        PanelTrouble.trouble(for: situation, verdict: PlugVerdict.verdict(for: situation))
+        PanelTrouble.trouble(for: situation)
     }
 
     func testPanelHasNoCardWhenNothingNeedsYou() {
@@ -304,15 +298,36 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertEqual(starting.settledServers.map(\.name), ["a", "b"])
     }
 
-    /// A face that never came to rest would redraw for ever, and one that
-    /// moved a part out of sight would not be the character.
-    func testEveryFaceHoldsStillAsAWholeCharacter() {
-        for mood in PlugCharacter.Mood.allCases {
+    /// A face that moved a part out of sight would not be the character.
+    func testEveryStillFaceIsAWholeCharacter() {
+        for mood in PlugMood.allCases {
             let pose = PlugPose.pose(for: mood, at: 0, moving: false)
-            XCTAssertEqual(pose, PlugPose.pose(for: mood, at: 3.7, moving: false), "\(mood)")
             for part in [PlugPose.Part.bodyWidth, .bodyHeight, .leftProngHeight, .rightProngHeight] {
                 XCTAssertGreaterThan(pose[part], 0, "\(mood) \(part)")
             }
+        }
+    }
+
+    /// The character stops drawing until the next change `nextChange` names,
+    /// so a face that moved before then would freeze mid-move. Faces that
+    /// never stop moving are looked at again every quarter of a second.
+    func testAMovingFaceHoldsStillUntilItsNextChange() {
+        let restless: Set<PlugMood> = [.happy, .thinking, .loading, .dizzy, .asleep, .tucked]
+        for mood in PlugMood.allCases where !restless.contains(mood) {
+            for step in 0..<150 {
+                let time = Double(step) * 0.137
+                let next = PlugPose.nextChange(for: mood, after: time)
+                XCTAssertGreaterThan(next, time, "\(mood) at \(time)")
+                let until = next.isFinite ? next : time + 30
+                let pose = PlugPose.pose(for: mood, at: time, moving: true)
+                for fraction in [0.1, 0.5, 0.9] {
+                    let later = time + (until - time) * fraction
+                    XCTAssertEqual(PlugPose.pose(for: mood, at: later, moving: true), pose, "\(mood) at \(later)")
+                }
+            }
+        }
+        for mood in restless {
+            XCTAssertEqual(PlugPose.nextChange(for: mood, after: 3), 3.25, "\(mood)")
         }
     }
 
@@ -332,27 +347,27 @@ final class PlugVerdictTests: XCTestCase {
     }
 
     func testHealthNeverLeaksProtocolVocabulary() {
-        XCTAssertEqual(ServerHealth(daemonValue: "AuthRequired", enabled: true).label, "Sign-in needed")
-        XCTAssertEqual(ServerHealth(daemonValue: "Failed", enabled: true).label, "Down")
-        XCTAssertEqual(ServerHealth(daemonValue: "Healthy", enabled: false), .off)
+        XCTAssertEqual(ServerHealth(daemonValue: .authRequired, enabled: true).label, "Sign-in needed")
+        XCTAssertEqual(ServerHealth(daemonValue: .failed, enabled: true).label, "Down")
+        XCTAssertEqual(ServerHealth(daemonValue: .healthy, enabled: false), .off)
         XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: true), .starting)
     }
 
     func testDegradedServerStillReadsAsRunning() {
-        let health = ServerHealth(daemonValue: "Degraded", enabled: true)
+        let health = ServerHealth(daemonValue: .degraded, enabled: true)
         XCTAssertEqual(health, .working)
         XCTAssertFalse(health.needsAttention)
     }
 
     func testWorkingHealthUsesLiveDotInsteadOfCompletionCheckmark() {
-        XCTAssertEqual(ServerHealth(daemonValue: "Healthy", enabled: true).icon, .working)
+        XCTAssertEqual(ServerHealth(daemonValue: .healthy, enabled: true).icon, .working)
     }
 
     /// Only a state that is changing moves. A running server used to pulse,
     /// so a healthy list looked busy.
     func testOnlySettlingServersPulse() {
         XCTAssertTrue(ServerHealth.starting.pulses)
-        for health in [ServerHealth.working, .signInNeeded, .down, .notLoaded, .off, .unknown] {
+        for health in [ServerHealth.working, .signInNeeded, .down, .notLoaded, .off] {
             XCTAssertFalse(health.pulses, "\(health) should hold still")
         }
     }
@@ -362,8 +377,18 @@ final class PlugVerdictTests: XCTestCase {
     func testAServerTheDaemonNeverLoadedSaysSoAndOffersAReload() {
         XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: true, daemonUptimeSecs: 5), .starting)
         XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: true, daemonUptimeSecs: 61), .notLoaded)
-        XCTAssertEqual(ServerHealth(daemonValue: "Starting", enabled: true, daemonUptimeSecs: 600), .starting)
         XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: false, daemonUptimeSecs: 600), .off)
+
+        // The model reads the uptime steadied, and the silence still ends
+        // exactly when the startup allowance does.
+        func health(atUptime uptime: UInt64) -> ServerHealth {
+            var snapshot = OperatorSnapshot.empty
+            snapshot.uptimeSecs = uptime
+            let steady = snapshot.steadied(startup: ServerHealth.notLoadedAfterSecs)
+            return ServerHealth(daemonValue: nil, enabled: true, daemonUptimeSecs: steady.uptimeSecs)
+        }
+        XCTAssertEqual(health(atUptime: ServerHealth.notLoadedAfterSecs), .starting)
+        XCTAssertEqual(health(atUptime: ServerHealth.notLoadedAfterSecs + 1), .notLoaded)
 
         let missing = server("Linear", health: .notLoaded)
         XCTAssertEqual(missing.fix, .init("Reload", .reloadConfiguration))
@@ -382,30 +407,15 @@ final class PlugVerdictTests: XCTestCase {
         let situation = PlugSituation(runtime: .reconnecting, servers: [off, server("a", tools: 3)])
         XCTAssertEqual(situation.countsSummary(stale: false), "1 server · 3 tools")
         XCTAssertEqual(situation.countsSummary(stale: true), "Last known · 1 server · 3 tools")
-        XCTAssertEqual(situation.listedServers.map(\.name), ["a", "b"])
         XCTAssertEqual(
             PlugSituation(servers: [server("a", tools: 1)]).countsSummary(stale: false),
             "1 server · 1 tool"
         )
     }
 
-    func testConnectedAppsGroupSessionsByAppInFirstSeenOrder() {
-        let targets = AppIcons.distinctTargets(forClientTypes: [
-            "claude-code", "Codex CLI", "claude-code", "Claude Desktop"
-        ])
-        XCTAssertEqual(targets, ["claude-code", "codex-cli", "claude-desktop"])
-        let situation = PlugSituation(
-            runtime: .running,
-            connectedApps: targets.count,
-            connectedAppTargets: targets
-        )
-        XCTAssertEqual(situation.connectedApps, 3)
-    }
-
     func testThePanelNamesWhoIsConnected() {
         func connected(_ names: [String]) -> String {
             PlugSituation(
-                connectedApps: names.count,
                 connectedClients: names.map { ConnectedClient(target: $0, name: $0) }
             ).connectedSummary
         }
@@ -419,7 +429,6 @@ final class PlugVerdictTests: XCTestCase {
         // Shorter ways to say it, for a panel too narrow for two names.
         XCTAssertEqual(
             PlugSituation(
-                connectedApps: 4,
                 connectedClients: ["Codex CLI", "GrokBot", "Zed", "Pi"].map { ConnectedClient(target: $0, name: $0) }
             ).connectedSummaries,
             ["Codex CLI, GrokBot and 2 others connected", "Codex CLI and 3 others connected", "4 clients connected"]

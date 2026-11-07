@@ -44,20 +44,19 @@ fn auth_status_source_text(live: bool) -> &'static str {
     }
 }
 
+fn auth_status_source(live: bool) -> &'static str {
+    if live {
+        crate::ipc_client::DaemonQueryAvailability::Available.status_source()
+    } else {
+        "stored_credentials_only"
+    }
+}
+
 fn auth_status_json(servers: Vec<serde_json::Value>, live: bool) -> serde_json::Value {
     serde_json::json!({
         "runtime_available": live,
         "servers": servers,
-        "status_source": if live {
-            "live_daemon"
-        } else {
-            "stored_credentials_only"
-        },
-        "status_scope": if live {
-            "live_daemon"
-        } else {
-            "stored_credentials_only"
-        }
+        "status_source": auth_status_source(live),
     })
 }
 
@@ -118,31 +117,25 @@ async fn bind_reusable_callback_listener(
 }
 
 async fn refresh_live_daemon_server(server_name: &str) -> anyhow::Result<bool> {
-    if !crate::daemon::socket_path().exists() {
+    if !plug_core::paths::socket_path().exists() {
         return Ok(false);
     }
 
-    let auth_token = match crate::daemon::read_auth_token() {
-        Ok(token) => token,
-        Err(_) => return Ok(false),
-    };
-
-    let request = plug_core::ipc::IpcRequest::RestartServer {
+    let request = plug_core::ipc::OperatorRequest::RestartServer {
         server_id: server_name.to_string(),
-        auth_token,
     };
 
-    match crate::daemon::ipc_request(&request).await {
+    match crate::ipc_client::operator(request).await {
         Ok(plug_core::ipc::IpcResponse::Ok) => Ok(true),
         Ok(plug_core::ipc::IpcResponse::Error { code, message }) => {
             anyhow::bail!("{code}: {message}");
         }
         Ok(other) => anyhow::bail!("unexpected daemon response: {other:?}"),
-        Err(err) => Err(err),
+        Err(crate::ipc_client::IpcClientError::Token { .. }) => Ok(false),
+        Err(err) => Err(err.into()),
     }
 }
 
-/// Top-level auth command dispatcher.
 pub(crate) async fn cmd_auth(
     config_path: Option<&PathBuf>,
     command: crate::AuthCommands,
@@ -246,22 +239,13 @@ impl LocalOperatorClient {
         &self,
         method: reqwest::Method,
         child_segment: Option<&str>,
-    ) -> anyhow::Result<reqwest::Response> {
-        self.send_authenticated_with_allow_empty(method, child_segment, false)
-            .await
-    }
-
-    async fn send_authenticated_with_allow_empty(
-        &self,
-        method: reqwest::Method,
-        child_segment: Option<&str>,
         allow_empty: bool,
     ) -> anyhow::Result<reqwest::Response> {
         let endpoint = match child_segment {
             Some(segment) => self.child_endpoint(segment)?,
             None => self.endpoint.clone(),
         };
-        crate::runtime::send_authenticated_operator_request(
+        crate::operator_http::send_authenticated_operator_request(
             &self.client,
             endpoint,
             &self.host_authority,
@@ -288,18 +272,20 @@ fn local_operator_client(
     if operator_token.is_empty() {
         anyhow::bail!("the local operator token is empty");
     }
-    let scheme = if cfg.http.tls_cert_path.is_some() && cfg.http.tls_key_path.is_some() {
+    let scheme = if cfg.http.tls_enabled() {
         "https"
     } else {
         "http"
     };
     let host_authority =
-        crate::runtime::local_operator_authority(&cfg.http.bind_address, cfg.http.port);
-    let connection_authority =
-        crate::runtime::local_operator_connection_authority(&cfg.http.bind_address, cfg.http.port);
+        crate::operator_http::local_operator_authority(&cfg.http.bind_address, cfg.http.port);
+    let connection_authority = crate::operator_http::local_operator_connection_authority(
+        &cfg.http.bind_address,
+        cfg.http.port,
+    );
     let endpoint =
         reqwest::Url::parse(&format!("{scheme}://{connection_authority}{endpoint_path}"))?;
-    let client = reqwest::Client::builder()
+    let client = plug_core::tls::http_client_builder()
         .timeout(Duration::from_secs(5))
         // Never let proxy configuration or redirects carry operator headers
         // outside the loopback request boundary.
@@ -326,30 +312,25 @@ async fn cmd_downstream_oauth_clients(
     command: crate::DownstreamOauthClientCommands,
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
-    if config_path.is_none() {
-        return cmd_downstream_oauth_clients_via_daemon(command, output).await;
-    }
-    let operator = local_operator_client(config_path, "/_plug/oauth/clients")?;
+    // `--config` names a Plug served from that file, reached over its
+    // operator routes; without it, the daemon answers.
+    let operator = match config_path {
+        Some(_) => Some(local_operator_client(
+            config_path,
+            crate::operator_http::OPERATOR_OAUTH_CLIENTS_PATH,
+        )?),
+        None => {
+            crate::runtime::ensure_daemon_with_feedback(None, false).await?;
+            None
+        }
+    };
 
     match command {
         crate::DownstreamOauthClientCommands::List => {
-            let response = operator
-                .send_authenticated(reqwest::Method::GET, None)
-                .await?;
-            if !response.status().is_success() {
-                anyhow::bail!(
-                    "the running Plug service rejected the client-list request ({})",
-                    response.status()
-                );
-            }
-            let clients = response
-                .json::<Vec<plug_core::downstream_oauth::RegisteredClientSummary>>()
-                .await?;
+            let clients = list_registered_clients(operator.as_ref()).await?;
             match output {
                 OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&clients)?),
-                OutputFormat::Text => {
-                    print_registered_clients(&clients);
-                }
+                OutputFormat::Text => print_registered_clients(&clients),
             }
         }
         crate::DownstreamOauthClientCommands::Revoke { client_id, yes } => {
@@ -362,21 +343,68 @@ async fn cmd_downstream_oauth_clients(
                 ui::print_info_line("Revocation cancelled");
                 return Ok(());
             }
-            let response = operator
-                .send_authenticated(reqwest::Method::DELETE, Some(&client_id))
-                .await?;
-            match response.status() {
-                reqwest::StatusCode::NO_CONTENT => ui::print_success_line(format!(
-                    "Revoked {client_id} and all of its downstream OAuth grants"
-                )),
-                reqwest::StatusCode::NOT_FOUND => anyhow::bail!("registered client not found"),
-                status => {
-                    anyhow::bail!("the running Plug service rejected the revocation ({status})")
-                }
-            }
+            revoke_registered_client(operator.as_ref(), &client_id).await?;
+            ui::print_success_line(format!(
+                "Revoked {client_id} and all of its downstream OAuth grants"
+            ));
         }
     }
     Ok(())
+}
+
+async fn list_registered_clients(
+    operator: Option<&LocalOperatorClient>,
+) -> anyhow::Result<Vec<plug_core::downstream_oauth::RegisteredClientSummary>> {
+    let Some(operator) = operator else {
+        return match crate::ipc_client::operator(plug_core::ipc::OperatorRequest::Snapshot).await? {
+            plug_core::ipc::IpcResponse::OperatorSnapshot { snapshot } => {
+                Ok(snapshot.downstream_clients)
+            }
+            plug_core::ipc::IpcResponse::Error { code, message } => {
+                anyhow::bail!("{code}: {message}")
+            }
+            other => anyhow::bail!("unexpected daemon response: {other:?}"),
+        };
+    };
+    let response = operator
+        .send_authenticated(reqwest::Method::GET, None, false)
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "the running Plug service rejected the client-list request ({})",
+            response.status()
+        );
+    }
+    Ok(response.json().await?)
+}
+
+async fn revoke_registered_client(
+    operator: Option<&LocalOperatorClient>,
+    client_id: &str,
+) -> anyhow::Result<()> {
+    let Some(operator) = operator else {
+        return match crate::ipc_client::operator(
+            plug_core::ipc::OperatorRequest::RevokeDownstreamClient {
+                client_id: client_id.to_string(),
+            },
+        )
+        .await?
+        {
+            plug_core::ipc::IpcResponse::DownstreamClientRevoked { .. } => Ok(()),
+            plug_core::ipc::IpcResponse::Error { code, message } => {
+                anyhow::bail!("{code}: {message}")
+            }
+            other => anyhow::bail!("unexpected daemon response: {other:?}"),
+        };
+    };
+    let response = operator
+        .send_authenticated(reqwest::Method::DELETE, Some(client_id), false)
+        .await?;
+    match response.status() {
+        reqwest::StatusCode::NO_CONTENT => Ok(()),
+        reqwest::StatusCode::NOT_FOUND => anyhow::bail!("registered client not found"),
+        status => anyhow::bail!("the running Plug service rejected the revocation ({status})"),
+    }
 }
 
 fn print_registered_clients(clients: &[plug_core::downstream_oauth::RegisteredClientSummary]) {
@@ -429,73 +457,9 @@ fn registered_client_timeline(
     )
 }
 
-async fn cmd_downstream_oauth_clients_via_daemon(
-    command: crate::DownstreamOauthClientCommands,
-    output: &OutputFormat,
-) -> anyhow::Result<()> {
-    crate::runtime::ensure_daemon_with_feedback(None, false).await?;
-    let auth_token = crate::daemon::read_auth_token()?;
-    match command {
-        crate::DownstreamOauthClientCommands::List => {
-            let response =
-                crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::OperatorSnapshot {
-                    auth_token,
-                })
-                .await?;
-            let clients = match response {
-                plug_core::ipc::IpcResponse::OperatorSnapshot { snapshot } => {
-                    snapshot.downstream_clients
-                }
-                plug_core::ipc::IpcResponse::Error { code, message } => {
-                    anyhow::bail!("{code}: {message}")
-                }
-                other => anyhow::bail!("unexpected daemon response: {other:?}"),
-            };
-            match output {
-                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&clients)?),
-                OutputFormat::Text => print_registered_clients(&clients),
-            }
-        }
-        crate::DownstreamOauthClientCommands::Revoke { client_id, yes } => {
-            if !yes
-                && !dialoguer::Confirm::new()
-                    .with_prompt(format!("Revoke {client_id} and all of its Plug tokens?"))
-                    .default(false)
-                    .interact()?
-            {
-                ui::print_info_line("Revocation cancelled");
-                return Ok(());
-            }
-            match crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::RevokeDownstreamClient {
-                auth_token,
-                client_id: client_id.clone(),
-            })
-            .await?
-            {
-                plug_core::ipc::IpcResponse::DownstreamClientRevoked { .. } => {
-                    ui::print_success_line(format!(
-                        "Revoked {client_id} and all of its downstream OAuth grants"
-                    ));
-                }
-                plug_core::ipc::IpcResponse::Error { code, message } => {
-                    anyhow::bail!("{code}: {message}")
-                }
-                other => anyhow::bail!("unexpected daemon response: {other:?}"),
-            }
-        }
-    }
-    Ok(())
-}
-
 #[derive(serde::Deserialize)]
 struct OwnerBootstrapResponse {
     enrollment_url: String,
-}
-
-fn owner_credentials_json(
-    credentials: &[plug_core::downstream_oauth::OwnerCredentialSummary],
-) -> serde_json::Value {
-    serde_json::to_value(credentials).expect("owner credential summaries serialize")
 }
 
 fn owner_enrollment_manual_url(
@@ -524,7 +488,7 @@ fn validate_owner_enrollment_url<'a>(
         || candidate.origin() != expected.origin()
         || !candidate.username().is_empty()
         || candidate.password().is_some()
-        || candidate.path() != "/oauth/owner/enroll"
+        || candidate.path() != plug_core::downstream_oauth::paths::OWNER_ENROLL
         || candidate.query().is_some()
         || !valid_bootstrap
     {
@@ -547,7 +511,7 @@ async fn fetch_owner_credentials(
     operator: &LocalOperatorClient,
 ) -> anyhow::Result<Vec<plug_core::downstream_oauth::OwnerCredentialSummary>> {
     let response = operator
-        .send_authenticated(reqwest::Method::GET, None)
+        .send_authenticated(reqwest::Method::GET, None, false)
         .await?;
     if !response.status().is_success() {
         anyhow::bail!(
@@ -565,9 +529,12 @@ async fn cmd_downstream_oauth_owner(
 ) -> anyhow::Result<()> {
     match command {
         crate::OwnerCommands::Enroll { no_browser } => {
-            let operator = local_operator_client(config_path, "/_plug/oauth/owner/bootstrap")?;
+            let operator = local_operator_client(
+                config_path,
+                crate::operator_http::OPERATOR_OWNER_BOOTSTRAP_PATH,
+            )?;
             let response = operator
-                .send_authenticated(reqwest::Method::POST, None)
+                .send_authenticated(reqwest::Method::POST, None, false)
                 .await?;
             if !response.status().is_success() {
                 anyhow::bail!(
@@ -619,13 +586,13 @@ async fn cmd_downstream_oauth_owner(
             }
         }
         crate::OwnerCommands::List => {
-            let operator = local_operator_client(config_path, "/_plug/oauth/owner/credentials")?;
+            let operator = local_operator_client(
+                config_path,
+                crate::operator_http::OPERATOR_OWNER_CREDENTIALS_PATH,
+            )?;
             let credentials = fetch_owner_credentials(&operator).await?;
             match output {
-                OutputFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&owner_credentials_json(&credentials))?
-                ),
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&credentials)?),
                 OutputFormat::Text => {
                     if credentials.is_empty() {
                         ui::print_info_line("No owner passkeys are enrolled");
@@ -644,7 +611,10 @@ async fn cmd_downstream_oauth_owner(
             }
         }
         crate::OwnerCommands::Remove { credential_id, yes } => {
-            let operator = local_operator_client(config_path, "/_plug/oauth/owner/credentials")?;
+            let operator = local_operator_client(
+                config_path,
+                crate::operator_http::OPERATOR_OWNER_CREDENTIALS_PATH,
+            )?;
             let credentials = fetch_owner_credentials(&operator).await?;
             let Some(credential) = credentials
                 .iter()
@@ -672,11 +642,7 @@ async fn cmd_downstream_oauth_owner(
 
             let mut allow_empty = yes || removing_final;
             let mut response = operator
-                .send_authenticated_with_allow_empty(
-                    reqwest::Method::DELETE,
-                    Some(&credential_id),
-                    allow_empty,
-                )
+                .send_authenticated(reqwest::Method::DELETE, Some(&credential_id), allow_empty)
                 .await?;
             if response.status() == reqwest::StatusCode::CONFLICT && !allow_empty {
                 let current = fetch_owner_credentials(&operator).await?;
@@ -704,11 +670,7 @@ async fn cmd_downstream_oauth_owner(
                 }
                 allow_empty = true;
                 response = operator
-                    .send_authenticated_with_allow_empty(
-                        reqwest::Method::DELETE,
-                        Some(&credential_id),
-                        allow_empty,
-                    )
+                    .send_authenticated(reqwest::Method::DELETE, Some(&credential_id), allow_empty)
                     .await?;
             }
             match response.status() {
@@ -731,7 +693,131 @@ async fn cmd_downstream_oauth_owner(
     Ok(())
 }
 
-// login
+/// The OAuth server `server_name` names, and its URL.
+fn oauth_server<'a>(
+    cfg: &'a config::Config,
+    server_name: &str,
+) -> anyhow::Result<(&'a plug_core::config::ServerConfig, &'a str)> {
+    let server_config = cfg
+        .servers
+        .get(server_name)
+        .ok_or_else(|| anyhow::anyhow!("server '{server_name}' not found in config"))?;
+    if !server_config.is_oauth() {
+        anyhow::bail!(
+            "server '{server_name}' is not configured for OAuth (set auth = \"oauth\" in config)"
+        );
+    }
+    let url = server_config
+        .url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("server '{server_name}' has no URL configured"))?;
+    Ok((server_config, url))
+}
+
+/// A sign-in to one server, bound to the authority its metadata names.
+struct SignIn {
+    manager: rmcp::transport::auth::AuthorizationManager,
+    credentials: oauth::CompositeCredentialStore,
+    authority: oauth::VerifiedOAuthAuthority,
+}
+
+impl SignIn {
+    /// Discover the server's authorization metadata, verify its authority
+    /// and bind the server's stored credentials to it.
+    async fn start(server_name: &str, url: &str) -> anyhow::Result<Self> {
+        let mut manager = plug_core::upstream_http::authorization_manager(url)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to initialize OAuth for '{server_name}': {e}"))?;
+
+        // `set_credential_store` takes ownership, so these are fresh instances
+        // over the same file and Keychain entries the daemon's stores read.
+        let credentials = oauth::CompositeCredentialStore::new(server_name.to_string());
+        manager.set_credential_store(credentials.clone());
+        manager.set_state_store(oauth::CompositeStateStore::new(server_name.to_string()));
+
+        ui::print_info_line("Discovering authorization server metadata...");
+        let metadata = manager
+            .resolve_metadata()
+            .await
+            .map_err(|e| anyhow::anyhow!("metadata discovery failed: {e}"))?;
+        let authority = oauth::VerifiedOAuthAuthority::verify(url, &metadata.metadata)
+            .map_err(|e| anyhow::anyhow!("OAuth authority verification failed: {e}"))?;
+        credentials
+            .bind_verified_authority(&authority)
+            .map_err(|e| anyhow::anyhow!("stored credential binding conflict: {e}"))?;
+        manager.set_metadata(metadata.metadata);
+        Ok(Self {
+            manager,
+            credentials,
+            authority,
+        })
+    }
+
+    /// Use the configured OAuth client, or the registration kept from an
+    /// earlier sign-in. False when there is neither.
+    fn configure_known_client(
+        &mut self,
+        server_config: &plug_core::config::ServerConfig,
+        reusable_registration: Option<&plug_core::oauth::DynamicOauthClientRegistration>,
+        redirect_uri: &str,
+        scopes: &[String],
+    ) -> anyhow::Result<bool> {
+        let oauth_config = if let Some(client_id) = &server_config.oauth_client_id {
+            ui::print_info_line("Using configured OAuth client...");
+            rmcp::transport::auth::OAuthClientConfig::new(
+                client_id.clone(),
+                redirect_uri.to_string(),
+            )
+            .with_scopes(scopes.to_vec())
+        } else if let Some(registration) = reusable_registration {
+            ui::print_info_line("Reusing existing OAuth client registration...");
+            registration.to_oauth_client_config(scopes.to_vec())
+        } else {
+            return Ok(false);
+        };
+        self.manager
+            .configure_client(oauth_config)
+            .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
+        Ok(true)
+    }
+
+    /// Check the callback came from the verified authority, trade the code
+    /// for a token, and tell the running daemon.
+    async fn finish(
+        self,
+        server_name: &str,
+        code: &str,
+        csrf_state: &str,
+        callback_issuer: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.authority
+            .validate_callback_issuer(callback_issuer)
+            .map_err(|e| anyhow::anyhow!("OAuth callback issuer validation failed: {e}"))?;
+        ui::print_info_line("Exchanging authorization code for token...");
+        self.manager
+            .exchange_code_for_token(code, csrf_state)
+            .await
+            .map_err(|e| anyhow::anyhow!("token exchange failed: {e}"))?;
+        ui::print_success_line(format!("Successfully authenticated server '{server_name}'"));
+        report_live_refresh(server_name, "Credentials were saved").await;
+        Ok(())
+    }
+}
+
+/// Ask the running daemon to pick up `server_name`'s new credentials and say
+/// how that went; `done` says what already happened to them.
+async fn report_live_refresh(server_name: &str, done: &str) {
+    match refresh_live_daemon_server(server_name).await {
+        Ok(true) => ui::print_info_line(format!(
+            "Refreshed live daemon state for server '{server_name}'"
+        )),
+        Ok(false) => {}
+        Err(err) => ui::print_warning_line(format!(
+            "{done}, but the running service did not reload them automatically: {err}. Next: {}.",
+            crate::runtime::restart_advice()
+        )),
+    }
+}
 
 async fn cmd_auth_login(
     config_path: Option<&PathBuf>,
@@ -739,53 +825,12 @@ async fn cmd_auth_login(
     no_browser: bool,
 ) -> anyhow::Result<()> {
     let cfg = config::load_config(config_path)?;
-    let server_config = cfg
-        .servers
-        .get(server_name)
-        .ok_or_else(|| anyhow::anyhow!("server '{server_name}' not found in config"))?;
-
-    if server_config.auth.as_deref() != Some("oauth") {
-        anyhow::bail!(
-            "server '{server_name}' is not configured for OAuth (set auth = \"oauth\" in config)"
-        );
-    }
-
-    let url = server_config
-        .url
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("server '{server_name}' has no URL configured"))?;
+    let (server_config, url) = oauth_server(&cfg, server_name)?;
 
     ui::print_info_line(format!(
         "Starting OAuth login for server '{server_name}'..."
     ));
-
-    use rmcp::transport::auth::AuthorizationManager;
-
-    let mut auth_manager = AuthorizationManager::new(url)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to initialize OAuth for '{server_name}': {e}"))?;
-
-    // Create stores for the AuthorizationManager. We create fresh instances
-    // rather than reusing the global registry's Arc because set_credential_store
-    // takes ownership. The file/keyring paths are the same, so credentials
-    // saved by the manager will be visible to the global store on next load.
-    let cred_store = oauth::CompositeCredentialStore::new(server_name.to_string());
-    let state_store = oauth::CompositeStateStore::new(server_name.to_string());
-    auth_manager.set_credential_store(cred_store.clone());
-    auth_manager.set_state_store(state_store);
-
-    ui::print_info_line("Discovering authorization server metadata...");
-    let metadata = auth_manager
-        .resolve_metadata()
-        .await
-        .map_err(|e| anyhow::anyhow!("metadata discovery failed: {e}"))?;
-    let authority = oauth::VerifiedOAuthAuthority::verify(url, &metadata.metadata)
-        .map_err(|e| anyhow::anyhow!("OAuth authority verification failed: {e}"))?;
-    cred_store
-        .bind_verified_authority(&authority)
-        .map_err(|e| anyhow::anyhow!("stored credential binding conflict: {e}"))?;
-    auth_manager.set_metadata(metadata.metadata);
-
+    let mut sign_in = SignIn::start(server_name, url).await?;
     let scopes: Vec<String> = server_config.oauth_scopes.clone().unwrap_or_default();
 
     let PersistedOauthClientState {
@@ -832,22 +877,12 @@ async fn cmd_auth_login(
             None => default_dynamic_oauth_redirect_uri(),
         });
 
-    if let Some(ref client_id) = server_config.oauth_client_id {
-        ui::print_info_line("Using configured OAuth client...");
-        let oauth_config =
-            rmcp::transport::auth::OAuthClientConfig::new(client_id.clone(), redirect_uri.clone())
-                .with_scopes(scopes.clone());
-        auth_manager
-            .configure_client(oauth_config)
-            .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
-    } else if let Some(registration) = reusable_registration.as_ref() {
-        ui::print_info_line("Reusing existing OAuth client registration...");
-        let oauth_config = registration.to_oauth_client_config(scopes.clone());
-        auth_manager
-            .configure_client(oauth_config)
-            .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
-    } else {
-        // Dynamic client registration
+    if !sign_in.configure_known_client(
+        server_config,
+        reusable_registration.as_ref(),
+        &redirect_uri,
+        &scopes,
+    )? {
         if has_persisted_credentials {
             ui::print_warning_line(format!(
                 "Stored credentials for '{server_name}' do not include reusable dynamic registration metadata. Plug will register one new OAuth client so future reauth can reuse it safely."
@@ -855,17 +890,20 @@ async fn cmd_auth_login(
         }
         ui::print_info_line("Registering client with authorization server...");
         let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
-        let reg_config = auth_manager
+        let reg_config = sign_in
+            .manager
             .register_client("plug", &redirect_uri, &scope_refs)
             .await
             .map_err(|e| anyhow::anyhow!("client registration failed: {e}"))?;
-        cred_store
+        sign_in
+            .credentials
             .remember_dynamic_client_registration(&reg_config)
             .map_err(|e| anyhow::anyhow!("failed to persist OAuth client registration: {e}"))?;
     }
 
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
-    let auth_url = auth_manager
+    let auth_url = sign_in
+        .manager
         .get_authorization_url(&scope_refs)
         .await
         .map_err(|e| anyhow::anyhow!("failed to get authorization URL: {e}"))?;
@@ -889,7 +927,6 @@ async fn cmd_auth_login(
     }
 
     let (code, csrf_state, callback_issuer) = if let Some(listener) = callback_listener {
-        // Localhost callback: wait for the OAuth redirect with a 120s timeout.
         ui::print_info_line("Waiting for OAuth callback on localhost...");
         await_oauth_callback(listener, Duration::from_secs(120)).await?
     } else {
@@ -920,36 +957,10 @@ async fn cmd_auth_login(
         (code, state, None)
     };
 
-    authority
-        .validate_callback_issuer(callback_issuer.as_deref())
-        .map_err(|e| anyhow::anyhow!("OAuth callback issuer validation failed: {e}"))?;
-
-    ui::print_info_line("Exchanging authorization code for token...");
-    auth_manager
-        .exchange_code_for_token(&code, &csrf_state)
+    sign_in
+        .finish(server_name, &code, &csrf_state, callback_issuer.as_deref())
         .await
-        .map_err(|e| anyhow::anyhow!("token exchange failed: {e}"))?;
-
-    ui::print_success_line(format!("Successfully authenticated server '{server_name}'"));
-    match refresh_live_daemon_server(server_name).await {
-        Ok(true) => {
-            ui::print_info_line(format!(
-                "Refreshed live daemon state for server '{server_name}'"
-            ));
-        }
-        Ok(false) => {}
-        Err(err) => {
-            ui::print_warning_line(format!(
-                "Credentials were saved, but the running service did not reload them automatically: {err}. Next: {}.",
-                crate::runtime::restart_advice()
-            ));
-        }
-    }
-
-    Ok(())
 }
-
-// complete (non-interactive code exchange)
 
 /// Non-interactive OAuth code exchange for agents that obtained an authorization
 /// code through an external mechanism (e.g. a separate browser step orchestrated
@@ -963,47 +974,8 @@ async fn cmd_auth_complete(
     callback_issuer: Option<&str>,
 ) -> anyhow::Result<()> {
     let cfg = config::load_config(config_path)?;
-    let server_config = cfg
-        .servers
-        .get(server_name)
-        .ok_or_else(|| anyhow::anyhow!("server '{server_name}' not found in config"))?;
-
-    if server_config.auth.as_deref() != Some("oauth") {
-        anyhow::bail!(
-            "server '{server_name}' is not configured for OAuth (set auth = \"oauth\" in config)"
-        );
-    }
-
-    let url = server_config
-        .url
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("server '{server_name}' has no URL configured"))?;
-
-    use rmcp::transport::auth::AuthorizationManager;
-
-    let mut auth_manager = AuthorizationManager::new(url)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to initialize OAuth for '{server_name}': {e}"))?;
-
-    let cred_store = oauth::CompositeCredentialStore::new(server_name.to_string());
-    let state_store = oauth::CompositeStateStore::new(server_name.to_string());
-    auth_manager.set_credential_store(cred_store.clone());
-    auth_manager.set_state_store(state_store);
-
-    let metadata = auth_manager
-        .resolve_metadata()
-        .await
-        .map_err(|e| anyhow::anyhow!("metadata discovery failed: {e}"))?;
-    let authority = oauth::VerifiedOAuthAuthority::verify(url, &metadata.metadata)
-        .map_err(|e| anyhow::anyhow!("OAuth authority verification failed: {e}"))?;
-    authority
-        .validate_callback_issuer(callback_issuer)
-        .map_err(|e| anyhow::anyhow!("OAuth callback issuer validation failed: {e}"))?;
-    cred_store
-        .bind_verified_authority(&authority)
-        .map_err(|e| anyhow::anyhow!("stored credential binding conflict: {e}"))?;
-    auth_manager.set_metadata(metadata.metadata);
-
+    let (server_config, url) = oauth_server(&cfg, server_name)?;
+    let mut sign_in = SignIn::start(server_name, url).await?;
     let scopes: Vec<String> = server_config.oauth_scopes.clone().unwrap_or_default();
 
     let PersistedOauthClientState {
@@ -1015,19 +987,12 @@ async fn cmd_auth_complete(
         .map(|registration| registration.redirect_uri.clone())
         .unwrap_or_else(default_dynamic_oauth_redirect_uri);
 
-    if let Some(ref client_id) = server_config.oauth_client_id {
-        let oauth_config =
-            rmcp::transport::auth::OAuthClientConfig::new(client_id.clone(), redirect_uri.clone())
-                .with_scopes(scopes.clone());
-        auth_manager
-            .configure_client(oauth_config)
-            .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
-    } else if let Some(registration) = reusable_registration.as_ref() {
-        let oauth_config = registration.to_oauth_client_config(scopes.clone());
-        auth_manager
-            .configure_client(oauth_config)
-            .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
-    } else {
+    if !sign_in.configure_known_client(
+        server_config,
+        reusable_registration.as_ref(),
+        &redirect_uri,
+        &scopes,
+    )? {
         anyhow::bail!(
             "server '{server_name}' has no reusable OAuth client registration for non-interactive completion. {} Start the login flow first with `plug auth login --server {server_name} --no-browser` or configure `oauth_client_id`.",
             if has_persisted_credentials {
@@ -1038,32 +1003,10 @@ async fn cmd_auth_complete(
         );
     }
 
-    ui::print_info_line("Exchanging authorization code for token...");
-    auth_manager
-        .exchange_code_for_token(code, csrf_state)
+    sign_in
+        .finish(server_name, code, csrf_state, callback_issuer)
         .await
-        .map_err(|e| anyhow::anyhow!("token exchange failed: {e}"))?;
-
-    ui::print_success_line(format!("Successfully authenticated server '{server_name}'"));
-    match refresh_live_daemon_server(server_name).await {
-        Ok(true) => {
-            ui::print_info_line(format!(
-                "Refreshed live daemon state for server '{server_name}'"
-            ));
-        }
-        Ok(false) => {}
-        Err(err) => {
-            ui::print_warning_line(format!(
-                "Credentials were saved, but the running service did not reload them automatically: {err}. Next: {}.",
-                crate::runtime::restart_advice()
-            ));
-        }
-    }
-
-    Ok(())
 }
-
-// inject
 
 /// Persist an externally obtained token for `server_name`.
 ///
@@ -1082,7 +1025,7 @@ async fn inject_credentials(
     use oauth2::{AccessToken, RefreshToken, basic::BasicTokenType};
     use rmcp::transport::auth::VendorExtraTokenFields;
 
-    let is_oauth = server_config.auth.as_deref() == Some("oauth");
+    let is_oauth = server_config.is_oauth();
     let store = oauth::get_or_create_store(server_name);
     if is_oauth {
         let url = server_config
@@ -1159,13 +1102,7 @@ async fn cmd_auth_inject(
     )
     .await?;
 
-    match refresh_live_daemon_server(server_name).await {
-        Ok(true) => ui::print_info_line("Refreshed live daemon server state"),
-        Ok(false) => {}
-        Err(err) => ui::print_warning_line(format!(
-            "Stored credentials but failed to refresh the live daemon state: {err}"
-        )),
-    }
+    report_live_refresh(server_name, "Credentials were stored").await;
 
     ui::print_success_line(format!("Injected credentials for server '{server_name}'"));
 
@@ -1188,19 +1125,13 @@ async fn cmd_auth_inject(
     Ok(())
 }
 
-// status
-
 async fn cmd_auth_status(
     config_path: Option<&PathBuf>,
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
     let cfg = config::load_config(config_path)?;
 
-    let mut oauth_servers: Vec<_> = cfg
-        .servers
-        .iter()
-        .filter(|(_, sc)| sc.auth.as_deref() == Some("oauth"))
-        .collect();
+    let mut oauth_servers: Vec<_> = cfg.servers.iter().filter(|(_, sc)| sc.is_oauth()).collect();
     oauth_servers.sort_by_key(|(name, _)| (*name).clone());
 
     if oauth_servers.is_empty() {
@@ -1218,15 +1149,21 @@ async fn cmd_auth_status(
         return Ok(());
     }
 
-    let live_auth_status =
-        match crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::AuthStatus).await {
-            Ok(plug_core::ipc::IpcResponse::AuthStatus { servers }) => Some(
-                servers
-                    .into_iter()
-                    .map(|s| (s.name.clone(), s))
-                    .collect::<std::collections::HashMap<_, _>>(),
+    let (live_auth_status, live_unavailable_reason) =
+        match crate::ipc_client::request(plug_core::ipc::IpcRequest::AuthStatus).await {
+            Ok(plug_core::ipc::IpcResponse::AuthStatus { servers }) => (
+                Some(
+                    servers
+                        .into_iter()
+                        .map(|s| (s.name.clone(), s))
+                        .collect::<std::collections::HashMap<_, _>>(),
+                ),
+                None,
             ),
-            _ => None,
+            Err(crate::ipc_client::IpcClientError::NotRunning) => (None, None),
+            Ok(plug_core::ipc::IpcResponse::Error { message, .. }) => (None, Some(message)),
+            Ok(_) => (None, Some("unexpected reply".to_string())),
+            Err(error) => (None, Some(error.to_string())),
         };
 
     match output {
@@ -1239,9 +1176,10 @@ async fn cmd_auth_status(
                 style(auth_status_source_text(live_auth_status.is_some())).dim()
             );
             if live_auth_status.is_none() {
-                ui::print_warning_line(
-                    "Live daemon auth state is unavailable. Start the shared service with `plug start` for authoritative runtime auth status.",
-                );
+                ui::print_warning_line(match &live_unavailable_reason {
+                    Some(reason) => format!("Live daemon auth state is unavailable: {reason}"),
+                    None => "Live daemon auth state is unavailable. Start the shared service with `plug start` for authoritative runtime auth status.".to_string(),
+                });
             }
             println!();
 
@@ -1375,16 +1313,7 @@ async fn cmd_auth_status(
                         .map(|s| s.warnings.clone())
                         .unwrap_or_else(|| snapshot.as_ref().map(|snapshot| snapshot.warnings.clone()).unwrap_or_default()),
                     "recovery_hint": auth_recovery_hint(name, has_creds, health),
-                    "status_source": if live.is_some() {
-                        "live_daemon"
-                    } else {
-                        "stored_credentials_only"
-                    },
-                    "status_scope": if live.is_some() {
-                        "live_daemon"
-                    } else {
-                        "stored_credentials_only"
-                    },
+                    "status_source": auth_status_source(live.is_some()),
                 }));
             }
             println!(
@@ -1399,8 +1328,6 @@ async fn cmd_auth_status(
 
     Ok(())
 }
-
-// localhost callback listener
 
 /// Accepts a single GET request to `/callback`, extracts `code` and `state`
 /// query parameters, returns a success page to the browser, and shuts down.
@@ -1499,7 +1426,6 @@ async fn await_oauth_callback_inner(
         .to_string();
     let issuer = params.get("iss").cloned();
 
-    // Respond with a success page and close.
     let success_html = callback_page(
         "Authentication successful",
         "<p>You can close this tab and return to the terminal.</p>",
@@ -1541,8 +1467,6 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
-// logout
-
 async fn cmd_auth_logout(server_name: &str) -> anyhow::Result<()> {
     let store = oauth::get_or_create_store(server_name);
     store
@@ -1551,20 +1475,7 @@ async fn cmd_auth_logout(server_name: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to clear credentials: {e}"))?;
 
     ui::print_success_line(format!("Logged out from server '{server_name}'"));
-    match refresh_live_daemon_server(server_name).await {
-        Ok(true) => {
-            ui::print_info_line(format!(
-                "Refreshed live daemon state for server '{server_name}'"
-            ));
-        }
-        Ok(false) => {}
-        Err(err) => {
-            ui::print_warning_line(format!(
-                "Stored credentials were cleared, but the running service did not reload them automatically: {err}. Next: {}.",
-                crate::runtime::restart_advice()
-            ));
-        }
-    }
+    report_live_refresh(server_name, "Stored credentials were cleared").await;
 
     Ok(())
 }
@@ -1594,6 +1505,8 @@ mod tests {
             last_used_at: Some(100 * day - 19 * day),
             expires_at: 100 * day + 71 * day,
             signed_in: true,
+            client_key: "oauth:client".to_string(),
+            target: Some("cursor".to_string()),
         };
         assert_eq!(
             registered_client_timeline(&registered, 100 * day),
@@ -1640,32 +1553,12 @@ mod tests {
 
     #[test]
     fn reusable_dynamic_registration_skips_configured_clients() {
-        crate::install_test_credential_environment();
         let server = plug_core::config::ServerConfig {
-            command: None,
-            args: Vec::new(),
-            env: std::collections::HashMap::new(),
-            enabled: true,
             transport: plug_core::config::TransportType::Http,
-            protocol_mode: Default::default(),
             url: Some("https://example.com/mcp".to_string()),
-            auth_token: None,
             auth: Some("oauth".to_string()),
             oauth_client_id: Some("configured-client".to_string()),
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: std::collections::HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         };
 
         assert!(
@@ -1677,33 +1570,12 @@ mod tests {
 
     #[tokio::test]
     async fn reusable_dynamic_registration_loads_persisted_registration() {
-        crate::install_test_credential_environment();
         let server_name = format!("auth-registration-{}", std::process::id());
         let server = plug_core::config::ServerConfig {
-            command: None,
-            args: Vec::new(),
-            env: std::collections::HashMap::new(),
-            enabled: true,
             transport: plug_core::config::TransportType::Http,
-            protocol_mode: Default::default(),
             url: Some("https://example.com/mcp".to_string()),
-            auth_token: None,
             auth: Some("oauth".to_string()),
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: std::collections::HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         };
 
         let store = oauth::get_or_create_store(&server_name);
@@ -1737,34 +1609,15 @@ mod tests {
     #[test]
     fn injected_client_identity_requires_configured_oauth_client_for_refresh() {
         let server = plug_core::config::ServerConfig {
-            command: None,
-            args: Vec::new(),
-            env: std::collections::HashMap::new(),
-            enabled: true,
             transport: plug_core::config::TransportType::Http,
-            protocol_mode: Default::default(),
             url: Some("https://example.com/mcp".to_string()),
-            auth_token: None,
             auth: Some("oauth".to_string()),
             oauth_client_id: Some("client-123".to_string()),
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: std::collections::HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         };
 
         let (client_id, refreshable) = oauth::injected_client_identity(
-            server.auth.as_deref() == Some("oauth"),
+            server.is_oauth(),
             server.oauth_client_id.as_deref(),
             None,
             true,
@@ -1773,7 +1626,7 @@ mod tests {
         assert!(refreshable);
 
         let (fallback_client_id, fallback_refreshable) = oauth::injected_client_identity(
-            server.auth.as_deref() == Some("oauth"),
+            server.is_oauth(),
             server.oauth_client_id.as_deref(),
             None,
             false,
@@ -1785,34 +1638,14 @@ mod tests {
     #[test]
     fn injected_client_identity_reuses_existing_oauth_client_for_refresh() {
         let server = plug_core::config::ServerConfig {
-            command: None,
-            args: Vec::new(),
-            env: std::collections::HashMap::new(),
-            enabled: true,
             transport: plug_core::config::TransportType::Http,
-            protocol_mode: Default::default(),
             url: Some("https://example.com/mcp".to_string()),
-            auth_token: None,
             auth: Some("oauth".to_string()),
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: std::collections::HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         };
 
         let (client_id, refreshable) = oauth::injected_client_identity(
-            server.auth.as_deref() == Some("oauth"),
+            server.is_oauth(),
             server.oauth_client_id.as_deref(),
             Some("dynamic-client-123"),
             true,
@@ -1837,7 +1670,6 @@ mod tests {
         let json = auth_status_json(servers, true);
         assert_eq!(json["runtime_available"], true);
         assert_eq!(json["status_source"], "live_daemon");
-        assert_eq!(json["status_scope"], "live_daemon");
         assert_eq!(json["servers"][0]["name"], "notion");
         assert_eq!(
             json["servers"][0]["warnings"][0],
@@ -1850,7 +1682,6 @@ mod tests {
         let json = auth_status_json(Vec::new(), false);
         assert_eq!(json["runtime_available"], false);
         assert_eq!(json["status_source"], "stored_credentials_only");
-        assert_eq!(json["status_scope"], "stored_credentials_only");
         assert!(json["servers"].as_array().is_some());
         assert_eq!(json["servers"].as_array().unwrap().len(), 0);
     }
@@ -1864,7 +1695,7 @@ mod tests {
             last_used_at: None,
         }];
 
-        let json = owner_credentials_json(&credentials);
+        let json = serde_json::to_value(&credentials).unwrap();
         let item = &json.as_array().expect("array")[0];
         assert_eq!(item["credential_id"], "credential-1");
         assert!(item.get("passkey").is_none());
@@ -1919,7 +1750,7 @@ mod tests {
         let protected_route_state = protected_route_hit.clone();
         let app = axum::Router::new()
             .route(
-                "/_plug/operator/proof",
+                crate::operator_http::OPERATOR_PROOF_PATH,
                 axum::routing::post(|headers: axum::http::HeaderMap| async move {
                     assert!(!headers.contains_key("x-plug-operator-token"));
                     axum::Json(serde_json::json!({
@@ -1929,7 +1760,7 @@ mod tests {
                 }),
             )
             .route(
-                "/_plug/oauth/owner/credentials",
+                crate::operator_http::OPERATOR_OWNER_CREDENTIALS_PATH,
                 axum::routing::get(move |headers: axum::http::HeaderMap| {
                     let protected_route_state = protected_route_state.clone();
                     async move {
@@ -1942,7 +1773,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = reqwest::Client::builder()
+        let client = plug_core::tls::http_client_builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -1957,7 +1788,7 @@ mod tests {
         };
 
         let error = operator
-            .send_authenticated(reqwest::Method::GET, None)
+            .send_authenticated(reqwest::Method::GET, None, false)
             .await
             .expect_err("rogue proof must fail");
         assert!(
@@ -2087,7 +1918,6 @@ mod tests {
     /// AuthRequired.
     #[tokio::test]
     async fn inject_on_an_empty_store_is_usable_by_the_runtime() {
-        crate::install_test_credential_environment();
         plug_core::tls::ensure_rustls_provider_installed();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2098,29 +1928,10 @@ mod tests {
         let resource_url = format!("http://{address}/mcp");
         let server_name = format!("auth-inject-{}", uuid::Uuid::new_v4());
         let server = plug_core::config::ServerConfig {
-            command: None,
-            args: Vec::new(),
-            env: std::collections::HashMap::new(),
-            enabled: true,
             transport: plug_core::config::TransportType::Http,
-            protocol_mode: Default::default(),
             url: Some(resource_url.clone()),
-            auth_token: None,
             auth: Some("oauth".to_string()),
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: std::collections::HashMap::new(),
-            tool_groups: Vec::new(),
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         };
         let store = oauth::get_or_create_store(&server_name);
         store.clear().await.unwrap();

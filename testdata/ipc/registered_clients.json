@@ -1,0 +1,66 @@
+{
+  "never_finished": {
+    "summary": {
+      "client_id": "abc",
+      "client_key": "oauth:abc",
+      "client_name": "ChatGPT",
+      "created_at": 1700000000,
+      "expires_at": 1800000000,
+      "last_used_at": null,
+      "redirect_uris": [
+        "https://chatgpt.com/callback"
+      ],
+      "signed_in": false,
+      "source": "dynamic_registration"
+    },
+    "unfinished": true
+  },
+  "signed_in": {
+    "summary": {
+      "client_id": "abc",
+      "client_key": "oauth:abc",
+      "client_name": "ChatGPT",
+      "created_at": 1700000000,
+      "expires_at": 1800000000,
+      "last_used_at": 1700000500,
+      "redirect_uris": [
+        "https://chatgpt.com/callback"
+      ],
+      "signed_in": true,
+      "source": "dynamic_registration"
+    },
+    "unfinished": false
+  },
+  "signed_in_registered_again": {
+    "summary": {
+      "client_id": "abc",
+      "client_key": "oauth:abc",
+      "client_name": "ChatGPT",
+      "created_at": 1700000000,
+      "expires_at": 1800000000,
+      "last_used_at": null,
+      "redirect_uris": [
+        "https://chatgpt.com/callback"
+      ],
+      "signed_in": true,
+      "source": "dynamic_registration"
+    },
+    "unfinished": false
+  },
+  "signed_out": {
+    "summary": {
+      "client_id": "abc",
+      "client_key": "oauth:abc",
+      "client_name": "ChatGPT",
+      "created_at": 1700000000,
+      "expires_at": 1800000000,
+      "last_used_at": 1700000500,
+      "redirect_uris": [
+        "https://chatgpt.com/callback"
+      ],
+      "signed_in": false,
+      "source": "dynamic_registration"
+    },
+    "unfinished": false
+  }
+}

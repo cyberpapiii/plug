@@ -12,65 +12,59 @@ struct ActivityView: View {
     let run: (PlugIntent) -> Void
     @Environment(\.splitPane) private var pane
 
-    enum Scope: String, CaseIterable, Identifiable {
-        case everything = "All"
-        case problems = "Problems"
-        var id: Self { self }
-    }
-
     /// Kept on the router, because the list column filters by it and the
     /// detail column holds its control.
-    private var scope: Scope { router.activityScope }
+    private var scope: Router.ActivityScope { router.activityScope }
 
     var body: some View {
         // Filtered and sorted once for each time the page is drawn; the
         // list, its groups and the selection all read the same result.
         let visible = self.visible
         let selected = visible.first { $0.sequence == router.selectedCall }
-        return Group {
-            if model.isLoadingInitialData {
-                LoadingPage(message: "Loading activity")
-            } else if model.initialDataUnavailable {
-                UnavailablePage(verdict: model.verdict, run: run)
-            } else if model.activities.isEmpty {
+        return SectionPage(
+            model: model,
+            loading: "Loading activity",
+            isEmpty: model.activities.isEmpty,
+            hasNoMatches: visible.isEmpty,
+            run: run
+        ) {
+            EmptyPage(
+                title: "No Activity",
+                message: "Each time a client uses a tool, it shows here with the client, the server, the time, and whether it worked."
+            )
+        } noMatches: {
+            if scope == .problems, search.trimmingCharacters(in: .whitespaces).isEmpty {
                 EmptyPage(
-                    title: "No Activity",
-                    message: "Each time a client uses a tool, it shows here with the client, the server, the time, and whether it worked."
+                    title: "No Problems",
+                    message: "No recent call failed.",
+                    mood: .awake
                 )
-            } else if visible.isEmpty {
-                if scope == .problems, search.trimmingCharacters(in: .whitespaces).isEmpty {
-                    EmptyPage(
-                        title: "No Problems",
-                        message: "No recent call failed.",
-                        mood: .awake
-                    )
-                } else {
-                    NoSearchResults(text: search)
-                }
             } else {
-                ListDetail {
-                    List(selection: $router.selectedCall) {
-                        ForEach(Self.groups(of: visible), id: \.title) { group in
-                            ListGroupHeader(group.title)
-                            ForEach(group.events) { event in
-                                ActivityRow(call: model.call(event))
-                                    .equatable()
-                                    .tag(event.sequence)
-                            }
-                            .listRowSeparator(.hidden)
+                NoSearchResults(text: search)
+            }
+        } content: {
+            ListDetail {
+                List(selection: $router.selectedCall) {
+                    ForEach(Self.groups(of: visible), id: \.title) { group in
+                        ListGroupHeader(group.title)
+                        ForEach(group.events) { event in
+                            ActivityRow(call: model.call(event))
+                                .equatable()
+                                .tag(event.sequence)
                         }
+                        .listRowSeparator(.hidden)
                     }
-                } detail: {
-                    if let selected {
-                        CallDetail(
-                            call: model.call(selected),
-                            canShowServer: serverNames.contains(selected.server ?? ""),
-                            run: run
-                        )
-                        .id(selected.sequence)
-                    } else {
-                        NoSelection(item: "Call", icon: .activity)
-                    }
+                }
+            } detail: {
+                if let selected {
+                    CallDetail(
+                        call: model.call(selected),
+                        canShowServer: serverNames.contains(selected.server ?? ""),
+                        run: run
+                    )
+                    .id(selected.sequence)
+                } else {
+                    NoSelection(item: "Call", icon: .activity)
                 }
             }
         }
@@ -81,7 +75,7 @@ struct ActivityView: View {
             if pane != .list {
                 ToolbarItem(placement: .primaryAction) {
                     Picker("Show", selection: $router.activityScope) {
-                        ForEach(Scope.allCases) { scope in
+                        ForEach(Router.ActivityScope.allCases) { scope in
                             Text(scope.rawValue).tag(scope)
                         }
                     }
@@ -115,14 +109,7 @@ struct ActivityView: View {
         let query = search.trimmingCharacters(in: .whitespaces)
         return model.activities
             .filter { scope == .everything || CallFacts($0).failed }
-            .filter { event in
-                guard !query.isEmpty else { return true }
-                return event.method.localizedCaseInsensitiveContains(query)
-                    || (event.tool ?? "").localizedCaseInsensitiveContains(query)
-                    || (event.server ?? "").localizedCaseInsensitiveContains(query)
-                    || (event.clientLabel ?? "").localizedCaseInsensitiveContains(query)
-                    || (event.clientType ?? "").localizedCaseInsensitiveContains(query)
-            }
+            .filter { query.isEmpty || model.call($0).matches(query) }
             .sorted { $0.sequence > $1.sequence }
     }
 
@@ -168,7 +155,7 @@ private struct ActivityRow: View, Equatable {
             // Who called what, as two pictures: the client's icon, then
             // the server's. A long list can be scanned without reading it.
             HStack(spacing: Metric.hairline) {
-                AppGlyph(target: call.callerTarget, name: call.callerIconName)
+                AppGlyph(target: call.callerTarget, name: call.caller)
                 if let server = call.server {
                     Image(systemName: "chevron.compact.right")
                         .font(PanelType.small)
@@ -246,7 +233,7 @@ private struct CallDetail: View {
             Section(heading: "Details") {
                 LabeledContent("Client") {
                     HStack(spacing: Metric.tight) {
-                        AppGlyph(target: call.callerTarget, name: call.callerIconName, size: 16)
+                        AppGlyph(target: call.callerTarget, name: call.caller, size: 16)
                         Text(call.callerAndPlace).textSelection(.enabled)
                     }
                 }
@@ -255,8 +242,8 @@ private struct CallDetail: View {
                         HStack(spacing: Metric.tight) {
                             ServerGlyph(name: server, size: 16)
                             Text(server).textSelection(.enabled)
-                            if canShowServer, let name = call.event.server {
-                                Button { run(.reveal(server: name)) } label: {
+                            if canShowServer {
+                                Button { run(.reveal(server: server)) } label: {
                                     PlugIcon(.show)
                                 }
                                 .buttonStyle(.borderless)

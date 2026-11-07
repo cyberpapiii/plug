@@ -5,12 +5,16 @@
 //! former single configured client: upgrading is a clean security boundary.
 
 pub mod owner;
+pub mod paths;
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_owner;
 
-pub use owner::{
+pub use owner::OwnerCredentialSummary;
+use owner::{
     OwnerApprovalChallenge, OwnerAuthenticationCeremony, OwnerBootstrap, OwnerCredential,
-    OwnerCredentialSummary, OwnerRegistrationCeremony, OwnerRegistrationChallenge, OwnerSecurity,
-    PublicKeyCredential, RegisterPublicKeyCredential,
+    OwnerRegistrationCeremony, OwnerRegistrationChallenge, OwnerSecurity,
 };
+use passkey_auth::{AuthenticationResponse, RegistrationResponse};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -24,13 +28,13 @@ use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
 use crate::config::HttpConfig;
 
 const STATE_VERSION: u8 = 3;
-const AUTH_REQUEST_LIFETIME_SECS: u64 = 300;
+/// How long a sign-in request waits for the owner to approve it.
+pub const AUTH_REQUEST_LIFETIME_SECS: u64 = 300;
 const AUTH_CODE_LIFETIME_SECS: u64 = 300;
 const ACCESS_TOKEN_LIFETIME_SECS: u64 = 3600;
 const REFRESH_TOKEN_LIFETIME_SECS: u64 = 30 * 24 * 3600;
@@ -43,8 +47,10 @@ const REFRESH_TOKEN_LIFETIME_SECS: u64 = 30 * 24 * 3600;
 /// the whole sign-in is revoked for every process. As long as a spent token
 /// is remembered at all, so a process idle for weeks does not end it either.
 const REFRESH_REUSE_LEEWAY_SECS: u64 = REFRESH_TOKEN_LIFETIME_SECS;
-const REGISTRATION_LIFETIME_SECS: u64 = 90 * 24 * 3600;
-const UNACTIVATED_REGISTRATION_LIFETIME_SECS: u64 = 3600;
+/// How long a registration lasts after it was last used.
+pub const REGISTRATION_LIFETIME_SECS: u64 = 90 * 24 * 3600;
+/// How long a registration whose sign-in never finished lasts.
+pub const UNACTIVATED_REGISTRATION_LIFETIME_SECS: u64 = 3600;
 const MAX_REGISTRATIONS: usize = 100;
 const REGISTRATION_RATE_WINDOW_SECS: u64 = 3600;
 const MAX_REGISTRATIONS_PER_WINDOW: usize = 10;
@@ -53,7 +59,6 @@ const MAX_PENDING_CONSENTS_PER_CLIENT: usize = 5;
 const MAX_ACCESS_TOKENS_PER_CLIENT: usize = 10;
 const MAX_REGISTRATION_RATE_KEYS: usize = 10_000;
 const MAX_METADATA_DOCUMENT_BYTES: usize = 64 * 1024;
-const PARENT_DIR_SYNC_ATTEMPTS: usize = 3;
 /// Attempts to take the issuer state lock, spread over
 /// [`STATE_LOCK_RETRY_INTERVAL`]. Long enough to outlast a departing writer's
 /// close, short enough that a genuinely occupied lock still fails startup fast.
@@ -65,7 +70,6 @@ const CURSOR_NATIVE_REDIRECT: &str = "cursor://anysphere.cursor-mcp/oauth/callba
 pub struct DownstreamOauthConfig {
     pub public_base_url: String,
     pub oauth_scopes: Vec<String>,
-    pub local_port: u16,
 }
 
 impl DownstreamOauthConfig {
@@ -76,12 +80,11 @@ impl DownstreamOauthConfig {
         Some(Self {
             public_base_url: http.public_base_url.clone()?,
             oauth_scopes: http.oauth_scopes.clone().unwrap_or_else(|| {
-                crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+                crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
                     .iter()
                     .map(ToString::to_string)
                     .collect()
             }),
-            local_port: http.port,
         })
     }
 }
@@ -100,52 +103,29 @@ pub enum OwnerEnrollmentStatus {
 }
 
 pub fn inspect_owner_enrollment(config: &DownstreamOauthConfig) -> OwnerEnrollmentStatus {
-    let state_dir = crate::config::config_dir().join("downstream_oauth");
+    let state_dir = crate::paths::downstream_oauth_dir();
     inspect_owner_enrollment_in_dir(config, &state_dir)
 }
 
-#[doc(hidden)]
-pub fn inspect_owner_enrollment_in_dir(
+pub(crate) fn inspect_owner_enrollment_in_dir(
     config: &DownstreamOauthConfig,
     state_dir: &std::path::Path,
 ) -> OwnerEnrollmentStatus {
-    use std::io::Read as _;
-
     let path = owner_enrollment_state_path_in_dir(config, state_dir);
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return OwnerEnrollmentStatus::NotEnrolled;
-        }
-        Err(_) => return OwnerEnrollmentStatus::StateUnavailable,
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let Ok(metadata) = file.metadata() else {
-            return OwnerEnrollmentStatus::StateUnavailable;
-        };
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return OwnerEnrollmentStatus::UnsafePermissions;
-        }
-    }
-    let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() {
-        return OwnerEnrollmentStatus::StateUnavailable;
-    }
-    let state = match serde_json::from_slice::<DownstreamOauthState>(&bytes) {
-        Ok(state) if state.version == STATE_VERSION => state,
-        Ok(_) | Err(_) => return OwnerEnrollmentStatus::StateUnavailable,
-    };
-    match state.owner_credentials.len() {
-        0 => OwnerEnrollmentStatus::NotEnrolled,
-        credential_count => OwnerEnrollmentStatus::Enrolled { credential_count },
+    match read_state_file(&path) {
+        Ok(None) => OwnerEnrollmentStatus::NotEnrolled,
+        Ok(Some(state)) => match state.owner_credentials.len() {
+            0 => OwnerEnrollmentStatus::NotEnrolled,
+            credential_count => OwnerEnrollmentStatus::Enrolled { credential_count },
+        },
+        Err(StateFileError::Shared) => OwnerEnrollmentStatus::UnsafePermissions,
+        Err(StateFileError::Unreadable(_)) => OwnerEnrollmentStatus::StateUnavailable,
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct DownstreamOauthManager {
-    pub config: DownstreamOauthConfig,
+    config: DownstreamOauthConfig,
     pub owner_security: Arc<OwnerSecurity>,
     state: Arc<Mutex<DownstreamOauthState>>,
     principal_lifecycles: Arc<dashmap::DashMap<String, Arc<PrincipalLifecycleState>>>,
@@ -194,14 +174,22 @@ pub struct RegisteredClientSummary {
     pub last_used_at: Option<u64>,
     pub expires_at: u64,
     /// False when the client holds no token that still works: its sign-in
-    /// ran out or was revoked, and only the client can start another. A
-    /// reader older than this field sees every client as signed in.
-    #[serde(default = "signed_in_when_unsaid")]
+    /// ran out or was revoked, and only the client can start another.
     pub signed_in: bool,
+    /// What this client's settings are stored under.
+    pub client_key: String,
+    /// The client Plug takes this one for by the name it registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
-fn signed_in_when_unsaid() -> bool {
-    true
+impl RegisteredClientSummary {
+    /// Whether the client's sign-in never finished. A client that
+    /// registered itself then goes by itself
+    /// [`UNACTIVATED_REGISTRATION_LIFETIME_SECS`] after it registered.
+    pub fn is_unactivated(&self) -> bool {
+        !self.signed_in && self.last_used_at.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,7 +293,7 @@ pub struct PrincipalLifecycleLease {
     generation: u64,
     /// The sign-in this token descends from, which can end while the client
     /// itself stays registered.
-    family_ended: Option<Arc<SignIn>>,
+    family_ended: Arc<SignIn>,
 }
 
 /// One sign-in, shared by everything opened under it.
@@ -332,18 +320,17 @@ impl PrincipalLifecycleLease {
     pub fn is_active(&self) -> bool {
         self.state.active.load(Ordering::SeqCst)
             && self.state.generation.load(Ordering::SeqCst) == self.generation
-            && !self
-                .family_ended
-                .as_ref()
-                .is_some_and(|sign_in| sign_in.is_over())
+            && !self.family_ended.is_over()
     }
 
     #[cfg(test)]
     pub(crate) fn active_for_tests() -> Self {
+        let sign_in = SignIn::default();
+        sign_in.lasts_until(u64::MAX);
         Self {
             state: Arc::new(PrincipalLifecycleState::active()),
             generation: 1,
-            family_ended: None,
+            family_ended: Arc::new(sign_in),
         }
     }
 
@@ -377,13 +364,6 @@ pub struct AccessTokenClaims {
     pub scopes: Vec<String>,
     pub resource: String,
     pub principal_lifecycle: PrincipalLifecycleLease,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AccessTokenValidation {
-    Valid(AccessTokenClaims),
-    Invalid,
-    InsufficientScope,
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -445,6 +425,16 @@ struct RegisteredClient {
     expires_at: u64,
 }
 
+impl RegisteredClient {
+    /// Whether Plug may send this client's browser to `requested`, with an
+    /// authorization code or with an error.
+    fn allows_redirect(&self, requested: &str) -> bool {
+        self.redirect_uris
+            .iter()
+            .any(|registered| registered_redirect_matches(registered, requested))
+    }
+}
+
 impl From<&RegisteredClient> for RegisteredClientSummary {
     fn from(value: &RegisteredClient) -> Self {
         Self {
@@ -456,6 +446,11 @@ impl From<&RegisteredClient> for RegisteredClientSummary {
             last_used_at: value.last_used_at,
             expires_at: value.expires_at,
             signed_in: true,
+            client_key: crate::downstream_identity::grant_client_key(&value.client_id),
+            target: crate::downstream_identity::client_target(
+                None,
+                crate::client_detect::detect_client(&value.client_name),
+            ),
         }
     }
 }
@@ -468,7 +463,6 @@ struct PendingConsent {
     code_challenge: String,
     scopes: Vec<String>,
     resource: String,
-    #[serde(default)]
     csrf_token: String,
     expires_at: u64,
 }
@@ -478,30 +472,7 @@ struct CompletedConsent {
     client_id: String,
     redirect: AuthorizationRedirect,
     expires_at: u64,
-    #[serde(
-        default,
-        alias = "approval_ceremony_id",
-        deserialize_with = "deserialize_approval_ceremony_ids"
-    )]
     approval_ceremony_ids: Vec<String>,
-}
-
-fn deserialize_approval_ceremony_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum OneOrMany {
-        One(String),
-        Many(Vec<String>),
-    }
-
-    Ok(match Option::<OneOrMany>::deserialize(deserializer)? {
-        Some(OneOrMany::One(id)) => vec![id],
-        Some(OneOrMany::Many(ids)) => ids,
-        None => Vec::new(),
-    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -523,8 +494,8 @@ struct IssuedAccessToken {
     expires_at: u64,
     /// Rotation lineage. Every pair minted from the same authorization code
     /// shares one id, so a replayed refresh token can revoke the whole chain.
-    /// Empty only on records written before families existed; an empty id
-    /// never matches in [`revoke_token_family`].
+    /// A record written before families existed has none, and is dropped on
+    /// load: all such tokens have expired.
     #[serde(default)]
     family_id: String,
 }
@@ -538,6 +509,39 @@ struct IssuedRefreshToken {
     /// See [`IssuedAccessToken::family_id`].
     #[serde(default)]
     family_id: String,
+}
+
+/// What an access or a refresh token grants, read the same way for both.
+struct Grant<'a> {
+    client_id: &'a str,
+    scopes: &'a [String],
+    resource: &'a str,
+    expires_at: u64,
+    family_id: &'a str,
+}
+
+impl<'a> From<&'a IssuedAccessToken> for Grant<'a> {
+    fn from(token: &'a IssuedAccessToken) -> Self {
+        Self {
+            client_id: &token.client_id,
+            scopes: &token.scopes,
+            resource: &token.resource,
+            expires_at: token.expires_at,
+            family_id: &token.family_id,
+        }
+    }
+}
+
+impl<'a> From<&'a IssuedRefreshToken> for Grant<'a> {
+    fn from(token: &'a IssuedRefreshToken) -> Self {
+        Self {
+            client_id: &token.client_id,
+            scopes: &token.scopes,
+            resource: &token.resource,
+            expires_at: token.expires_at,
+            family_id: &token.family_id,
+        }
+    }
 }
 
 /// A refresh token that was already spent, kept only long enough to recognise a
@@ -672,6 +676,14 @@ impl DownstreamOauthState {
         expired
     }
 
+    /// Every access and refresh token issued.
+    fn grants(&self) -> impl Iterator<Item = Grant<'_>> {
+        self.access_tokens
+            .values()
+            .map(Grant::from)
+            .chain(self.refresh_tokens.values().map(Grant::from))
+    }
+
     fn remove_client_material(&mut self, client_id: &str) {
         self.clients.remove(client_id);
         self.pending_consents
@@ -699,12 +711,8 @@ struct ClientMetadataDocument {
 }
 
 impl DownstreamOauthManager {
-    pub fn new(config: DownstreamOauthConfig) -> Self {
-        Self::try_new(config).expect("downstream OAuth state must be readable")
-    }
-
     pub fn try_new(config: DownstreamOauthConfig) -> Result<Self, DownstreamOauthError> {
-        let state_dir = crate::config::config_dir().join("downstream_oauth");
+        let state_dir = crate::paths::downstream_oauth_dir();
         Self::try_new_with_state_dir(config, &state_dir)
     }
 
@@ -717,7 +725,7 @@ impl DownstreamOauthManager {
         Self::new_with_state_path_and_lock(config, path, state_lock)
     }
 
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn new_with_state_path(
         config: DownstreamOauthConfig,
         state_path: PathBuf,
@@ -734,7 +742,7 @@ impl DownstreamOauthManager {
         let state_dir = state_path
             .parent()
             .ok_or_else(|| DownstreamOauthError::Persistence("invalid state path".to_string()))?;
-        sync_parent_dir_with_retry(state_dir).map_err(|error| {
+        crate::fs_perm::sync_dir(state_dir).map_err(|error| {
             DownstreamOauthError::Persistence(format!(
                 "downstream OAuth startup directory sync failed for {}: {error}",
                 state_dir.display()
@@ -778,7 +786,7 @@ impl DownstreamOauthManager {
             && self
                 .state_path
                 .parent()
-                .is_some_and(|dir| sync_parent_dir(dir).is_ok())
+                .is_some_and(|dir| run_blocking_io(|| crate::fs_perm::sync_dir(dir)).is_ok())
         {
             self.durability_degraded.store(false, Ordering::SeqCst);
             tracing::info!("downstream OAuth state is durable again");
@@ -802,8 +810,8 @@ impl DownstreamOauthManager {
         let outcome = persist_state(&self.state_path, &next)?;
         *live = next;
         match outcome {
-            PersistOutcome::Durable => Ok(()),
-            PersistOutcome::CommittedDurabilityUncertain(error) => {
+            crate::fs_perm::Durability::Durable => Ok(()),
+            crate::fs_perm::Durability::Uncertain(error) => {
                 self.durability_degraded.store(true, Ordering::SeqCst);
                 tracing::error!(
                     state_path = %self.state_path.display(),
@@ -811,7 +819,8 @@ impl DownstreamOauthManager {
                     "downstream OAuth entered fail-closed durability-degraded state"
                 );
                 Err(DownstreamOauthError::Persistence(format!(
-                    "state rename committed but parent directory durability remains uncertain after {PARENT_DIR_SYNC_ATTEMPTS} attempts: {error}"
+                    "state rename committed but parent directory durability remains uncertain after {} attempts: {error}",
+                    crate::fs_perm::DIR_SYNC_ATTEMPTS
                 )))
             }
         }
@@ -821,20 +830,19 @@ impl DownstreamOauthManager {
         self.config.public_base_url.trim_end_matches('/')
     }
 
+    /// This issuer's address for `path`, one of [`paths`].
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url())
+    }
+
+    /// The protected resource tokens from this issuer are bound to.
     pub fn resource(&self) -> String {
-        format!("{}/mcp", self.base_url())
+        self.url(paths::MCP)
     }
 
-    pub fn authorization_endpoint(&self) -> String {
-        format!("{}/oauth/authorize", self.base_url())
-    }
-
-    pub fn token_endpoint(&self) -> String {
-        format!("{}/oauth/token", self.base_url())
-    }
-
-    pub fn registration_endpoint(&self) -> String {
-        format!("{}/oauth/register", self.base_url())
+    /// The scopes a client may be granted.
+    pub fn scopes(&self) -> &[String] {
+        &self.config.oauth_scopes
     }
 
     #[cfg(test)]
@@ -948,7 +956,7 @@ impl DownstreamOauthManager {
     pub async fn finish_owner_registration(
         &self,
         ceremony_id: &str,
-        response: RegisterPublicKeyCredential,
+        response: RegistrationResponse,
     ) -> Result<OwnerCredentialSummary, DownstreamOauthError> {
         self.ensure_durable()?;
         let now = epoch_secs();
@@ -1074,7 +1082,7 @@ impl DownstreamOauthManager {
     pub async fn finish_owner_approval(
         &self,
         ceremony_id: &str,
-        response: PublicKeyCredential,
+        response: AuthenticationResponse,
     ) -> Result<AuthorizationRedirect, DownstreamOauthError> {
         self.ensure_durable()?;
         let now = epoch_secs();
@@ -1339,13 +1347,8 @@ impl DownstreamOauthManager {
             .map(|client| {
                 let id = client.client_id.as_str();
                 let holds_a_token = guard
-                    .refresh_tokens
-                    .values()
-                    .any(|token| token.client_id == id && token.expires_at > now)
-                    || guard
-                        .access_tokens
-                        .values()
-                        .any(|token| token.client_id == id && token.expires_at > now);
+                    .grants()
+                    .any(|grant| grant.client_id == id && self.grant_is_live(&guard, &grant, now));
                 RegisteredClientSummary {
                     signed_in: holds_a_token,
                     ..RegisteredClientSummary::from(client)
@@ -1361,59 +1364,63 @@ impl DownstreamOauthManager {
         clients
     }
 
-    /// Recheck a durable event subscription without retaining an access token.
-    /// A live access or refresh grant must still authorize this resource/scope.
-    pub async fn permits_event_delivery(&self, client_id: &str, scope: &str) -> bool {
+    /// Whether `client_id` still holds a live access or refresh grant for
+    /// this resource that carries `scope`.
+    pub async fn holds_live_grant(&self, client_id: &str, scope: &str) -> bool {
         if self.durability_degraded() {
             return false;
         }
         let guard = self.state.lock().await;
         let now = epoch_secs();
-        if guard.revoked_client_ids.contains(client_id)
-            || !guard
-                .clients
-                .get(client_id)
-                .is_some_and(|client| client.expires_at > now)
-            || !self
-                .principal_lifecycles
-                .get(client_id)
-                .is_some_and(|lease| lease.active.load(Ordering::SeqCst))
-        {
-            return false;
-        }
-        let resource = format!("{}/mcp", self.base_url().trim_end_matches('/'));
-        guard.access_tokens.values().any(|grant| {
+        let resource = self.resource();
+        guard.grants().any(|grant| {
             grant.client_id == client_id
-                && grant.expires_at > now
                 && grant.resource == resource
                 && grant.scopes.iter().any(|s| s == scope)
-        }) || guard.refresh_tokens.values().any(|grant| {
-            grant.client_id == client_id
-                && grant.expires_at > now
-                && grant.resource == resource
-                && grant.scopes.iter().any(|s| s == scope)
+                && self.grant_is_live(&guard, &grant, now)
         })
     }
 
+    /// Whether `grant` still lets its holder in: it has not run out, its
+    /// client is registered and not revoked, and neither the client's
+    /// principal nor the sign-in the grant came from has ended.
+    /// `validate_access_token_for`, `holds_live_grant` and `list_clients` all
+    /// decide by this.
+    fn grant_is_live(&self, state: &DownstreamOauthState, grant: &Grant<'_>, now: u64) -> bool {
+        grant.expires_at > now
+            && !state.revoked_client_ids.contains(grant.client_id)
+            && state
+                .clients
+                .get(grant.client_id)
+                .is_some_and(|client| client.expires_at > now)
+            && self
+                .principal_lifecycles
+                .get(grant.client_id)
+                .is_some_and(|lifecycle| lifecycle.active.load(Ordering::SeqCst))
+            && !self
+                .family_ended
+                .get(grant.family_id)
+                .is_some_and(|sign_in| sign_in.is_over())
+    }
+
+    /// Revoke `client_id`'s grant. `Ok(false)` when there is no such client.
+    /// Any error still leaves the grant refused by this process: only saving
+    /// the revocation failed.
     pub async fn revoke_client(&self, client_id: &str) -> Result<bool, DownstreamOauthError> {
-        self.ensure_durable()?;
         let mut guard = self.state.lock().await;
-        let existed = guard.clients.contains_key(client_id);
-        if !existed {
+        if !guard.clients.contains_key(client_id) {
             return Ok(false);
         }
-        // Invalidate validation-time leases before removing credentials or
-        // starting task cleanup. If persistence fails, this process remains
-        // fail-closed; the operator did not receive a successful revocation.
         if let Some(lifecycle) = self.principal_lifecycles.get(client_id) {
             lifecycle.deactivate();
         }
+        self.ensure_durable()?;
         let mut next = guard.clone();
         next.remove_client_material(client_id);
         next.revoked_client_ids.insert(client_id.to_string());
         self.commit_state(&mut guard, next)?;
         self.principal_lifecycles.remove(client_id);
-        Ok(existed)
+        Ok(true)
     }
 
     pub async fn begin_authorization(
@@ -1438,11 +1445,7 @@ impl DownstreamOauthManager {
             .get(request.client_id)
             .cloned()
             .ok_or(DownstreamOauthError::InvalidClient)?;
-        if !client
-            .redirect_uris
-            .iter()
-            .any(|uri| registered_redirect_matches(uri, request.redirect_uri))
-        {
+        if !client.allows_redirect(request.redirect_uri) {
             return Err(DownstreamOauthError::InvalidRedirectUri);
         }
         if request.resource != self.resource() {
@@ -1504,66 +1507,6 @@ impl DownstreamOauthManager {
             csrf_token,
             expires_at,
         })
-    }
-
-    /// Approve or deny a consent without the owner passkey ceremony.
-    ///
-    /// Test-only: production approval goes through
-    /// [`Self::finish_owner_approval`] and denial through
-    /// [`Self::deny_consent`]. Tests in other crates reach this through the
-    /// `test-helpers` feature, which only dev-dependencies enable.
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub async fn decide_consent(
-        &self,
-        consent_id: &str,
-        approved: bool,
-    ) -> Result<AuthorizationRedirect, DownstreamOauthError> {
-        self.ensure_durable()?;
-        let mut guard = self.state.lock().await;
-        let now = epoch_secs();
-        guard
-            .completed_consents
-            .retain(|_, completed| completed.expires_at > now);
-        if let Some(completed) = guard.completed_consents.get(consent_id) {
-            return Ok(completed.redirect.clone());
-        }
-        let consent = guard
-            .pending_consents
-            .get(consent_id)
-            .cloned()
-            .ok_or(DownstreamOauthError::InvalidAuthorizationRequest)?;
-        if consent.expires_at <= now {
-            let mut next = guard.clone();
-            let expired = expire_consent(&mut next, consent_id, &consent);
-            self.commit_state(&mut guard, next)?;
-            return Err(expired);
-        }
-        if !approved {
-            let redirect = AuthorizationRedirect {
-                location: redirect_with_params(
-                    &consent.redirect_uri,
-                    &[("error", "access_denied"), ("state", &consent.state)],
-                ),
-            };
-            let mut next = guard.clone();
-            next.pending_consents.remove(consent_id);
-            next.completed_consents.insert(
-                consent_id.to_string(),
-                CompletedConsent {
-                    client_id: consent.client_id,
-                    redirect: redirect.clone(),
-                    expires_at: now + AUTH_CODE_LIFETIME_SECS,
-                    approval_ceremony_ids: Vec::new(),
-                },
-            );
-            self.commit_state(&mut guard, next)?;
-            return Ok(redirect);
-        }
-
-        let mut next = guard.clone();
-        let redirect = issue_code_for_consent(&mut next, consent_id, consent, Vec::new(), now);
-        self.commit_state(&mut guard, next)?;
-        Ok(redirect)
     }
 
     pub async fn exchange_authorization_code(
@@ -1635,8 +1578,7 @@ impl DownstreamOauthManager {
                     .refresh_tokens
                     .values()
                     .find(|live| {
-                        !consumed.family_id.is_empty()
-                            && live.family_id == consumed.family_id
+                        live.family_id == consumed.family_id
                             && live.client_id == client_id
                             && live.resource == resource
                     })
@@ -1720,42 +1662,29 @@ impl DownstreamOauthManager {
     pub async fn validate_access_token_for(
         &self,
         token: &str,
-        required_scopes: &[String],
         resource: &str,
-    ) -> AccessTokenValidation {
+    ) -> Option<AccessTokenClaims> {
         if self.durability_degraded() {
-            return AccessTokenValidation::Invalid;
+            return None;
         }
         let guard = self.state.lock().await;
-        let Some(record) = guard.access_tokens.get(token) else {
-            return AccessTokenValidation::Invalid;
-        };
-        if record.expires_at <= epoch_secs()
-            || record.resource != resource
-            || !guard.clients.contains_key(&record.client_id)
+        let record = guard.access_tokens.get(token)?;
+        if record.resource != resource
+            || !self.grant_is_live(&guard, &Grant::from(record), epoch_secs())
         {
-            return AccessTokenValidation::Invalid;
+            return None;
         }
-        if required_scopes
-            .iter()
-            .any(|scope| !record.scopes.contains(scope))
-        {
-            return AccessTokenValidation::InsufficientScope;
-        }
-        AccessTokenValidation::Valid(AccessTokenClaims {
+        Some(AccessTokenClaims {
             client_id: record.client_id.clone(),
             scopes: record.scopes.clone(),
             resource: record.resource.clone(),
             principal_lifecycle: {
-                let Some(lifecycle) = self.principal_lifecycles.get(&record.client_id) else {
-                    return AccessTokenValidation::Invalid;
-                };
+                let lifecycle = self.principal_lifecycles.get(&record.client_id)?;
                 let generation = lifecycle.generation.load(Ordering::SeqCst);
                 let lease = PrincipalLifecycleLease {
                     state: Arc::clone(lifecycle.value()),
                     generation,
-                    // A record from before sign-ins were tracked has none.
-                    family_ended: (!record.family_id.is_empty()).then(|| {
+                    family_ended: {
                         let sign_in = Arc::clone(
                             self.family_ended
                                 .entry(record.family_id.clone())
@@ -1773,10 +1702,10 @@ impl DownstreamOauthManager {
                                 .fold(record.expires_at, u64::max),
                         );
                         sign_in
-                    }),
+                    },
                 };
                 if !lease.is_active() {
-                    return AccessTokenValidation::Invalid;
+                    return None;
                 }
                 lease
             },
@@ -1793,11 +1722,7 @@ impl DownstreamOauthManager {
             .clients
             .get(client_id)
             .is_some_and(|client| {
-                client.expires_at > epoch_secs()
-                    && client
-                        .redirect_uris
-                        .iter()
-                        .any(|registered| registered == redirect_uri)
+                client.expires_at > epoch_secs() && client.allows_redirect(redirect_uri)
             })
     }
 
@@ -1813,8 +1738,18 @@ impl DownstreamOauthManager {
         &self,
         requested: Option<&str>,
     ) -> Result<Vec<String>, DownstreamOauthError> {
-        let scopes = requested
-            .map(|value| value.split_whitespace().map(ToString::to_string).collect())
+        let offered = |scope: &str| self.config.oauth_scopes.iter().any(|s| s == scope);
+        let scopes: Vec<String> = requested
+            .map(|value| {
+                value
+                    .split_whitespace()
+                    .filter(|scope| {
+                        offered(scope)
+                            || !crate::admission::RETIRED_DOWNSTREAM_OAUTH_SCOPES.contains(scope)
+                    })
+                    .map(ToString::to_string)
+                    .collect()
+            })
             .unwrap_or_else(|| self.config.oauth_scopes.clone());
         if scopes.is_empty()
             || scopes
@@ -1876,16 +1811,18 @@ impl DownstreamOauthManager {
             Err(error) => return Err(error),
         };
         validate_metadata_document(client_id, &document)?;
+        self.record_metadata_document_client(client_id, document)
+            .await
+    }
+
+    /// Keep the client `document` describes. A client already known keeps
+    /// when it was first seen and last used: only its document is new.
+    async fn record_metadata_document_client(
+        &self,
+        client_id: &str,
+        document: ClientMetadataDocument,
+    ) -> Result<(), DownstreamOauthError> {
         let now = epoch_secs();
-        let client = RegisteredClient {
-            client_id: client_id.to_string(),
-            client_name: safe_client_name(document.client_name.as_deref()),
-            redirect_uris: document.redirect_uris,
-            source: ClientSource::MetadataDocument,
-            created_at: now,
-            last_used_at: None,
-            expires_at: now + REGISTRATION_LIFETIME_SECS,
-        };
         let mut guard = self.state.lock().await;
         if guard.revoked_client_ids.contains(client_id) {
             return Err(DownstreamOauthError::InvalidClient);
@@ -1895,6 +1832,19 @@ impl DownstreamOauthManager {
         if !next.clients.contains_key(client_id) && next.clients.len() >= MAX_REGISTRATIONS {
             return Err(DownstreamOauthError::RegistrationQuotaExceeded);
         }
+        let known = next
+            .clients
+            .get(client_id)
+            .filter(|client| matches!(client.source, ClientSource::MetadataDocument));
+        let client = RegisteredClient {
+            client_id: client_id.to_string(),
+            client_name: safe_client_name(document.client_name.as_deref()),
+            redirect_uris: document.redirect_uris,
+            source: ClientSource::MetadataDocument,
+            created_at: known.map_or(now, |client| client.created_at),
+            last_used_at: known.and_then(|client| client.last_used_at),
+            expires_at: now + REGISTRATION_LIFETIME_SECS,
+        };
         next.clients.insert(client_id.to_string(), client);
         self.deactivate_principal_lifecycles(&expired);
         self.commit_state(&mut guard, next)?;
@@ -1980,8 +1930,12 @@ fn registered_redirect_matches(registered: &str, requested: &str) -> bool {
     // Only the port may vary; token exchange still requires the actual callback.
     if registered.scheme() != "http"
         || requested.scheme() != "http"
-        || !registered.host_str().is_some_and(is_loopback_host)
-        || !requested.host_str().is_some_and(is_loopback_host)
+        || !registered
+            .host_str()
+            .is_some_and(crate::config::is_loopback_host)
+        || !requested
+            .host_str()
+            .is_some_and(crate::config::is_loopback_host)
     {
         return false;
     }
@@ -2010,17 +1964,9 @@ fn valid_redirect_uri(value: &str) -> bool {
     }
     match uri.scheme() {
         "https" => true,
-        "http" => uri.host_str().is_some_and(is_loopback_host),
+        "http" => uri.host_str().is_some_and(crate::config::is_loopback_host),
         _ => false,
     }
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .trim_matches(['[', ']'])
-            .parse::<IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn validate_metadata_document(
@@ -2106,7 +2052,7 @@ async fn fetch_client_metadata_document(
         return Err(DownstreamOauthError::MetadataFetch);
     }
     let pinned = resolved[0];
-    let client = reqwest::Client::builder()
+    let client = crate::tls::http_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(5))
@@ -2326,16 +2272,10 @@ fn issue_token_pair(
     }
 }
 
-fn redirect_with_params(base: &str, pairs: &[(&str, &str)]) -> String {
-    let query = pairs
-        .iter()
-        .fold(
-            url::form_urlencoded::Serializer::new(String::new()),
-            |mut serializer, (key, value)| {
-                serializer.append_pair(key, value);
-                serializer
-            },
-        )
+/// `base` with `pairs` appended to its query.
+pub(crate) fn redirect_with_params(base: &str, pairs: &[(&str, &str)]) -> String {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
         .finish();
     format!(
         "{base}{}{query}",
@@ -2349,11 +2289,6 @@ fn redirect_with_params(base: &str, pairs: &[(&str, &str)]) -> String {
 /// alive would let a stolen chain keep working for up to their remaining
 /// lifetime, which is the window the revocation exists to close.
 fn revoke_token_family(state: &mut DownstreamOauthState, family_id: &str) -> usize {
-    if family_id.is_empty() {
-        // A record predating families carries no lineage, and an empty id is
-        // not a family — treating it as one would revoke every legacy grant.
-        return 0;
-    }
     let before = state.access_tokens.len()
         + state.refresh_tokens.len()
         + state.consumed_refresh_tokens.len();
@@ -2417,48 +2352,84 @@ fn state_file_path_in_dir(
     ))
 }
 
-#[doc(hidden)]
-pub fn owner_enrollment_state_path_in_dir(
+pub(crate) fn owner_enrollment_state_path_in_dir(
     config: &DownstreamOauthConfig,
     state_dir: &std::path::Path,
 ) -> PathBuf {
     state_file_path_in_dir(config, state_dir, STATE_VERSION)
 }
 
-fn load_persisted_state(
-    path: &std::path::Path,
-) -> Result<DownstreamOauthState, DownstreamOauthError> {
-    let data = match std::fs::read_to_string(path) {
-        Ok(data) => data,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(DownstreamOauthState::default());
-        }
-        Err(error) => return Err(DownstreamOauthError::Persistence(error.to_string())),
+/// Whether only its owner can read or write the state file. Anyone else
+/// who could write it could have enrolled an owner credential of their own.
+fn state_file_is_private(file: &std::fs::File) -> std::io::Result<bool> {
+    Ok(file.metadata()?.permissions().mode() & 0o077 == 0)
+}
+
+enum StateFileError {
+    /// Other local users can read the file.
+    Shared,
+    Unreadable(String),
+}
+
+/// Read the issuer state file. `Ok(None)` when there is none yet.
+fn read_state_file(path: &std::path::Path) -> Result<Option<DownstreamOauthState>, StateFileError> {
+    use std::io::Read as _;
+
+    let unreadable = |error: std::io::Error| StateFileError::Unreadable(error.to_string());
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(unreadable(error)),
     };
-    let mut state: DownstreamOauthState = serde_json::from_str(&data)
-        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
+    if !state_file_is_private(&file).map_err(unreadable)? {
+        return Err(StateFileError::Shared);
+    }
+    let mut data = String::new();
+    file.read_to_string(&mut data).map_err(unreadable)?;
+    let state: DownstreamOauthState = serde_json::from_str(&data)
+        .map_err(|error| StateFileError::Unreadable(error.to_string()))?;
     if state.version != STATE_VERSION {
-        return Err(DownstreamOauthError::Persistence(
+        return Err(StateFileError::Unreadable(
             "unsupported downstream OAuth state version".to_string(),
         ));
     }
-    let _ = state.evict_expired(epoch_secs());
-    Ok(state)
+    Ok(Some(state))
 }
 
-#[derive(Debug)]
-enum PersistOutcome {
-    Durable,
-    CommittedDurabilityUncertain(std::io::Error),
+fn load_persisted_state(
+    path: &std::path::Path,
+) -> Result<DownstreamOauthState, DownstreamOauthError> {
+    let mut state = match read_state_file(path) {
+        Ok(Some(state)) => state,
+        Ok(None) => return Ok(DownstreamOauthState::default()),
+        Err(StateFileError::Shared) => {
+            return Err(DownstreamOauthError::Persistence(format!(
+                "{} is visible to other local users; run chmod 600 on it",
+                path.display()
+            )));
+        }
+        Err(StateFileError::Unreadable(detail)) => {
+            return Err(DownstreamOauthError::Persistence(detail));
+        }
+    };
+    let _ = state.evict_expired(epoch_secs());
+    state
+        .access_tokens
+        .retain(|_, token| !token.family_id.is_empty());
+    state
+        .refresh_tokens
+        .retain(|_, token| !token.family_id.is_empty());
+    Ok(state)
 }
 
 fn persist_state(
     path: &std::path::Path,
     state: &DownstreamOauthState,
-) -> Result<PersistOutcome, DownstreamOauthError> {
+) -> Result<crate::fs_perm::Durability, DownstreamOauthError> {
     let json = serde_json::to_vec(state)
         .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    run_blocking_io(|| persist_bytes(path, &json))
+    run_blocking_io(|| crate::fs_perm::write_private(path, &json))
+        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))
 }
 
 /// Run a blocking state write without stalling the other tasks scheduled on
@@ -2480,79 +2451,15 @@ fn run_blocking_io<T>(write: impl FnOnce() -> T) -> T {
     }
 }
 
-fn persist_bytes(
-    path: &std::path::Path,
-    bytes: &[u8],
-) -> Result<PersistOutcome, DownstreamOauthError> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| DownstreamOauthError::Persistence("invalid state path".to_string()))?;
-    crate::fs_perm::ensure_dir_0700(dir)
-        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    let tmp = temporary_state_path(path);
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    {
-        use std::io::Write as _;
-        let mut file = options
-            .open(&tmp)
-            .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-        let write_result = file.write_all(bytes).and_then(|_| file.sync_all());
-        drop(file);
-        if let Err(error) = write_result {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(DownstreamOauthError::Persistence(error.to_string()));
-        }
-    }
-    #[cfg(unix)]
-    if let Err(error) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(DownstreamOauthError::Persistence(error.to_string()));
-    }
-    #[cfg(test)]
-    if FAIL_NEXT_STATE_RENAME.replace(false) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(DownstreamOauthError::Persistence(
-            "injected state rename failure".to_string(),
-        ));
-    }
-    if let Err(error) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(DownstreamOauthError::Persistence(error.to_string()));
-    }
-    Ok(match sync_parent_dir_with_retry(dir) {
-        Ok(()) => PersistOutcome::Durable,
-        Err(error) => PersistOutcome::CommittedDurabilityUncertain(error),
-    })
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static FAIL_PARENT_DIR_SYNC_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static FAIL_NEXT_STATE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-fn fail_next_parent_dir_sync_attempts_for_tests(attempts: usize) {
-    FAIL_PARENT_DIR_SYNC_ATTEMPTS.set(attempts);
-}
-
-#[cfg(test)]
-fn fail_next_state_rename_for_tests() {
-    FAIL_NEXT_STATE_RENAME.set(true);
-}
-
-fn temporary_state_path(path: &std::path::Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("state.json");
-    path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()))
-}
-
 fn acquire_state_lock(path: &std::path::Path) -> Result<std::fs::File, DownstreamOauthError> {
+    acquire_state_lock_waiting(path, || {})
+}
+
+/// [`acquire_state_lock`], calling `on_wait` each time the lock is found held.
+fn acquire_state_lock_waiting(
+    path: &std::path::Path,
+    mut on_wait: impl FnMut(),
+) -> Result<std::fs::File, DownstreamOauthError> {
     let dir = path
         .parent()
         .ok_or_else(|| DownstreamOauthError::Persistence("invalid state path".to_string()))?;
@@ -2561,12 +2468,10 @@ fn acquire_state_lock(path: &std::path::Path) -> Result<std::fs::File, Downstrea
     let lock_path = path.with_extension("lock");
     let mut options = std::fs::OpenOptions::new();
     options.create(true).read(true).write(true);
-    #[cfg(unix)]
     options.mode(0o600);
     let file = options
         .open(&lock_path)
         .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    #[cfg(unix)]
     std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
         .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
     // A restart that races the previous writer's exit is not a second writer.
@@ -2574,22 +2479,24 @@ fn acquire_state_lock(path: &std::path::Path) -> Result<std::fs::File, Downstrea
     // and refusing there turns an ordinary daemon restart into a startup failure
     // that only a second restart clears. A live writer still holds the lock well
     // past this window, so the guard keeps its meaning.
-    for attempt in 0..STATE_LOCK_ATTEMPTS {
+    let mut attempt = 1;
+    loop {
         match fs4::FileExt::try_lock(&file) {
             Ok(()) => return Ok(file),
             // An I/O error will not resolve itself by waiting.
             Err(error @ fs4::TryLockError::Error(_)) => {
                 return Err(lock_held_error(path, &error));
             }
-            Err(error @ fs4::TryLockError::WouldBlock) => {
-                if attempt + 1 == STATE_LOCK_ATTEMPTS {
-                    return Err(lock_held_error(path, &error));
-                }
+            Err(error @ fs4::TryLockError::WouldBlock) if attempt == STATE_LOCK_ATTEMPTS => {
+                return Err(lock_held_error(path, &error));
+            }
+            Err(fs4::TryLockError::WouldBlock) => {
+                attempt += 1;
+                on_wait();
             }
         }
         std::thread::sleep(STATE_LOCK_RETRY_INTERVAL);
     }
-    Err(lock_held_error(path, &fs4::TryLockError::WouldBlock))
 }
 
 fn lock_held_error(path: &std::path::Path, error: &fs4::TryLockError) -> DownstreamOauthError {
@@ -2599,54 +2506,14 @@ fn lock_held_error(path: &std::path::Path, error: &fs4::TryLockError) -> Downstr
     ))
 }
 
-fn sync_parent_dir_with_retry(dir: &std::path::Path) -> std::io::Result<()> {
-    let mut last_error = None;
-    for attempt in 0..PARENT_DIR_SYNC_ATTEMPTS {
-        match sync_parent_dir(dir) {
-            Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error),
-        }
-        if attempt + 1 < PARENT_DIR_SYNC_ATTEMPTS {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-    Err(last_error.unwrap_or_else(|| std::io::Error::other("directory sync was not attempted")))
-}
-
-fn sync_parent_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(test)]
-    {
-        let remaining = FAIL_PARENT_DIR_SYNC_ATTEMPTS.get();
-        if remaining > 0 {
-            FAIL_PARENT_DIR_SYNC_ATTEMPTS.set(remaining - 1);
-            return Err(std::io::Error::other(
-                "injected parent directory sync failure",
-            ));
-        }
-    }
-
-    #[cfg(unix)]
-    {
-        std::fs::File::open(dir)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::downstream_oauth::owner::tests::BrowserAuthenticator;
+    use crate::downstream_oauth::test_owner::{self, BrowserAuthenticator};
     use serde_json::json;
 
     fn temp_state_path() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "plug-downstream-oauth-{}.json",
-            uuid::Uuid::new_v4()
-        ))
+        crate::paths::test::scratch("downstream-oauth").join("state.json")
     }
 
     /// Serve one HTTP response with a chunked body that never ends, and
@@ -2676,7 +2543,13 @@ mod tests {
     async fn metadata_body_cap_applies_to_chunked_responses() {
         crate::tls::ensure_rustls_provider_installed();
         let url = endless_chunked_server().await;
-        let response = reqwest::Client::new().get(url).send().await.expect("send");
+        let response = crate::tls::http_client_builder()
+            .build()
+            .expect("HTTP client")
+            .get(url)
+            .send()
+            .await
+            .expect("send");
         assert!(response.content_length().is_none(), "body must be chunked");
         let result = tokio::time::timeout(
             Duration::from_secs(5),
@@ -2729,9 +2602,9 @@ mod tests {
 
     fn write_state_fixture(fixture: serde_json::Value) -> PathBuf {
         let path = temp_state_path();
-        std::fs::write(
+        crate::fs_perm::write_private_atomic(
             &path,
-            serde_json::to_vec_pretty(&fixture).expect("serialize fixture"),
+            &serde_json::to_vec_pretty(&fixture).expect("serialize fixture"),
         )
         .expect("write state fixture");
         path
@@ -2741,7 +2614,6 @@ mod tests {
         DownstreamOauthConfig {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
-            local_port: 3282,
         }
     }
 
@@ -3091,8 +2963,8 @@ mod tests {
         assert_eq!(manager.state.lock().await.pending_codes.len(), 1);
     }
 
-    fn malformed_owner_assertion() -> PublicKeyCredential {
-        PublicKeyCredential {
+    fn malformed_owner_assertion() -> AuthenticationResponse {
+        AuthenticationResponse {
             id: "malformed".to_string(),
             authenticator_data: "malformed".to_string(),
             signature: "malformed".to_string(),
@@ -3294,7 +3166,7 @@ mod tests {
             "https://plug.example.com",
             true,
         );
-        fail_next_state_rename_for_tests();
+        crate::fs_perm::faults::fail_next_rename();
         assert!(matches!(
             manager
                 .finish_owner_registration(&challenge.ceremony_id, response)
@@ -3341,7 +3213,7 @@ mod tests {
             "https://plug.example.com",
             true,
         );
-        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
         assert!(matches!(
             manager
                 .finish_owner_approval(&challenge.ceremony_id, response)
@@ -3575,7 +3447,7 @@ mod tests {
             .await
             .expect("finish owner approval after restart");
         assert!(redirect.location.contains("state=restart-state"));
-        let replay = PublicKeyCredential {
+        let replay = AuthenticationResponse {
             id: "malformed".to_string(),
             authenticator_data: "malformed".to_string(),
             signature: "malformed".to_string(),
@@ -3635,7 +3507,7 @@ mod tests {
             "https://plug.example.com",
             true,
         );
-        fail_next_state_rename_for_tests();
+        crate::fs_perm::faults::fail_next_rename();
         assert!(matches!(
             manager
                 .finish_owner_approval(&challenge.ceremony_id, response)
@@ -3902,14 +3774,12 @@ mod tests {
             .await
             .expect("start owner approval");
         let denial_consent = begin_test_authorization(&manager, "expired-consent-denial").await;
-        let legacy_consent = begin_test_authorization(&manager, "expired-consent-legacy").await;
         {
             let mut state = manager.state.lock().await;
             for consent_id in [
                 &challenge_consent.consent_id,
                 &assertion_consent.consent_id,
                 &denial_consent.consent_id,
-                &legacy_consent.consent_id,
             ] {
                 state
                     .pending_consents
@@ -3943,20 +3813,11 @@ mod tests {
                 .unwrap_err(),
             "expired-consent-denial",
         );
-        assert_expired_callback(
-            manager
-                .decide_consent(&legacy_consent.consent_id, false)
-                .await
-                .unwrap_err(),
-            "expired-consent-legacy",
-        );
     }
 
     #[tokio::test]
     async fn owner_enrollment_probe_counts_only_valid_persisted_credentials() {
-        let state_dir =
-            std::env::temp_dir().join(format!("plug-owner-probe-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let state_dir = crate::paths::test::scratch("owner-probe");
         let manager = DownstreamOauthManager::try_new_with_state_dir(test_config(), &state_dir)
             .expect("manager");
         let authenticator = BrowserAuthenticator::new();
@@ -3969,14 +3830,11 @@ mod tests {
                 credential_count: 1
             }
         );
-        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[tokio::test]
     async fn owner_enrollment_probe_does_not_claim_readiness_for_corrupt_issuer_state() {
-        let state_dir =
-            std::env::temp_dir().join(format!("plug-owner-probe-corrupt-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let state_dir = crate::paths::test::scratch("owner-probe-corrupt");
         let config = test_config();
         let manager = DownstreamOauthManager::try_new_with_state_dir(config.clone(), &state_dir)
             .expect("manager");
@@ -3998,19 +3856,13 @@ mod tests {
             inspect_owner_enrollment_in_dir(&config, &state_dir),
             OwnerEnrollmentStatus::StateUnavailable
         );
-        let _ = std::fs::remove_dir_all(state_dir);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn owner_enrollment_probe_rejects_state_visible_to_other_users() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let state_dir = std::env::temp_dir().join(format!(
-            "plug-owner-probe-permissions-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let state_dir = crate::paths::test::scratch("owner-probe-permissions");
         let config = test_config();
         let manager = DownstreamOauthManager::try_new_with_state_dir(config.clone(), &state_dir)
             .expect("manager");
@@ -4025,7 +3877,11 @@ mod tests {
             inspect_owner_enrollment_in_dir(&config, &state_dir),
             OwnerEnrollmentStatus::UnsafePermissions
         );
-        let _ = std::fs::remove_dir_all(state_dir);
+        // The daemon holds the state to the rule doctor reports.
+        assert!(matches!(
+            DownstreamOauthManager::try_new_with_state_dir(config, &state_dir),
+            Err(DownstreamOauthError::Persistence(message)) if message.contains("chmod 600")
+        ));
     }
 
     #[tokio::test]
@@ -4140,27 +3996,15 @@ mod tests {
         let manager = DownstreamOauthManager::new_with_state_path(wider, path)
             .expect("v3 state with scope_model loads");
         let resource = manager.resource();
-        assert!(matches!(
-            manager
-                .validate_access_token_for(
-                    "access-existing",
-                    &["tools:read".to_string()],
-                    &resource
-                )
-                .await,
-            AccessTokenValidation::Valid(_)
-        ));
-        assert!(
-            matches!(
-                manager
-                    .validate_access_token_for(
-                        "access-existing",
-                        &["tools:call".to_string()],
-                        &resource
-                    )
-                    .await,
-                AccessTokenValidation::InsufficientScope
-            ),
+        let Some(claims) = manager
+            .validate_access_token_for("access-existing", &resource)
+            .await
+        else {
+            panic!("the stored grant still works");
+        };
+        assert_eq!(
+            claims.scopes,
+            vec!["tools:read".to_string()],
             "a stored grant must not widen to the configured scope set"
         );
         let state = manager.state.lock().await;
@@ -4233,7 +4077,7 @@ mod tests {
     async fn authorization_start_sync_failure_fails_closed_with_aligned_recovery() {
         let (manager, path) = test_manager();
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
-        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
 
         let result = manager
             .begin_authorization(AuthorizationRequest {
@@ -4287,21 +4131,64 @@ mod tests {
         manager.age_spent_refresh_tokens_for_tests().await;
     }
 
+    /// A client whose sign-in has ended is not signed in anywhere Plug asks:
+    /// the app's client list, an event's grant count, and a request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_sign_in_that_ended_is_over_for_every_reader() {
+        let (manager, _path) = test_manager();
+        let client = register(&manager, "Codex", "http://localhost:8787/callback").await;
+        let tokens = issue_tokens(&manager, &client).await;
+        let resource = "https://plug.example.com/mcp";
+        let open = manager
+            .validate_access_token_for(&tokens.access_token, resource)
+            .await
+            .expect("a fresh token works");
+        let signed_in = |clients: Vec<RegisteredClientSummary>| {
+            clients
+                .into_iter()
+                .find(|listed| listed.client_id == client.client_id)
+                .expect("listed")
+                .signed_in
+        };
+        assert!(signed_in(manager.list_clients().await));
+        assert!(
+            manager
+                .holds_live_grant(&client.client_id, "tools:read")
+                .await
+        );
+
+        let sign_in = &open.principal_lifecycle.family_ended;
+        sign_in.ended.store(true, Ordering::SeqCst);
+
+        assert!(!signed_in(manager.list_clients().await));
+        assert!(
+            !manager
+                .holds_live_grant(&client.client_id, "tools:read")
+                .await
+        );
+        assert!(
+            manager
+                .validate_access_token_for(&tokens.access_token, resource)
+                .await
+                .is_none()
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn what_is_open_under_a_sign_in_ends_when_the_sign_in_runs_out() {
         let (manager, _path) = test_manager();
         let client = register(&manager, "Codex", "http://localhost:8787/callback").await;
         let tokens = issue_tokens(&manager, &client).await;
         let resource = "https://plug.example.com/mcp";
-        let AccessTokenValidation::Valid(open) = manager
-            .validate_access_token_for(&tokens.access_token, &[], resource)
+        let Some(open) = manager
+            .validate_access_token_for(&tokens.access_token, resource)
             .await
         else {
             panic!("a fresh token works");
         };
         // It lasts as long as the refresh token, not only the hour the
         // access token has.
-        let sign_in = Arc::clone(open.principal_lifecycle.family_ended.as_ref().unwrap());
+        let sign_in = Arc::clone(&open.principal_lifecycle.family_ended);
         assert!(
             sign_in.until.load(Ordering::SeqCst) >= epoch_secs() + REFRESH_TOKEN_LIFETIME_SECS - 5
         );
@@ -4379,12 +4266,12 @@ mod tests {
                 .any(|listed| listed.client_id == client.client_id && listed.signed_in)
         );
         for pair in [&first, &second] {
-            assert!(matches!(
+            assert!(
                 manager
-                    .validate_access_token_for(&pair.access_token, &[], resource)
-                    .await,
-                AccessTokenValidation::Valid(_)
-            ));
+                    .validate_access_token_for(&pair.access_token, resource)
+                    .await
+                    .is_some()
+            );
         }
 
         // A third process that sat idle for an hour still holds the first
@@ -4399,12 +4286,12 @@ mod tests {
             .exchange_refresh_token(&client.client_id, &original_refresh, resource)
             .await
             .expect("the idle process, an hour later, renews too");
-        assert!(matches!(
+        assert!(
             manager
-                .validate_access_token_for(&first.access_token, &[], resource)
-                .await,
-            AccessTokenValidation::Valid(_)
-        ));
+                .validate_access_token_for(&first.access_token, resource)
+                .await
+                .is_some()
+        );
 
         // Another client presenting the spent token is not that race.
         let other = register(&manager, "Other", "http://localhost:8788/callback").await;
@@ -4458,8 +4345,8 @@ mod tests {
         let rotated_refresh = rotated.refresh_token.expect("rotated refresh token");
 
         // The rotated pair works before the replay.
-        let AccessTokenValidation::Valid(open_under_it) = manager
-            .validate_access_token_for(&rotated.access_token, &[], "https://plug.example.com/mcp")
+        let Some(open_under_it) = manager
+            .validate_access_token_for(&rotated.access_token, "https://plug.example.com/mcp")
             .await
         else {
             panic!("the rotated pair works before the replay");
@@ -4488,13 +4375,9 @@ mod tests {
         // present has to die too, or the stolen token keeps a live descendant.
         assert_eq!(
             manager
-                .validate_access_token_for(
-                    &rotated.access_token,
-                    &[],
-                    "https://plug.example.com/mcp",
-                )
+                .validate_access_token_for(&rotated.access_token, "https://plug.example.com/mcp",)
                 .await,
-            AccessTokenValidation::Invalid,
+            None,
             "the descendant access token must not outlive the replay"
         );
         assert!(
@@ -4550,41 +4433,34 @@ mod tests {
         ));
 
         assert!(
-            matches!(
-                manager
-                    .validate_access_token_for(
-                        &bystander.access_token,
-                        &[],
-                        "https://plug.example.com/mcp",
-                    )
-                    .await,
-                AccessTokenValidation::Valid(_)
-            ),
+            manager
+                .validate_access_token_for(&bystander.access_token, "https://plug.example.com/mcp",)
+                .await
+                .is_some(),
             "an unrelated authorization for the same client must survive"
         );
     }
 
+    /// A token from before sign-ins had families has run out by now. Its
+    /// record still loads, and is dropped.
     #[test]
-    fn an_empty_family_id_revokes_nothing() {
-        let mut state = DownstreamOauthState::default();
-        state.access_tokens.insert(
-            "token".to_string(),
-            IssuedAccessToken {
-                client_id: "client".to_string(),
-                scopes: Vec::new(),
-                resource: "https://plug.example.com/mcp".to_string(),
-                issued_at: 0,
-                expires_at: u64::MAX,
-                family_id: String::new(),
-            },
-        );
+    fn a_token_from_before_families_is_dropped_on_load() {
+        let token = serde_json::json!({
+            "client_id": "client",
+            "scopes": [],
+            "resource": "https://plug.example.com/mcp",
+            "issued_at": 0,
+            "expires_at": u64::MAX,
+        });
+        let path = write_state_fixture(serde_json::json!({
+            "version": STATE_VERSION,
+            "access_tokens": { "access-old": token.clone() },
+            "refresh_tokens": { "refresh-old": token },
+        }));
 
-        assert_eq!(revoke_token_family(&mut state, ""), 0);
-        assert_eq!(
-            state.access_tokens.len(),
-            1,
-            "an empty lineage is not a family to revoke"
-        );
+        let state = load_persisted_state(&path).expect("old records load");
+        assert!(state.access_tokens.is_empty());
+        assert!(state.refresh_tokens.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4593,7 +4469,7 @@ mod tests {
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
         let original = issue_tokens(&manager, &client).await;
         let original_refresh = original.refresh_token.expect("original refresh token");
-        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
 
         let result = manager
             .exchange_refresh_token(
@@ -4620,16 +4496,12 @@ mod tests {
         drop(memory);
         assert_eq!(
             manager
-                .validate_access_token_for(
-                    &original.access_token,
-                    &["tools:read".to_string()],
-                    "https://plug.example.com/mcp",
-                )
+                .validate_access_token_for(&original.access_token, "https://plug.example.com/mcp",)
                 .await,
-            AccessTokenValidation::Invalid
+            None
         );
         // While the directory still cannot be synced, nothing new is issued.
-        fail_next_parent_dir_sync_attempts_for_tests(1);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
         assert!(matches!(
             manager
                 .exchange_refresh_token(
@@ -4675,17 +4547,13 @@ mod tests {
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
         let tokens = issue_tokens(&manager, &client).await;
         let lease = match manager
-            .validate_access_token_for(
-                &tokens.access_token,
-                &["tools:read".to_string()],
-                "https://plug.example.com/mcp",
-            )
+            .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp")
             .await
         {
-            AccessTokenValidation::Valid(claims) => claims.principal_lifecycle,
+            Some(claims) => claims.principal_lifecycle,
             other => panic!("expected valid token before revoke, got {other:?}"),
         };
-        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
 
         let result = manager.revoke_client(&client.client_id).await;
 
@@ -4694,19 +4562,15 @@ mod tests {
         assert!(!lease.is_active());
         assert_eq!(
             manager
-                .validate_access_token_for(
-                    &tokens.access_token,
-                    &["tools:read".to_string()],
-                    "https://plug.example.com/mcp",
-                )
+                .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp",)
                 .await,
-            AccessTokenValidation::Invalid
+            None
         );
         let disk = load_persisted_state(&path).expect("read committed revocation");
         assert!(disk.revoked_client_ids.contains(&client.client_id));
         drop(manager);
 
-        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
         let restart_error =
             DownstreamOauthManager::new_with_state_path(test_config(), path.clone()).expect_err(
                 "restart must refuse service while directory durability remains uncertain",
@@ -4725,13 +4589,9 @@ mod tests {
         );
         assert_eq!(
             restarted
-                .validate_access_token_for(
-                    &tokens.access_token,
-                    &["tools:read".to_string()],
-                    "https://plug.example.com/mcp",
-                )
+                .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp",)
                 .await,
-            AccessTokenValidation::Invalid
+            None
         );
     }
 
@@ -4739,7 +4599,7 @@ mod tests {
     async fn pre_rename_failure_publishes_nothing_and_restart_matches() {
         let (manager, path) = test_manager();
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
-        fail_next_state_rename_for_tests();
+        crate::fs_perm::faults::fail_next_rename();
 
         let result = manager
             .begin_authorization(AuthorizationRequest {
@@ -4773,7 +4633,7 @@ mod tests {
     async fn parent_directory_sync_retry_can_recover_without_degrading() {
         let (manager, _) = test_manager();
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
-        fail_next_parent_dir_sync_attempts_for_tests(1);
+        crate::fs_perm::faults::fail_next_dir_syncs(1);
 
         let consent = manager
             .begin_authorization(AuthorizationRequest {
@@ -4801,19 +4661,6 @@ mod tests {
     }
 
     #[test]
-    fn persistence_temp_paths_are_unique_per_writer() {
-        let path = temp_state_path();
-        let first = temporary_state_path(&path);
-        let second = temporary_state_path(&path);
-
-        assert_eq!(first.parent(), path.parent());
-        assert_eq!(second.parent(), path.parent());
-        assert_ne!(first, second);
-        assert_ne!(first, path.with_extension("json.tmp"));
-        assert_ne!(second, path.with_extension("json.tmp"));
-    }
-
-    #[test]
     fn issuer_state_allows_only_one_live_writer() {
         let path = temp_state_path();
         let first = DownstreamOauthManager::new_with_state_path(test_config(), path.clone())
@@ -4834,13 +4681,24 @@ mod tests {
         let outgoing = DownstreamOauthManager::new_with_state_path(test_config(), path.clone())
             .expect("first writer acquires issuer lock");
 
+        let (waiting, wait_seen) = std::sync::mpsc::channel();
+        let (released, release_done) = std::sync::mpsc::channel();
         let release = std::thread::spawn(move || {
-            std::thread::sleep(STATE_LOCK_RETRY_INTERVAL * 2);
+            wait_seen.recv().expect("the restart finds the lock held");
             drop(outgoing);
+            released.send(()).expect("the restart is waiting");
         });
 
-        DownstreamOauthManager::new_with_state_path(test_config(), path)
-            .expect("a restart waits out the previous writer's close");
+        let mut waits = 0;
+        acquire_state_lock_waiting(&path, || {
+            waits += 1;
+            if waits == 1 {
+                waiting.send(()).expect("the writer is still running");
+                release_done.recv().expect("the writer let go");
+            }
+        })
+        .expect("a restart waits out the previous writer's close");
+        assert_eq!(waits, 1, "the restart found the lock held once");
         release.join().expect("the outgoing writer thread finishes");
     }
 
@@ -4861,8 +4719,7 @@ mod tests {
             })
             .await
             .expect("begin authorization");
-        let redirect = manager
-            .decide_consent(&consent.consent_id, true)
+        let redirect = test_owner::approve_consent(&manager, &consent.consent_id)
             .await
             .expect("approve consent");
         let code = url::Url::parse(&redirect.location)
@@ -4908,7 +4765,8 @@ mod tests {
                 "expired-completed": {
                     "client_id": "plug_expired",
                     "redirect": { "location": "https://client.example/callback" },
-                    "expires_at": now
+                    "expires_at": now,
+                    "approval_ceremony_ids": []
                 }
             },
             "pending_codes": {
@@ -4979,8 +4837,7 @@ mod tests {
             })
             .await
             .expect("begin authorization");
-        let redirect = manager
-            .decide_consent(&consent.consent_id, true)
+        let redirect = test_owner::approve_consent(manager, &consent.consent_id)
             .await
             .expect("approve consent");
         let parsed = url::Url::parse(&redirect.location).expect("redirect URL");
@@ -5012,24 +4869,45 @@ mod tests {
         let config = DownstreamOauthConfig::from_http_config(&http).expect("oauth config");
         assert_eq!(
             config.oauth_scopes,
-            crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+            crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-            "absent http.oauth_scopes must inherit the six-family default grant"
+            "absent http.oauth_scopes must inherit the default grant"
         );
     }
 
+    /// A client that still asks for a scope Plug retired signs in with the
+    /// rest of what it asked for.
     #[tokio::test]
-    async fn default_grant_issuance_covers_all_six_scope_families() {
+    async fn a_retired_scope_in_a_request_is_left_out() {
+        let (manager, _path) = test_manager();
+        let client = register(&manager, "Old client", "https://client.example/callback").await;
+        let consent = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: &client.redirect_uris[0],
+                state: "retired-scope-state",
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                code_challenge_method: "S256",
+                scope: Some("tools:read subscriptions:listen"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("begin authorization");
+        assert_eq!(consent.scopes, vec!["tools:read".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn default_grant_issuance_covers_every_scope_family() {
         let manager = DownstreamOauthManager::new_with_state_path(
             DownstreamOauthConfig {
                 public_base_url: "https://plug.example.com".to_string(),
-                oauth_scopes: crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+                oauth_scopes: crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
                     .iter()
                     .map(ToString::to_string)
                     .collect(),
-                local_port: 3282,
             },
             temp_state_path(),
         )
@@ -5048,7 +4926,7 @@ mod tests {
             })
             .await
             .expect("begin authorization without an explicit scope");
-        let mut expected = crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+        let mut expected = crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>();
@@ -5057,8 +4935,7 @@ mod tests {
             consent.scopes, expected,
             "scopeless authorization must request the sorted default grant"
         );
-        let redirect = manager
-            .decide_consent(&consent.consent_id, true)
+        let redirect = test_owner::approve_consent(&manager, &consent.consent_id)
             .await
             .expect("approve consent");
         let code = url::Url::parse(&redirect.location)
@@ -5078,7 +4955,7 @@ mod tests {
             .expect("exchange code");
         let scope = token.scope.expect("token response scope");
         let granted: HashSet<&str> = scope.split(' ').collect();
-        for required in crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES {
+        for required in crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES {
             assert!(
                 granted.contains(required),
                 "token scope string must grant {required}, got {scope:?}"
@@ -5128,16 +5005,30 @@ mod tests {
             .await
             .expect("begin authorization");
 
+        let mut authenticator = BrowserAuthenticator::new();
+        enroll_owner(&manager, &authenticator).await;
+        let challenge = manager
+            .start_owner_approval(&consent.consent_id)
+            .await
+            .expect("start approval");
+        let mut assert = || {
+            authenticator.authentication_response(
+                &challenge.public_key.challenge,
+                &manager.owner_security.rp_id,
+                "https://plug.example.com",
+                true,
+            )
+        };
         let first = manager
-            .decide_consent(&consent.consent_id, true)
+            .finish_owner_approval(&challenge.ceremony_id, assert())
             .await
             .expect("approve consent");
         let repeated = manager
-            .decide_consent(&consent.consent_id, true)
+            .finish_owner_approval(&challenge.ceremony_id, assert())
             .await
             .expect("repeat approval");
         let later_denial = manager
-            .decide_consent(&consent.consent_id, false)
+            .deny_consent(&consent.consent_id, &consent.csrf_token)
             .await
             .expect("later denial");
 
@@ -5165,11 +5056,11 @@ mod tests {
             .expect("begin authorization");
 
         let first = manager
-            .decide_consent(&consent.consent_id, false)
+            .deny_consent(&consent.consent_id, &consent.csrf_token)
             .await
             .expect("deny consent");
         let repeated = manager
-            .decide_consent(&consent.consent_id, false)
+            .deny_consent(&consent.consent_id, &consent.csrf_token)
             .await
             .expect("repeat denial");
 
@@ -5201,7 +5092,7 @@ mod tests {
                 .await
                 .expect("begin authorization within cap");
             manager
-                .decide_consent(&consent.consent_id, false)
+                .deny_consent(&consent.consent_id, &consent.csrf_token)
                 .await
                 .expect("deny consent");
         }
@@ -5270,7 +5161,7 @@ mod tests {
             .await
             .expect("begin authorization");
         manager
-            .decide_consent(&consent.consent_id, false)
+            .deny_consent(&consent.consent_id, &consent.csrf_token)
             .await
             .expect("deny consent");
 
@@ -5303,7 +5194,7 @@ mod tests {
             .await
             .expect("begin second authorization");
         manager
-            .decide_consent(&second.consent_id, false)
+            .deny_consent(&second.consent_id, &second.csrf_token)
             .await
             .expect("deny second consent");
         assert!(manager.revoke_client(&client.client_id).await.unwrap());
@@ -5338,6 +5229,28 @@ mod tests {
             "https://example.com/callback",
             "https://example.com:62557/callback"
         ));
+    }
+
+    /// A native client that may be sent a code on any loopback port may be
+    /// sent an error there too.
+    #[tokio::test]
+    async fn an_error_goes_to_any_callback_a_code_may_go_to() {
+        let (manager, _path) = test_manager();
+        let client = register(&manager, "Codex", "http://127.0.0.1:1234/callback").await;
+
+        for (requested, allowed) in [
+            ("http://127.0.0.1:62557/callback", true),
+            ("http://127.0.0.1:62557/other", false),
+            ("https://example.com/callback", false),
+        ] {
+            assert_eq!(
+                manager
+                    .client_redirect_allowed(&client.client_id, requested)
+                    .await,
+                allowed,
+                "{requested}"
+            );
+        }
     }
 
     #[test]
@@ -5587,16 +5500,12 @@ mod tests {
 
         let cursor_tokens = issue_tokens(&manager, &cursor).await;
         let access = cursor_tokens.access_token.clone();
-        assert!(matches!(
+        assert!(
             manager
-                .validate_access_token_for(
-                    &access,
-                    &["tools:read".to_string()],
-                    "https://plug.example.com/mcp"
-                )
-                .await,
-            AccessTokenValidation::Valid(_)
-        ));
+                .validate_access_token_for(&access, "https://plug.example.com/mcp")
+                .await
+                .is_some()
+        );
         assert_eq!(
             manager
                 .exchange_refresh_token(
@@ -5618,16 +5527,12 @@ mod tests {
             .expect("rotate refresh token");
         assert_ne!(rotated.refresh_token, cursor_tokens.refresh_token);
         // The original access token outlives the rotation itself.
-        assert!(matches!(
+        assert!(
             manager
-                .validate_access_token_for(
-                    &access,
-                    &["tools:read".to_string()],
-                    "https://plug.example.com/mcp"
-                )
-                .await,
-            AccessTokenValidation::Valid(_)
-        ));
+                .validate_access_token_for(&access, "https://plug.example.com/mcp")
+                .await
+                .is_some()
+        );
         age_spent_refresh_tokens(&manager).await;
         assert_eq!(
             manager
@@ -5645,28 +5550,23 @@ mod tests {
         // the replay was the whole response and the chain stayed live.
         assert_eq!(
             manager
-                .validate_access_token_for(
-                    &access,
-                    &["tools:read".to_string()],
-                    "https://plug.example.com/mcp"
-                )
+                .validate_access_token_for(&access, "https://plug.example.com/mcp")
                 .await,
-            AccessTokenValidation::Invalid
+            None
         );
         // Claude's earlier attempt with Cursor's live token did not revoke
         // anything, so client isolation still holds: only reuse of a spent
         // token trips the revocation.
         let claude_tokens = issue_tokens(&manager, &claude).await;
-        assert!(matches!(
+        assert!(
             manager
                 .validate_access_token_for(
                     &claude_tokens.access_token,
-                    &["tools:read".to_string()],
                     "https://plug.example.com/mcp"
                 )
-                .await,
-            AccessTokenValidation::Valid(_)
-        ));
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -5743,16 +5643,12 @@ mod tests {
         let restarted = DownstreamOauthManager::new_with_state_path(test_config(), path.clone())
             .expect("restart manager");
         assert_eq!(restarted.list_clients().await.len(), 1);
-        assert!(matches!(
+        assert!(
             restarted
-                .validate_access_token_for(
-                    &tokens.access_token,
-                    &["tools:read".to_string()],
-                    "https://plug.example.com/mcp"
-                )
-                .await,
-            AccessTokenValidation::Valid(_)
-        ));
+                .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp")
+                .await
+                .is_some()
+        );
         assert!(
             restarted
                 .revoke_client(&client.client_id)
@@ -5763,17 +5659,12 @@ mod tests {
         let after_revoke = DownstreamOauthManager::new_with_state_path(test_config(), path.clone())
             .expect("restart after revoke");
         assert!(after_revoke.list_clients().await.is_empty());
-        assert!(matches!(
+        assert!(
             after_revoke
-                .validate_access_token_for(
-                    &tokens.access_token,
-                    &["tools:read".to_string()],
-                    "https://plug.example.com/mcp"
-                )
-                .await,
-            AccessTokenValidation::Invalid
-        ));
-        #[cfg(unix)]
+                .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp")
+                .await
+                .is_none()
+        );
         assert_eq!(
             std::fs::metadata(&path)
                 .expect("state metadata")
@@ -5790,14 +5681,10 @@ mod tests {
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
         let tokens = issue_tokens(&manager, &client).await;
         let lease = match manager
-            .validate_access_token_for(
-                &tokens.access_token,
-                &["tools:read".to_string()],
-                "https://plug.example.com/mcp",
-            )
+            .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp")
             .await
         {
-            AccessTokenValidation::Valid(claims) => claims.principal_lifecycle,
+            Some(claims) => claims.principal_lifecycle,
             other => panic!("token must validate before revocation: {other:?}"),
         };
 
@@ -5813,14 +5700,10 @@ mod tests {
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
         let tokens = issue_tokens(&manager, &client).await;
         let lease = match manager
-            .validate_access_token_for(
-                &tokens.access_token,
-                &["tools:read".to_string()],
-                "https://plug.example.com/mcp",
-            )
+            .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp")
             .await
         {
-            AccessTokenValidation::Valid(claims) => claims.principal_lifecycle,
+            Some(claims) => claims.principal_lifecycle,
             other => panic!("token must validate before expiry: {other:?}"),
         };
         manager
@@ -5865,39 +5748,14 @@ mod tests {
         let server_manager = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager,
-            crate::proxy::RouterConfig {
-                enable_prefix: true,
-                prefix_delimiter: "__".to_string(),
-                priority_tools: Vec::new(),
-                disabled_tools: Vec::new(),
-                tool_description_max_chars: None,
-                tool_search_threshold: 50,
-                meta_tool_mode: false,
-                lazy_tools: crate::config::LazyToolsConfig::default(),
-                tool_filter_enabled: true,
-                enrichment_servers: std::collections::HashSet::new(),
-            },
+            crate::proxy::RouterConfig::default(),
         ));
         router.replace_snapshot(crate::proxy::RouterSnapshot {
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-
             routes: std::collections::HashMap::from([(
                 "Mock__echo".to_string(),
                 ("missing".to_string(), "echo".to_string()),
             )]),
-            tools_all: Arc::new(Vec::new()),
-            meta_tools_all: Arc::new(Vec::new()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: std::collections::HashMap::new(),
-            prompt_routes: std::collections::HashMap::new(),
-            tool_definition_fingerprints: std::collections::HashMap::new(),
-            tool_risk_inventory: std::collections::HashMap::new(),
+            ..Default::default()
         });
 
         let principal = crate::types::PrincipalId::downstream_oauth(
@@ -5914,26 +5772,19 @@ mod tests {
         let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
 
         let request = tokio::spawn(async move {
-            let claims = match request_manager
-                .validate_access_token_for(
-                    &access_token,
-                    &["tools:read".to_string()],
-                    &request_manager.resource(),
-                )
+            let claims = request_manager
+                .validate_access_token_for(&access_token, &request_manager.resource())
                 .await
-            {
-                AccessTokenValidation::Valid(claims) => claims,
-                other => panic!("token must validate before barrier: {other:?}"),
-            };
+                .expect("token must validate before barrier");
             validated_tx.send(()).expect("signal validated request");
             resume_rx.await.expect("release request after revocation");
 
-            let context = crate::proxy::DownstreamCallContext::http_for_client_with_trace(
+            let context = crate::proxy::DownstreamCallContext::http(
                 "session-before-revoke",
                 rmcp::model::RequestId::from(rmcp::model::NumberOrString::Number(1)),
                 crate::types::ClientType::Unknown,
-                Arc::<str>::from("00000000000000000000000000000001"),
             )
+            .with_trace_id(Arc::<str>::from("00000000000000000000000000000001"))
             .with_authorization(
                 crate::types::PrincipalId::downstream_oauth(
                     request_manager.base_url(),
@@ -6062,6 +5913,43 @@ mod tests {
                 .iter()
                 .any(|client| client.client_id == expired_id)
         );
+    }
+
+    /// Fetching a known client's document again changes its document, not
+    /// its history: a client that signed in before never reads as unfinished.
+    #[tokio::test]
+    async fn a_refetched_metadata_document_keeps_the_clients_history() {
+        let (manager, _) = test_manager();
+        let client_id = "https://client.example/oauth/client.json";
+        let document = |name: &str| -> ClientMetadataDocument {
+            serde_json::from_value(json!({
+                "client_id": client_id,
+                "client_name": name,
+                "redirect_uris": ["https://client.example/callback"],
+            }))
+            .expect("metadata document")
+        };
+        manager
+            .record_metadata_document_client(client_id, document("First"))
+            .await
+            .unwrap();
+        let (created_at, used_at) = {
+            let mut state = manager.state.lock().await;
+            let client = state.clients.get_mut(client_id).expect("recorded");
+            client.created_at -= 1000;
+            client.last_used_at = Some(client.created_at + 10);
+            (client.created_at, client.last_used_at)
+        };
+
+        manager
+            .record_metadata_document_client(client_id, document("Renamed"))
+            .await
+            .unwrap();
+        let state = manager.state.lock().await;
+        let client = &state.clients[client_id];
+        assert_eq!(client.client_name, "Renamed");
+        assert_eq!(client.created_at, created_at);
+        assert_eq!(client.last_used_at, used_at);
     }
 
     #[tokio::test]

@@ -16,11 +16,9 @@ struct ImportServersView: View {
 
     @State private var scan: ImportScan?
     @State private var chosen: Set<String> = []
-    @State private var failure: String?
+    @State private var failure: SheetFailure?
     @State private var importing = false
     @State private var scanFailed = false
-    /// Why each server that could not be added was refused, by server id.
-    @State private var refused: [String: String] = [:]
 
     /// The list scrolls once it is taller than this.
     private static let listHeight: CGFloat = 240
@@ -55,7 +53,8 @@ struct ImportServersView: View {
         if scanFailed {
             ProblemNote(
                 title: "Plug could not read your other clients' settings.",
-                reason: failure,
+                reason: failure?.reason,
+                advice: failure?.advice,
                 actionTitle: "Try Again",
                 action: { Task { await load() } },
                 failed: true
@@ -122,10 +121,6 @@ struct ImportServersView: View {
                     .font(PanelType.small)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                if let reason = refused[server.id] {
-                    InlineWarning("Not added: \(reason)")
-                        .font(PanelType.small)
-                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -169,10 +164,9 @@ struct ImportServersView: View {
 
     // MARK: - Work
 
-    /// Reads what the other clients have. `keeping` is what stays ticked;
-    /// nil ticks everything, because someone who opens this sheet wants their
-    /// servers, not a checklist.
-    private func load(keeping: Set<String>? = nil) async {
+    /// Reads what the other clients have, and ticks everything, because
+    /// someone who opens this sheet wants their servers, not a checklist.
+    private func load() async {
         scanFailed = false
         failure = nil
         scan = nil
@@ -180,59 +174,36 @@ struct ImportServersView: View {
             let result = try await scanner.scan()
             scan = result
             scanFailed = false
-            let found = Set(result.servers.map(\.id))
-            chosen = keeping.map { $0.intersection(found) } ?? found
+            chosen = Set(result.servers.map(\.id))
         } catch {
             scan = nil
             scanFailed = true
-            failure = error.localizedDescription
+            failure = SheetFailure(error)
         }
     }
 
+    /// Nothing goes in unless everything does, so a failure leaves the list
+    /// as it was to try again.
     private func importChosen() {
         guard let scan else { return }
         importing = true
         failure = nil
-        refused = [:]
         let wanted = scan.servers.filter { chosen.contains($0.id) }
         Task {
-            var failed: [String: String] = [:]
-            for server in wanted {
-                do {
-                    try await model.performOperation {
-                        .addServer(authToken: $0, name: server.name, server: server.config)
-                    }
-                } catch {
-                    failed[server.id] = error.localizedDescription
-                }
-            }
-            importing = false
-            guard !failed.isEmpty else {
-                // One server went in: show it. Several: the list shows them.
-                if wanted.count == 1, let only = wanted.first {
-                    router.reveal(server: only.name)
-                }
-                dismiss()
+            let names: [String]
+            do {
+                names = try await model.actions.importServers(wanted)
+            } catch {
+                importing = false
+                failure = SheetFailure(error)
                 return
             }
-            // The ones that went in leave the list; the rest stay ticked with
-            // their reason, so trying again retries only what failed.
-            await load(keeping: Set(failed.keys))
-            refused = failed
-            failure = Self.summary(
-                failed: wanted.filter { failed[$0.id] != nil }.map(\.name),
-                of: wanted.count
-            )
+            importing = false
+            // One server went in: show it. Several: the list shows them.
+            if names.count == 1, let only = names.first {
+                router.reveal(server: only)
+            }
+            dismiss()
         }
-    }
-
-    /// Names what could not be added, and says the rest went in.
-    nonisolated static func summary(failed: [String], of total: Int) -> String {
-        let names = failed.count <= 3
-            ? failed.joined(separator: ", ")
-            : failed.prefix(3).joined(separator: ", ") + ", and \(failed.count - 3) more"
-        let added = total - failed.count
-        let rest = added == 0 ? "" : added == 1 ? " 1 server was added." : " \(added) servers were added."
-        return "Could not add \(names).\(rest) The reason is under each one."
     }
 }

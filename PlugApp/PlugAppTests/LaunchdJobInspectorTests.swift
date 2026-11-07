@@ -1,16 +1,10 @@
 import Foundation
 import XCTest
 @testable import Plug
+import PlugIPC
 
 final class LaunchdJobInspectorTests: XCTestCase {
-    private let canonical = VerifiedAppInstallation(
-        bundleURL: URL(fileURLWithPath: "/Applications/Plug.app"),
-        executableURL: URL(fileURLWithPath: "/Applications/Plug.app/Contents/Resources/plug"),
-        appVersion: "0.7.0",
-        buildVersion: "20",
-        embeddedVersion: "0.7.0",
-        teamID: "HJF7LN64XX"
-    )
+    private let canonical = makeTestInstallation()
 
     func testClassifiesCurrentAndStaleAppManagedJobs() async throws {
         let current = record(label: "com.plug.daemon", program: canonical.executableURL, parentVersion: "20")
@@ -162,7 +156,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
     }
 
     func testBroadEnumerationFindsPlugProgramBehindUnrelatedLabel() async throws {
-        let runner = RecordingLaunchctlRunner()
+        let runner = launchctlPrintingOneOwner()
         let inspector = LaunchdJobInspector(runner: runner, userID: 501)
 
         let state = try await inspector.daemonJobs(
@@ -177,18 +171,12 @@ final class LaunchdJobInspectorTests: XCTestCase {
             parentVersion: nil
         )
         XCTAssertEqual(state, .recognizedLegacy([legacy]))
-        let printedLabels = await runner.printedLabels
-        XCTAssertEqual(printedLabels, ["unexpected.owner"])
+        let printed = await runner.arguments.filter { $0 != ["print", "gui/501"] }
+        XCTAssertEqual(printed, [["print", "gui/501/unexpected.owner"]])
     }
 
     func testAppleNamespaceLabelsAreNotInspected() {
-        let listing = """
-        PID\tStatus\tLabel
-        -\t0\tcom.apple.unrelated
-        1\t0\tcom.apple.plug.lookalike
-        2\t0\tcom.plug.daemon
-        3\t0\tunexpected.owner
-        """
+        let listing = domain("0\t0\tcom.apple.unrelated\n1\t0\tcom.apple.plug.lookalike\n2\t0\tcom.plug.daemon\n3\t0\tunexpected.owner\n")
 
         XCTAssertEqual(
             LaunchdJobInspector.parseLabels(listing),
@@ -196,8 +184,56 @@ final class LaunchdJobInspectorTests: XCTestCase {
         )
     }
 
+    // MARK: The samples `plug/src/service.rs` reads too
+
+    private func sample(_ name: String) throws -> String {
+        let root = URL(fileURLWithPath: "\(#filePath)")
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        return try String(contentsOf: root.appending(path: "testdata/launchd/\(name)"), encoding: .utf8)
+    }
+
+    func testTheDomainSampleListsTheSameLabelsAsTheCLI() throws {
+        XCTAssertEqual(
+            LaunchdJobInspector.domainLabels(try sample("gui_domain.txt")),
+            ["local.claude-rc.plug", "com.plug.daemon", "com.apple.Finder", "homebrew.mxcl.plug"]
+        )
+    }
+
+    func testTheServiceManagedSampleIsThisAppsDaemon() async throws {
+        let output = try sample("app_service_job.txt")
+        let installation = makeTestInstallation(build: "12")
+        let state = try await LaunchdJobInspector(records: {
+            [LaunchdJobInspector.parseRecord(label: PlugPaths.daemonLabel, output: output)]
+        }).daemonJobs(canonical: installation, recognizedLegacyPaths: [])
+        guard case let .appManagedCurrent(record) = state else {
+            return XCTFail("expected the app's own daemon, got \(state)")
+        }
+        XCTAssertEqual(record.programURL, installation.executableURL)
+        XCTAssertEqual(record.managedBy, LaunchdJobInspector.serviceManagement)
+    }
+
+    /// Without `managed_by`, nothing says SMAppService registered the job,
+    /// so it is not taken for the app's, as `plug doctor` does not.
+    func testAJobSMAppServiceDidNotRegisterIsNotTheAppsDaemon() async throws {
+        let output = try sample("app_job_not_service_managed.txt")
+        let installation = makeTestInstallation(build: "12")
+        let state = try await LaunchdJobInspector(records: {
+            [LaunchdJobInspector.parseRecord(label: PlugPaths.daemonLabel, output: output)]
+        }).daemonJobs(canonical: installation, recognizedLegacyPaths: [])
+        assertUnknown(state, programIdentifier: PlugPaths.bundledBinary)
+    }
+
+    func testTheLegacySampleIsALeftoverPlug() async throws {
+        let record = LaunchdJobInspector.parseRecord(label: "homebrew.mxcl.plug", output: try sample("legacy_job.txt"))
+        XCTAssertEqual(record.programURL?.path, "/opt/homebrew/opt/plug/bin/plug")
+        XCTAssertEqual(record.arguments, ["/opt/homebrew/opt/plug/bin/plug", "serve", "--daemon"])
+        let state = try await LaunchdJobInspector(records: { [record] })
+            .daemonJobs(canonical: canonical, recognizedLegacyPaths: [])
+        XCTAssertEqual(state, .recognizedLegacy([record]))
+    }
+
     func testLiveSMAppServiceShapeResolvesBundleRelativeDaemon() async throws {
-        let runner = SMAppServiceLaunchctlRunner(
+        let runner = launchctlWithAppServiceJob(
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
             parentBundleVersion: canonical.buildVersion,
             arguments: ["Contents/Resources/plug", "serve", "--daemon"]
@@ -212,13 +248,14 @@ final class LaunchdJobInspectorTests: XCTestCase {
             parentID: AppInstallationInspector.bundleIdentifier,
             parentVersion: canonical.buildVersion,
             programIdentifier: "Contents/Resources/plug",
-            arguments: ["Contents/Resources/plug", "serve", "--daemon"]
+            arguments: ["Contents/Resources/plug", "serve", "--daemon"],
+            managedBy: LaunchdJobInspector.serviceManagement
         )
         XCTAssertEqual(state, .appManagedCurrent(expected))
     }
 
     func testLiveSMAppServiceShapeWithOlderBundleVersionIsRecognizedAsStale() async throws {
-        let runner = SMAppServiceLaunchctlRunner(
+        let runner = launchctlWithAppServiceJob(
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
             parentBundleVersion: "19",
             arguments: ["Contents/Resources/plug", "serve", "--daemon"]
@@ -233,13 +270,14 @@ final class LaunchdJobInspectorTests: XCTestCase {
             parentID: AppInstallationInspector.bundleIdentifier,
             parentVersion: "19",
             programIdentifier: "Contents/Resources/plug",
-            arguments: ["Contents/Resources/plug", "serve", "--daemon"]
+            arguments: ["Contents/Resources/plug", "serve", "--daemon"],
+            managedBy: LaunchdJobInspector.serviceManagement
         )
         XCTAssertEqual(state, .appManagedStale(expected))
     }
 
     func testLiveSMAppServiceShapeWithMismatchedBundleIdentifierRemainsUnknown() async throws {
-        let runner = SMAppServiceLaunchctlRunner(
+        let runner = launchctlWithAppServiceJob(
             parentBundleIdentifier: "com.example.other",
             parentBundleVersion: canonical.buildVersion,
             arguments: ["Contents/Resources/plug", "serve", "--daemon"]
@@ -252,7 +290,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
     }
 
     func testLiveSMAppServiceShapeWithMismatchedArgumentsRemainsUnknown() async throws {
-        let runner = SMAppServiceLaunchctlRunner(
+        let runner = launchctlWithAppServiceJob(
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
             parentBundleVersion: canonical.buildVersion,
             arguments: ["Contents/Resources/plug", "serve"]
@@ -266,7 +304,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
 
     func testLaunchctlListFailureIsPropagatedInsteadOfReportingUnmanaged() async {
         let inspector = LaunchdJobInspector(
-            runner: FailingLaunchctlRunner(failure: .list),
+            runner: launchctlFailing(list: true),
             userID: 501
         )
 
@@ -282,7 +320,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
 
     func testAnyLaunchctlPrintFailureIsPropagatedInsteadOfDroppingTheJob() async {
         let inspector = LaunchdJobInspector(
-            runner: FailingLaunchctlRunner(failure: .print),
+            runner: launchctlFailing(list: false),
             userID: 501
         )
 
@@ -301,7 +339,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
 
     func testSlowLaunchctlPrintForUnrelatedJobIsIgnored() async throws {
         let inspector = LaunchdJobInspector(
-            runner: TimingOutLaunchctlRunner(slowLabel: "com.example.other"),
+            runner: launchctlTimingOut(on: "com.example.other"),
             userID: 501
         )
 
@@ -315,7 +353,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
 
     func testSlowLaunchctlPrintForPlugDaemonIsPropagated() async {
         let inspector = LaunchdJobInspector(
-            runner: TimingOutLaunchctlRunner(slowLabel: "com.plug.daemon"),
+            runner: launchctlTimingOut(on: "com.plug.daemon"),
             userID: 501
         )
 
@@ -329,7 +367,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
     }
 
     func testVanishedUnrelatedLaunchdJobIsIgnored() async throws {
-        let runner = VanishedUnrelatedLaunchctlRunner()
+        let runner = launchctl(listing: "123\t0\tcom.apple.transient\n") { _ in .notFound }
         let inspector = LaunchdJobInspector(runner: runner, userID: 501)
 
         let state = try await inspector.daemonJobs(
@@ -343,7 +381,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
     func testLaunchdProgramSymlinkResolvesToRecognizedLegacyBinary() async throws {
         let fixture = try LaunchdSymlinkFixture()
         defer { fixture.cleanup() }
-        let runner = SymlinkLaunchctlRunner(programURL: fixture.shellLink)
+        let runner = launchctlRunning( fixture.shellLink)
         let inspector = LaunchdJobInspector(runner: runner, userID: 501)
 
         let state = try await inspector.daemonJobs(
@@ -366,16 +404,17 @@ final class LaunchdJobInspectorTests: XCTestCase {
         parentID: String? = "com.cyberpapiii.plug",
         parentVersion: String? = "20",
         programIdentifier: String? = nil,
-        arguments: [String] = []
+        arguments: [String] = [],
+        managedBy: String? = nil
     ) -> LaunchdJobRecord {
         LaunchdJobRecord(
             label: label,
             programURL: program,
             parentBundleIdentifier: parentID,
             parentBundleVersion: parentVersion,
-            loaded: true,
             programIdentifier: programIdentifier,
-            arguments: arguments
+            arguments: arguments,
+            managedBy: managedBy
         )
     }
 
@@ -415,115 +454,62 @@ private struct LegacyPlugProgramFixture: Decodable {
     }
 }
 
-private actor TimingOutLaunchctlRunner: ProcessRunning {
-    private let slowLabel: String
+/// A `launchctl print gui/501` whose services are `lines` of PID, status
+/// and label.
+private func domain(_ lines: String) -> String {
+    let services = lines.split(separator: "\n").map { "\t\t\($0)\n" }.joined()
+    return "gui/501 = {\n\ttype = gui\n\tservices = {\n\(services)\t}\n}\n"
+}
 
-    init(slowLabel: String) {
-        self.slowLabel = slowLabel
-    }
-
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
-        if arguments == ["list"] {
-            return ProcessResult(
-                status: 0,
-                stdout: Data("PID\tStatus\tLabel\n123\t0\t\(slowLabel)\n124\t0\tcom.example.fast\n".utf8),
-                stderr: Data()
-            )
-        }
-        if arguments.last?.hasSuffix(slowLabel) == true {
-            throw ProcessRunnerError.timedOut
-        }
-        return ProcessResult(
-            status: 113,
-            stdout: Data(),
-            stderr: Data("Could not find service".utf8)
-        )
+/// The domain print names `labels`; each job's `print` gets `print`'s
+/// answer for the label it asks about.
+private func launchctl(
+    listing labels: String,
+    print: @escaping @Sendable (_ label: String) throws -> ProcessResult
+) -> StubProcessRunner {
+    StubProcessRunner { _, arguments in
+        if arguments == ["print", "gui/501"] { return .exited(stdout: domain(labels)) }
+        return try print(arguments.last?.split(separator: "/").last.map(String.init) ?? "")
     }
 }
 
-private actor VanishedUnrelatedLaunchctlRunner: ProcessRunning {
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
-        if arguments == ["list"] {
-            return ProcessResult(
-                status: 0,
-                stdout: Data("PID\tStatus\tLabel\n123\t0\tcom.apple.transient\n".utf8),
-                stderr: Data()
-            )
-        }
-        return ProcessResult(
-            status: 113,
-            stdout: Data(),
-            stderr: Data("Could not find service".utf8)
-        )
+private extension ProcessResult {
+    static let notFound = ProcessResult.exited(113, stderr: "Could not find service")
+}
+
+private func launchctlTimingOut(on slowLabel: String) -> StubProcessRunner {
+    launchctl(listing: "123\t0\t\(slowLabel)\n124\t0\tcom.example.fast\n") { label in
+        if label == slowLabel { throw ProcessRunnerError.timedOut }
+        return .notFound
     }
 }
 
-private actor FailingLaunchctlRunner: ProcessRunning {
-    enum Failure: Equatable, Sendable {
-        case list
-        case print
-    }
-
-    let failure: Failure
-
-    init(failure: Failure) {
-        self.failure = failure
-    }
-
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
-        if arguments == ["list"] {
-            if failure == .list {
-                return ProcessResult(status: 113, stdout: Data(), stderr: Data("list unavailable".utf8))
-            }
-            return ProcessResult(
-                status: 0,
-                stdout: Data("PID\tStatus\tLabel\n123\t0\tcom.plug.daemon\n".utf8),
-                stderr: Data()
-            )
+private func launchctlFailing(list: Bool) -> StubProcessRunner {
+    StubProcessRunner { _, arguments in
+        if arguments == ["print", "gui/501"] {
+            return list
+                ? .exited(113, stderr: "list unavailable")
+                : .exited(stdout: domain("123\t0\tcom.plug.daemon\n"))
         }
-        return ProcessResult(status: 113, stdout: Data(), stderr: Data("print unavailable".utf8))
+        return .exited(113, stderr: "print unavailable")
     }
 }
 
-private actor SymlinkLaunchctlRunner: ProcessRunning {
-    let programURL: URL
-
-    init(programURL: URL) {
-        self.programURL = programURL
-    }
-
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
-        if arguments == ["list"] {
-            return ProcessResult(
-                status: 0,
-                stdout: Data("PID\tStatus\tLabel\n123\t0\tlocal.claude-rc.plug\n".utf8),
-                stderr: Data()
-            )
-        }
-        let output = "program = \(programURL.path)\nstate = running\n"
-        return ProcessResult(status: 0, stdout: Data(output.utf8), stderr: Data())
+private func launchctlRunning(_ programURL: URL) -> StubProcessRunner {
+    launchctl(listing: "123\t0\tlocal.claude-rc.plug\n") { _ in
+        .exited(stdout: "program = \(programURL.path)\nstate = running\n")
     }
 }
 
-private actor SMAppServiceLaunchctlRunner: ProcessRunning {
-    let parentBundleIdentifier: String
-    let parentBundleVersion: String
-    let arguments: [String]
-
-    init(parentBundleIdentifier: String, parentBundleVersion: String, arguments: [String]) {
-        self.parentBundleIdentifier = parentBundleIdentifier
-        self.parentBundleVersion = parentBundleVersion
-        self.arguments = arguments
-    }
-
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
-        if arguments == ["list"] {
-            let output = "PID\tStatus\tLabel\n123\t0\tcom.plug.daemon\n"
-            return ProcessResult(status: 0, stdout: Data(output.utf8), stderr: Data())
-        }
-
-        let argumentLines = self.arguments.map { "    \($0)" }.joined(separator: "\n")
-        let output = """
+private func launchctlWithAppServiceJob(
+    parentBundleIdentifier: String,
+    parentBundleVersion: String,
+    arguments: [String]
+) -> StubProcessRunner {
+    let argumentLines = arguments.map { "    \($0)" }.joined(separator: "\n")
+    return launchctl(listing: "123\t0\tcom.plug.daemon\n") { _ in
+        .exited(stdout: """
+        managed_by = com.apple.xpc.ServiceManagement
         program identifier = Contents/Resources/plug (mode: 2)
         parent bundle identifier = \(parentBundleIdentifier)
         parent bundle version = \(parentBundleVersion)
@@ -531,8 +517,16 @@ private actor SMAppServiceLaunchctlRunner: ProcessRunning {
         \(argumentLines)
         }
         state = running
-        """
-        return ProcessResult(status: 0, stdout: Data(output.utf8), stderr: Data())
+        """)
+    }
+}
+
+/// An unrelated label whose program is a recognized Plug, beside one in
+/// Apple's namespace.
+private func launchctlPrintingOneOwner() -> StubProcessRunner {
+    launchctl(listing: "0\t0\tcom.apple.unrelated\n123\t0\tunexpected.owner\n") { label in
+        guard label == "unexpected.owner" else { return .exited(stdout: "state = running\n") }
+        return .exited(stdout: "program = /Users/me/.local/bin/plug\nstate = running\n")
     }
 }
 
@@ -563,27 +557,5 @@ private final class LaunchdSymlinkFixture: @unchecked Sendable {
 
     func cleanup() {
         try? FileManager.default.removeItem(at: root)
-    }
-}
-
-private actor RecordingLaunchctlRunner: ProcessRunning {
-    private(set) var printedLabels: [String] = []
-
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
-        if arguments == ["list"] {
-            let output = "PID\tStatus\tLabel\n-\t0\tcom.apple.unrelated\n123\t0\tunexpected.owner\n"
-            return ProcessResult(status: 0, stdout: Data(output.utf8), stderr: Data())
-        }
-
-        let label = arguments.last?.split(separator: "/").last.map(String.init) ?? ""
-        printedLabels.append(label)
-        if label == "unexpected.owner" {
-            let output = """
-            program = /Users/me/.local/bin/plug
-            state = running
-            """
-            return ProcessResult(status: 0, stdout: Data(output.utf8), stderr: Data())
-        }
-        return ProcessResult(status: 0, stdout: Data("state = running\n".utf8), stderr: Data())
     }
 }

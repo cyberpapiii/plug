@@ -1,18 +1,27 @@
 use super::*;
-use std::sync::atomic::{AtomicU8, AtomicU64};
+use crate::events::{DeliveryResponse, EventSource};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use hmac::{Hmac, Mac};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tokio::sync::Mutex;
 
-struct FakeAccess(AtomicU8);
+/// Answers every access check with what it holds.
+struct FakeAccess(std::sync::Mutex<Access>);
+impl FakeAccess {
+    fn allowed() -> Self {
+        Self(std::sync::Mutex::new(Access::Allowed))
+    }
+    fn set(&self, access: Access) {
+        *self.0.lock().unwrap() = access;
+    }
+}
 #[async_trait::async_trait]
 impl EventAccess for FakeAccess {
     fn enabled(&self) -> bool {
-        self.0.load(Ordering::SeqCst) != 3
+        true
     }
     async fn check(&self, _channel: Option<&str>) -> Access {
-        match self.0.load(Ordering::SeqCst) {
-            0 => Access::Allowed,
-            1 => Access::Denied,
-            _ => Access::Unavailable,
-        }
+        *self.0.lock().unwrap()
     }
 }
 #[derive(Default)]
@@ -66,7 +75,7 @@ fn fixture() -> (
     Arc<FakeDelivery>,
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let access = Arc::new(FakeAccess(AtomicU8::new(0)));
+    let access = Arc::new(FakeAccess::allowed());
     let sender = Arc::new(FakeDelivery::default());
     sender.status.store(200, Ordering::SeqCst);
     let events = SlackEvents::open(
@@ -112,7 +121,10 @@ async fn ingest(events: &SlackEvents, value: Value) -> Result<Value, EventError>
 #[tokio::test]
 async fn mention_reply_dedupe_restart_and_unsubscribe() {
     let (dir, events, access, sender) = fixture();
-    let subscribed = events.subscribe(&params()).await.unwrap();
+    let subscribed = events
+        .subscribe("existing-client", &params())
+        .await
+        .unwrap();
     assert!(subscribed["refreshBefore"].is_string());
     ingest(&events, envelope("Ev1", "<@U456> harmless canary", None))
         .await
@@ -126,7 +138,7 @@ async fn mention_reply_dedupe_restart_and_unsubscribe() {
     )
     .await
     .unwrap();
-    assert_eq!(events.state.lock().await.queue.len(), 2);
+    assert_eq!(events.state().await.queue.len(), 2);
     drop(events);
     let events = SlackEvents::open(
         config(),
@@ -138,7 +150,7 @@ async fn mention_reply_dedupe_restart_and_unsubscribe() {
     .unwrap();
     events.deliver_one().await.unwrap();
     events.deliver_one().await.unwrap();
-    assert!(events.state.lock().await.queue.is_empty());
+    assert!(events.state().await.queue.is_empty());
     let calls = sender.calls.lock().await;
     assert_eq!(calls.len(), 3);
     let first: Value = serde_json::from_slice(&calls[1].1).unwrap();
@@ -147,17 +159,26 @@ async fn mention_reply_dedupe_restart_and_unsubscribe() {
     assert_eq!(reply["data"]["reason"], "thread_reply");
     assert!(calls[1].0.contains_key("webhook-signature"));
     drop(calls);
-    events.unsubscribe(&params()).await.unwrap();
-    events.unsubscribe(&params()).await.unwrap();
+    events
+        .unsubscribe("existing-client", &params())
+        .await
+        .unwrap();
+    events
+        .unsubscribe("existing-client", &params())
+        .await
+        .unwrap();
     ingest(&events, envelope("Ev3", "<@U456> after removal", None))
         .await
         .unwrap();
-    assert!(events.state.lock().await.queue.is_empty());
+    assert!(events.state().await.queue.is_empty());
 }
 #[tokio::test]
 async fn rejects_bad_signature_replay_workspace_and_installation() {
     let (_dir, events, _, _) = fixture();
-    events.subscribe(&params()).await.unwrap();
+    events
+        .subscribe("existing-client", &params())
+        .await
+        .unwrap();
     let body = serde_json::to_vec(&envelope("Ev1", "<@U456>", None)).unwrap();
     assert!(events.ingest(&HeaderMap::new(), &body).await.is_err());
     assert!(
@@ -182,12 +203,15 @@ async fn rejects_bad_signature_replay_workspace_and_installation() {
     let mut value = envelope("Ev1", "<@U456>", None);
     value["authorizations"][0]["is_bot"] = json!(true);
     assert!(ingest(&events, value).await.is_err());
-    assert!(events.state.lock().await.queue.is_empty());
+    assert!(events.state().await.queue.is_empty());
 }
 #[tokio::test]
 async fn ignores_invalid_channels_dms_bots_owner_and_untracked_threads() {
     let (_dir, events, _, _) = fixture();
-    events.subscribe(&params()).await.unwrap();
+    events
+        .subscribe("existing-client", &params())
+        .await
+        .unwrap();
     for (i, (field, value)) in [
         ("channel", json!("D999")),
         ("channel_type", json!("im")),
@@ -209,19 +233,22 @@ async fn ignores_invalid_channels_dms_bots_owner_and_untracked_threads() {
     )
     .await
     .unwrap();
-    assert!(events.state.lock().await.queue.is_empty());
+    assert!(events.state().await.queue.is_empty());
 }
 #[tokio::test]
 async fn retries_keep_event_id_and_body_and_revoked_access_stops() {
     let (_dir, events, access, sender) = fixture();
-    events.subscribe(&params()).await.unwrap();
+    events
+        .subscribe("existing-client", &params())
+        .await
+        .unwrap();
     ingest(&events, envelope("Ev1", "<@U456>", None))
         .await
         .unwrap();
     sender.status.store(503, Ordering::SeqCst);
     events.deliver_one().await.unwrap();
-    assert_eq!(events.state.lock().await.queue[0].attempts, 1);
-    events.state.lock().await.queue[0].next_at = 0;
+    assert_eq!(events.state().await.queue[0].attempts, 1);
+    events.state().await.queue[0].next_at = 0;
     sender.status.store(200, Ordering::SeqCst);
     events.deliver_one().await.unwrap();
     let calls = sender.calls.lock().await;
@@ -231,17 +258,24 @@ async fn retries_keep_event_id_and_body_and_revoked_access_stops() {
     ingest(&events, envelope("Ev2", "<@U456>", None))
         .await
         .unwrap();
-    access.0.store(1, Ordering::SeqCst);
+    access.set(Access::Denied);
     events.deliver_one().await.unwrap();
-    assert!(events.state.lock().await.subscription.is_none());
+    assert!(events.state().await.subscriptions.is_empty());
     assert_eq!(sender.calls.lock().await.len(), 3);
 }
 #[tokio::test]
 async fn verification_failure_and_invalid_parameters_create_no_subscription() {
     let (_dir, events, _, sender) = fixture();
     sender.bad_echo.store(true, Ordering::SeqCst);
-    assert_eq!(events.subscribe(&params()).await.unwrap_err().code, -32015);
-    assert!(events.state.lock().await.subscription.is_none());
+    assert_eq!(
+        events
+            .subscribe("existing-client", &params())
+            .await
+            .unwrap_err()
+            .code,
+        -32015
+    );
+    assert!(events.state().await.subscriptions.is_empty());
     for (key, value) in [
         ("cursor", json!("unsupported")),
         ("ttlMs", json!(0)),
@@ -249,35 +283,19 @@ async fn verification_failure_and_invalid_parameters_create_no_subscription() {
     ] {
         let mut p = params();
         p[key] = value;
-        assert!(events.subscribe(&p).await.is_err());
+        assert!(events.subscribe("existing-client", &p).await.is_err());
     }
     let mut p = params();
     p["delivery"]["secret"] = json!("whsec_bad");
-    assert!(events.subscribe(&p).await.is_err());
-}
-#[test]
-fn public_callback_policy_rejects_internal_targets() {
-    for url in [
-        "http://example.com/",
-        "https://127.0.0.1/",
-        "https://10.1.2.3/",
-        "https://[::1]/",
-        "https://[::ffff:8.8.8.8]/",
-        "https://169.254.169.254/",
-        "https://user:pass@example.com/",
-        "https://example.com:8443/",
-        "https://example.com/#fragment",
-    ] {
-        assert!(delivery::validate_url(url).is_err(), "{url}");
-    }
-    assert!(delivery::validate_url("https://example.com/callback").is_ok());
-    assert!(delivery::public_address("8.8.8.8".parse().unwrap()));
-    assert!(!delivery::public_address("192.0.2.1".parse().unwrap()));
+    assert!(events.subscribe("existing-client", &p).await.is_err());
 }
 #[tokio::test]
 async fn expiry_permanent_failure_rotation_and_single_writer() {
     let (dir, events, access, sender) = fixture();
-    let first = events.subscribe(&params()).await.unwrap();
+    let first = events
+        .subscribe("existing-client", &params())
+        .await
+        .unwrap();
     assert!(
         SlackEvents::open(
             config(),
@@ -290,15 +308,15 @@ async fn expiry_permanent_failure_rotation_and_single_writer() {
     );
     let mut rotated = params();
     rotated["delivery"]["secret"] = json!(format!("whsec_{}", STANDARD.encode([8u8; 32])));
-    let next = events.subscribe(&rotated).await.unwrap();
+    let next = events.subscribe("existing-client", &rotated).await.unwrap();
     assert_eq!(first["id"], next["id"]);
-    events.subscribe(&rotated).await.unwrap();
+    events.subscribe("existing-client", &rotated).await.unwrap();
     ingest(&events, envelope("Ev1", "<@U456>", None))
         .await
         .unwrap();
     sender.status.store(413, Ordering::SeqCst);
     events.deliver_one().await.unwrap();
-    assert!(events.state.lock().await.queue.is_empty());
+    assert!(events.state().await.queue.is_empty());
     let calls = sender.calls.lock().await;
     assert_eq!(
         calls.last().unwrap().0["webhook-signature"]
@@ -309,68 +327,86 @@ async fn expiry_permanent_failure_rotation_and_single_writer() {
         2
     );
     drop(calls);
-    events
-        .state
-        .lock()
-        .await
-        .subscription
-        .as_mut()
-        .unwrap()
-        .expires = 0;
+    events.state().await.subscriptions[0].expires = 0;
     events.deliver_one().await.unwrap();
-    assert!(events.state.lock().await.subscription.is_none());
+    assert!(events.state().await.subscriptions.is_empty());
 }
 
-#[test]
-fn standard_webhooks_signature_matches_independent_vector() {
-    let secret = format!("whsec_{}", STANDARD.encode([7u8; 32]));
-    let headers = signed_headers(
-        "sub_test",
-        "Ev1",
-        &secret,
-        None,
-        br#"{"sample":true}"#,
-        1700000000,
-    )
-    .unwrap();
-    assert_eq!(
-        headers["webhook-signature"],
-        "v1,GZNGj6rLIWZ4DUblEE79gjt6eROPCI+z4HTZS5mqJwk="
-    );
-}
 #[tokio::test]
-async fn signed_lifecycle_revocation_and_storage_failure_stop_delivery() {
+async fn signed_lifecycle_revocation_stops_delivery() {
     let (_dir, events, _, sender) = fixture();
-    events.subscribe(&params()).await.unwrap();
+    events
+        .subscribe("existing-client", &params())
+        .await
+        .unwrap();
     ingest(&events, envelope("Ev1", "<@U456>", None))
         .await
         .unwrap();
-    events.state.lock().await.seen = (0..MAX_SEEN).map(|i| (format!("Seen{i}"), now())).collect();
+    events.state().await.source.seen = (0..MAX_SEEN).map(|i| (format!("Seen{i}"), now())).collect();
     let mut revoke = envelope("Ev2", "", None);
     revoke["event"] = json!({"type":"tokens_revoked","tokens":{"oauth":["U123"]}});
     revoke.as_object_mut().unwrap().remove("authorizations");
     ingest(&events, revoke).await.unwrap();
     events.deliver_one().await.unwrap();
     assert_eq!(sender.calls.lock().await.len(), 1);
-    assert!(events.subscribe(&params()).await.is_err());
-    let (_dir, events, _, sender) = fixture();
-    events.subscribe(&params()).await.unwrap();
-    std::fs::remove_file(&events.path).unwrap();
-    std::fs::create_dir(&events.path).unwrap();
     assert!(
-        ingest(&events, envelope("Ev1", "<@U456>", None))
+        events
+            .subscribe("existing-client", &params())
             .await
             .is_err()
     );
-    assert!(events.degraded.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn a_version_2_state_file_keeps_its_subscription_and_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("events");
+    crate::fs_perm::ensure_dir_0700(&state_dir).unwrap();
+    let secret = format!("whsec_{}", STANDARD.encode([7u8; 32]));
+    let old = json!({
+        "version": 2,
+        "subscription": {"id": "sub_old", "url": "https://events.example.com/callback",
+            "secret": secret, "old_secret": null, "old_secret_until": 0,
+            "expires": now() + 3600, "verified_until": 0},
+        "seen": {"Ev0": now()},
+        "threads": {"C123:1700000000.123456": now()},
+        "queue": [{"event_id": "Ev1", "channel_id": "C123", "body": b"{}".to_vec(),
+            "attempts": 1, "next_at": 0}],
+        "source_revoked": false,
+    });
+    let path = state_dir.join("state.json");
+    std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let sender = Arc::new(FakeDelivery::default());
+    sender.status.store(200, Ordering::SeqCst);
+    let events = SlackEvents::open(
+        config(),
+        "fake-signing-secret".to_owned().into(),
+        &state_dir,
+        Arc::new(FakeAccess::allowed()),
+        sender.clone(),
+    )
+    .unwrap();
+    {
+        let state = events.state().await;
+        assert_eq!(state.subscriptions[0].client_id, "existing-client");
+        assert_eq!(state.queue[0].origin.as_deref(), Some("C123"));
+        assert!(state.source.seen.contains_key("Ev0"));
+        assert_eq!(state.source.threads.len(), 1);
+    }
     events.deliver_one().await.unwrap();
-    assert_eq!(sender.calls.lock().await.len(), 1);
+    let calls = sender.calls.lock().await;
+    assert_eq!(calls[0].0["x-mcp-subscription-id"], "sub_old");
+    assert_eq!(calls[0].0["webhook-id"], "Ev1");
 }
 
 #[tokio::test]
 async fn existing_dot_participation_tracks_owner_started_thread_without_feedback() {
     let (_dir, events, _, _) = fixture();
-    events.subscribe(&params()).await.unwrap();
+    events
+        .subscribe("existing-client", &params())
+        .await
+        .unwrap();
     let mut owner = envelope("EvOwner", "<@U456> owner starts this", None);
     owner["event"]["user"] = json!("U123");
     ingest(&events, owner).await.unwrap();
@@ -380,7 +416,7 @@ async fn existing_dot_participation_tracks_owner_started_thread_without_feedback
     dot["event"]["subtype"] = json!("bot_message");
     dot["event"]["app_id"] = json!("A_NATIVE_DOT");
     ingest(&events, dot).await.unwrap();
-    assert!(events.state.lock().await.queue.is_empty());
+    assert!(events.state().await.queue.is_empty());
     ingest(
         &events,
         envelope(
@@ -391,7 +427,7 @@ async fn existing_dot_participation_tracks_owner_started_thread_without_feedback
     )
     .await
     .unwrap();
-    let state = events.state.lock().await;
+    let state = events.state().await;
     assert_eq!(state.queue.len(), 1);
     let value: Value = serde_json::from_slice(&state.queue[0].body).unwrap();
     assert_eq!(value["eventId"], "EvCoworker");
@@ -401,14 +437,17 @@ async fn existing_dot_participation_tracks_owner_started_thread_without_feedback
 #[tokio::test]
 async fn public_channels_are_dynamic_and_threads_are_channel_specific() {
     let (dir, events, access, sender) = fixture();
-    let subscription = events.subscribe(&params()).await.unwrap();
+    let subscription = events
+        .subscribe("existing-client", &params())
+        .await
+        .unwrap();
     ingest(&events, envelope("EvA", "<@U456>", None))
         .await
         .unwrap();
     let mut unrelated = envelope("EvB", "unmentioned", Some("1700000000.123456"));
     unrelated["event"]["channel"] = json!("C999");
     ingest(&events, unrelated).await.unwrap();
-    assert_eq!(events.state.lock().await.queue.len(), 1);
+    assert_eq!(events.state().await.queue.len(), 1);
     drop(events);
     let events = SlackEvents::open(
         config(),
@@ -425,10 +464,10 @@ async fn public_channels_are_dynamic_and_threads_are_channel_specific() {
     let mut reply = envelope("EvD", "unmentioned", Some("1700000000.123456"));
     reply["event"]["channel"] = json!("CNEW");
     ingest(&events, reply).await.unwrap();
-    let state = events.state.lock().await;
+    let state = events.state().await;
     assert_eq!(state.queue.len(), 3);
     assert_eq!(
-        state.subscription.as_ref().unwrap().id,
+        state.subscriptions[0].id,
         subscription["id"].as_str().unwrap()
     );
     let body: Value = serde_json::from_slice(&state.queue[2].body).unwrap();
@@ -464,7 +503,10 @@ async fn inaccessible_channel_does_not_block_other_channels_or_revoke_subscripti
             sender.clone(),
         )
         .unwrap();
-        events.subscribe(&params()).await.unwrap();
+        events
+            .subscribe("existing-client", &params())
+            .await
+            .unwrap();
         ingest(&events, envelope("EvA", "<@U456>", None))
             .await
             .unwrap();
@@ -477,10 +519,10 @@ async fn inaccessible_channel_does_not_block_other_channels_or_revoke_subscripti
         assert_eq!(calls.len(), 2); // verification and accessible C999 only
         let body: Value = serde_json::from_slice(&calls[1].1).unwrap();
         assert_eq!(body["data"]["channel_id"], "C999");
-        let state = events.state.lock().await;
-        assert!(state.subscription.is_some());
+        let state = events.state().await;
+        assert!(!state.subscriptions.is_empty());
         if decision == Access::Denied {
-            assert!(!state.threads.contains_key("C123:1700000000.123456"));
+            assert!(!state.source.threads.contains_key("C123:1700000000.123456"));
         }
     }
 }
@@ -497,13 +539,13 @@ async fn subscription_requires_explicit_public_scope_and_rejects_channel_selecto
     ] {
         let mut request = params();
         request["arguments"] = arguments;
-        assert!(events.subscribe(&request).await.is_err());
+        assert!(events.subscribe("existing-client", &request).await.is_err());
     }
     let mut old_config = serde_json::to_value(config()).unwrap();
     old_config["channel_id"] = json!("C123");
     assert!(serde_json::from_value::<SlackEventsConfig>(old_config).is_err());
     assert_eq!(
-        events.catalog()["events"][0]["inputSchema"]["properties"]["scope"]["enum"][0],
+        events.catalog("")[0]["inputSchema"]["properties"]["scope"]["enum"][0],
         "accessible_public_channels"
     );
 }
@@ -525,7 +567,10 @@ async fn owner_proof_only_accepts_exact_public_human_marker_before_expiry() {
             sender,
         )
         .unwrap();
-        events.subscribe(&params()).await.unwrap();
+        events
+            .subscribe("existing-client", &params())
+            .await
+            .unwrap();
         let marker = "<@U456> PLUG_EVENTS_PROOF_20261003";
         for (i, text) in [
             marker,
@@ -550,8 +595,8 @@ async fn owner_proof_only_accepts_exact_public_human_marker_before_expiry() {
             ingest(&events, event).await.unwrap();
         }
         let expected = usize::from(until.is_some_and(|expiry| expiry > now()));
-        assert_eq!(events.state.lock().await.queue.len(), expected);
-        assert!(events.state.lock().await.threads.is_empty());
+        assert_eq!(events.state().await.queue.len(), expected);
+        assert!(events.state().await.source.threads.is_empty());
     }
 }
 
@@ -560,7 +605,66 @@ fn owner_proof_window_preserves_existing_subscription_storage_key() {
     let baseline = config();
     let mut proof = baseline.clone();
     proof.owner_proof_until = Some(now() + 3600);
-    assert_eq!(state_key(&baseline).unwrap(), state_key(&proof).unwrap());
+    assert_eq!(state_dir(&baseline).unwrap(), state_dir(&proof).unwrap());
     proof.owner_proof_until = Some(now() + 3601);
     assert!(!proof.validate().is_empty());
+}
+
+#[tokio::test]
+async fn an_owner_proof_window_refreshes_and_unsubscribes_the_existing_subscription() {
+    let (dir, original, access, sender) = fixture();
+    let first = original
+        .subscribe("existing-client", &params())
+        .await
+        .unwrap();
+    drop(original);
+    let mut proof = config();
+    proof.owner_proof_until = Some(now() + 3600);
+    let events = SlackEvents::open(
+        proof,
+        "fake-signing-secret".to_owned().into(),
+        &dir.path().join("events"),
+        access,
+        sender,
+    )
+    .unwrap();
+    let refreshed = events
+        .subscribe("existing-client", &params())
+        .await
+        .unwrap();
+    assert_eq!(first["id"], refreshed["id"]);
+    events
+        .unsubscribe("existing-client", &params())
+        .await
+        .unwrap();
+    assert!(events.state().await.subscriptions.is_empty());
+}
+
+#[tokio::test]
+async fn only_the_chosen_client_may_subscribe() {
+    let (_dir, events, _, _) = fixture();
+    let error = events
+        .subscribe("another-client", &params())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, denied().code);
+    assert!(events.state().await.subscriptions.is_empty());
+}
+
+#[tokio::test]
+async fn unknown_access_waits_out_a_backoff_before_asking_again() {
+    let (_dir, events, access, sender) = fixture();
+    events
+        .subscribe("existing-client", &params())
+        .await
+        .unwrap();
+    ingest(&events, envelope("Ev1", "<@U456>", None))
+        .await
+        .unwrap();
+    access.set(Access::Unavailable);
+    events.deliver_one().await.unwrap();
+    let pending = events.state().await.queue[0].clone();
+    assert_eq!(pending.attempts, 1);
+    assert!(pending.next_at > now());
+    assert_eq!(sender.calls.lock().await.len(), 1, "only the challenge");
 }

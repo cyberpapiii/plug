@@ -5,7 +5,7 @@
 //! witness: the connector's parent is the program that launched it, whatever
 //! that program chooses to say.
 
-use plug_core::ipc::ClientHost;
+use plug_core::downstream_identity::ClientHost;
 
 /// Launchers that start a connector on behalf of something else. Their parent
 /// is the program worth naming.
@@ -15,7 +15,7 @@ const WRAPPERS: &[&str] = &["sh", "bash", "zsh", "fish", "dash", "env", "npx", "
 const MAX_HOPS: usize = 6;
 
 /// The host of this process, read once. `None` when the process table cannot
-/// be read; a session without a host is shown as it was before.
+/// be read; a session without a host is shown without one.
 pub(crate) fn current() -> Option<ClientHost> {
     #[cfg(test)]
     return None;
@@ -52,17 +52,6 @@ pub(crate) fn current() -> Option<ClientHost> {
         })
         .clone()
     }
-}
-
-/// The target this connector was linked as, from `plug connect --client`.
-static LINK_TARGET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-
-pub(crate) fn set_link_target(target: Option<String>) {
-    let _ = LINK_TARGET.set(target);
-}
-
-pub(crate) fn link_target() -> Option<String> {
-    LINK_TARGET.get().cloned().flatten()
 }
 
 /// Programs that run something else and say nothing about what. Two clients
@@ -184,12 +173,6 @@ fn script_name(script: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// The host of `pid` in a `ps -axo pid=,ppid=,comm=` listing.
-#[cfg(test)]
-fn host_of(pid: u32, table: &str) -> Option<ClientHost> {
-    find_host(pid, table).map(|(_, executable)| describe(executable))
-}
-
 /// The pid and executable of the program that started `pid`.
 fn find_host(pid: u32, table: &str) -> Option<(u32, &str)> {
     let processes: std::collections::HashMap<u32, (u32, &str)> =
@@ -251,6 +234,11 @@ fn describe(executable: &str) -> ClientHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host of `pid` in a `ps -axo pid=,ppid=,comm=` listing.
+    fn host_of(pid: u32, table: &str) -> Option<ClientHost> {
+        find_host(pid, table).map(|(_, executable)| describe(executable))
+    }
 
     #[test]
     fn a_connector_started_by_an_app_is_hosted_by_that_app() {

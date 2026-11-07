@@ -53,7 +53,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
     }
 
     func testRemovesFormulaOnlyThroughTrustedBrewCommand() async throws {
-        let runner = RecordingProcessRunner { executable, arguments in
+        let runner = StubProcessRunner { executable, arguments in
             if arguments.first == "list" {
                 return ProcessResult(status: 0, stdout: Data("plug 0.6.4\n".utf8), stderr: Data())
             }
@@ -70,7 +70,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
     }
 
     func testFailedBrewUninstallPreservesLegacyFiles() async throws {
-        let runner = RecordingProcessRunner { _, arguments in
+        let runner = StubProcessRunner { _, arguments in
             if arguments.first == "list" {
                 return ProcessResult(status: 0, stdout: Data("plug 0.6.4\n".utf8), stderr: Data())
             }
@@ -92,7 +92,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
     /// Without a keg under brew's prefix there is no formula, so brew is not
     /// run at all. Each call costs about a second, more at login.
     func testBrewIsNotAskedWhenNoFormulaKegExists() async throws {
-        let runner = RecordingProcessRunner { _, _ in
+        let runner = StubProcessRunner { _, _ in
             ProcessResult(status: 0, stdout: Data("plug 0.6.4\n".utf8), stderr: Data())
         }
         let fixture = try Fixture(runner: runner)
@@ -107,7 +107,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
 
     /// A keg reached through `opt/plug` alone still sends the question to brew.
     func testOptLinkAloneStillAsksBrew() async throws {
-        let runner = RecordingProcessRunner { _, arguments in
+        let runner = StubProcessRunner { _, arguments in
             ProcessResult(
                 status: 0,
                 stdout: Data(arguments.first == "list" ? "plug 0.6.4\n".utf8 : "".utf8),
@@ -130,7 +130,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
     }
 
     func testFormulaMustBeRemovedBeforeShellLinkRepair() async throws {
-        let runner = RecordingProcessRunner { _, arguments in
+        let runner = StubProcessRunner { _, arguments in
             if arguments.first == "list" {
                 return ProcessResult(status: 0, stdout: Data("plug 0.6.4\n".utf8), stderr: Data())
             }
@@ -148,7 +148,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
     }
 
     func testUnprovenCargoBinaryIsNeverExecutedOrDeleted() async throws {
-        let runner = RecordingProcessRunner { _, _ in
+        let runner = StubProcessRunner { _, _ in
             ProcessResult(status: 0, stdout: Data("plug 0.7.0\n".utf8), stderr: Data())
         }
         let fixture = try Fixture(runner: runner)
@@ -163,8 +163,6 @@ final class LegacyInstallMigratorTests: XCTestCase {
 
     func testCargoBinaryIsRetainedUntilExactProofThenDeleted() async throws {
         let identity = LegacyBinaryIdentity(
-            identifier: "plug",
-            teamID: AppInstallationInspector.teamID,
             sha256: "legacy-digest"
         )
         let fixture = try Fixture(
@@ -179,50 +177,28 @@ final class LegacyInstallMigratorTests: XCTestCase {
         XCTAssertEqual(snapshot.cargoBinary, fixture.cargo)
         XCTAssertEqual(snapshot.cargoBinaryIdentity, identity)
 
-        try await fixture.migrator.removeVerifiedCargoBinary(
-            snapshot,
-            proof: ReconciliationProof(
-                appVersion: "0.7.0",
-                embeddedVersion: "0.7.0",
-                daemonVersion: "0.6.4",
-                shellTarget: fixture.canonical.executableURL,
-                daemonExecutable: fixture.canonical.executableURL,
-                appManaged: true
-            )
-        )
-        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.cargo.path))
+        // A daemon of another version, or a shell command that runs something
+        // else, proves nothing, so there is no proof to remove the copy with.
+        XCTAssertNil(OwnDaemonProof(
+            app: fixture.canonical,
+            handshake: makeTestHandshake(version: "0.6.4", executable: fixture.canonical.executableURL),
+            shellLink: .canonical(fixture.canonical.executableURL)
+        ))
+        XCTAssertNil(OwnDaemonProof(
+            app: fixture.canonical,
+            handshake: makeTestHandshake(version: "0.7.0", executable: fixture.canonical.executableURL),
+            shellLink: .canonical(URL(fileURLWithPath: "/tmp/plug"))
+        ))
 
         try await fixture.migrator.removeVerifiedCargoBinary(
             snapshot,
-            proof: ReconciliationProof(
-                appVersion: "0.7.0",
-                embeddedVersion: "0.7.0",
-                daemonVersion: "0.7.0",
-                shellTarget: URL(fileURLWithPath: "/tmp/plug"),
-                daemonExecutable: fixture.canonical.executableURL,
-                appManaged: true
-            )
-        )
-        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.cargo.path))
-
-        try await fixture.migrator.removeVerifiedCargoBinary(
-            snapshot,
-            proof: ReconciliationProof(
-                appVersion: "0.7.0",
-                embeddedVersion: "0.7.0",
-                daemonVersion: "0.7.0",
-                shellTarget: fixture.canonical.executableURL,
-                daemonExecutable: fixture.canonical.executableURL,
-                appManaged: true
-            )
+            proof: fixture.proof
         )
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.cargo.path))
     }
 
     func testCargoReplacementAfterInspectionIsNeverDeleted() async throws {
         let identity = LegacyBinaryIdentity(
-            identifier: "plug",
-            teamID: AppInstallationInspector.teamID,
             sha256: "legacy-digest"
         )
         let fixture = try Fixture(
@@ -238,14 +214,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
 
         try await fixture.migrator.removeVerifiedCargoBinary(
             snapshot,
-            proof: ReconciliationProof(
-                appVersion: "0.7.0",
-                embeddedVersion: "0.7.0",
-                daemonVersion: "0.7.0",
-                shellTarget: fixture.canonical.executableURL,
-                daemonExecutable: fixture.canonical.executableURL,
-                appManaged: true
-            )
+            proof: fixture.proof
         )
 
         XCTAssertEqual(try String(contentsOf: fixture.cargo, encoding: .utf8), "unknown replacement")
@@ -253,8 +222,6 @@ final class LegacyInstallMigratorTests: XCTestCase {
 
     func testCargoDirectoryReplacementAfterIdentityCheckIsPreserved() async throws {
         let identity = LegacyBinaryIdentity(
-            identifier: "plug",
-            teamID: AppInstallationInspector.teamID,
             sha256: "legacy-digest"
         )
         let fixture = try Fixture(
@@ -280,14 +247,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
         do {
             try await fixture.migrator.removeVerifiedCargoBinary(
                 snapshot,
-                proof: ReconciliationProof(
-                    appVersion: "0.7.0",
-                    embeddedVersion: "0.7.0",
-                    daemonVersion: "0.7.0",
-                    shellTarget: fixture.canonical.executableURL,
-                    daemonExecutable: fixture.canonical.executableURL,
-                    appManaged: true
-                )
+                proof: fixture.proof
             )
             XCTFail("Expected replacement directory to fail closed")
         } catch let error as LegacyInstallError {
@@ -306,25 +266,6 @@ final class LegacyInstallMigratorTests: XCTestCase {
     }
 }
 
-private actor RecordingProcessRunner: ProcessRunning {
-    struct Call: Sendable {
-        let executable: URL
-        let arguments: [String]
-    }
-
-    private(set) var calls: [Call] = []
-    private let handler: @Sendable (URL, [String]) -> ProcessResult
-
-    init(handler: @escaping @Sendable (URL, [String]) -> ProcessResult) {
-        self.handler = handler
-    }
-
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
-        calls.append(Call(executable: executable, arguments: arguments))
-        return handler(executable, arguments)
-    }
-}
-
 private final class Fixture {
     let root: URL
     let home: URL
@@ -333,9 +274,17 @@ private final class Fixture {
     let brew: URL
     let canonical: VerifiedAppInstallation
     let migrator: LegacyInstallMigrator
+    /// The app's own daemon answering, with the shell command linked to it.
+    var proof: OwnDaemonProof {
+        OwnDaemonProof(
+            app: canonical,
+            handshake: makeTestHandshake(version: canonical.appVersion, executable: canonical.executableURL),
+            shellLink: .canonical(canonical.executableURL)
+        )!
+    }
 
     init(
-        runner: any ProcessRunning = RecordingProcessRunner { _, _ in
+        runner: any ProcessRunning = StubProcessRunner { _, _ in
             ProcessResult(status: 1, stdout: Data(), stderr: Data())
         },
         identityReader: @escaping @Sendable (URL) -> LegacyBinaryIdentity? = { _ in nil },
@@ -348,14 +297,7 @@ private final class Fixture {
         brew = root.appending(path: "trusted/brew")
         let app = root.appending(path: "Applications/Plug.app")
         let executable = app.appending(path: "Contents/Resources/plug")
-        canonical = VerifiedAppInstallation(
-            bundleURL: app,
-            executableURL: executable,
-            appVersion: "0.7.0",
-            buildVersion: "20",
-            embeddedVersion: "0.7.0",
-            teamID: "HJF7LN64XX"
-        )
+        canonical = makeTestInstallation(bundle: app)
         try FileManager.default.createDirectory(at: shellLink.deletingLastPathComponent(), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: cargo.deletingLastPathComponent(), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)

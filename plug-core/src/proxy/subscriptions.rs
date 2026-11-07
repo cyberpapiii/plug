@@ -1,7 +1,9 @@
 use super::*;
 
+use super::completion::resolve_resource_route;
 use dashmap::Entry as DashEntry;
 use tokio::sync::watch;
+use tokio_util::task::TaskTracker;
 
 /// Per-URI resource subscription registry with atomic subscribe/unsubscribe
 /// transitions across the upstream MCP call.
@@ -28,9 +30,8 @@ use tokio::sync::watch;
 ///   is still `Pending` on its own generation — a `Draining` marker set
 ///   mid-flight belongs to the queued drain and is never overwritten.
 /// - Every upstream `subscribe`/`unsubscribe` transition runs inside a task
-///   spawned detached from the calling request (via `Engine::tracker()`,
-///   falling back to a raw `tokio::spawn` if no engine reference is
-///   available yet or it is tearing down) so that cancelling/dropping the
+///   spawned detached from the calling request (on the runtime's
+///   `TaskTracker`) so that cancelling/dropping the
 ///   caller's future can never leave the per-URI transition lock held
 ///   forever or abandon an upstream call mid-flight.
 /// - Every MCP `resources/subscribe` and `resources/unsubscribe` call in
@@ -38,18 +39,14 @@ use tokio::sync::watch;
 ///   call `Peer::subscribe`/`Peer::unsubscribe` directly.
 pub(super) struct SubscriptionRegistry {
     entries: DashMap<String, Entry>,
-    /// Persistent per-URI async mutex serializing upstream transitions.
-    /// Entries here are never pruned — the plan calls this out explicitly:
-    /// the cardinality is bounded by distinct resource URIs ever subscribed
-    /// to, which is small relative to a long-running daemon's lifetime, and
-    /// removing them safely would require its own generation-matched
-    /// protocol for no real benefit.
+    /// Persistent per-URI async mutex serializing upstream transitions,
+    /// each bounded by its server's call timeout. Entries are never pruned:
+    /// there is one per distinct URI ever subscribed to, and removing one
+    /// safely would need its own generation-matched protocol.
     transition_locks: DashMap<String, Arc<Mutex<()>>>,
     next_generation: AtomicU64,
-    /// Weak reference to Engine, used to spawn transitions on its
-    /// `TaskTracker` so they participate in ordered shutdown. Set once via
-    /// `set_engine()`, mirroring `ToolRouter::engine`.
-    engine: std::sync::RwLock<Option<Weak<Engine>>>,
+    /// Where transitions are spawned, so shutdown waits for them.
+    tracker: TaskTracker,
     /// Resolves a server id to its current upstream handle at drain time.
     /// Set once via `set_owner_resolver()` (production: a
     /// `ServerManager::get_upstream` lookup). Drains prefer the entry's
@@ -196,28 +193,26 @@ impl UpstreamResourceOps for crate::server::UpstreamServer {
         &'a self,
         uri: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), McpError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.client
-                .peer()
-                .subscribe(SubscribeRequestParams::new(
-                    skills::inward(&self.name, uri).into_owned(),
-                ))
-                .await
-                .map_err(map_service_error)
-        })
+        Box::pin(answer_within(
+            upstream_call_timeout(self),
+            self.client.peer().subscribe(SubscribeRequestParams::new(
+                skills::inward(&self.name, uri).into_owned(),
+            )),
+        ))
     }
 
     fn unsubscribe_resource<'a>(
         &'a self,
         uri: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), McpError>> + Send + 'a>> {
-        Box::pin(async move {
+        Box::pin(answer_within(
+            upstream_call_timeout(self),
             self.client
                 .peer()
-                .unsubscribe(make_unsubscribe_params(&skills::inward(&self.name, uri)))
-                .await
-                .map_err(map_service_error)
-        })
+                .unsubscribe(UnsubscribeRequestParams::new(
+                    skills::inward(&self.name, uri).into_owned(),
+                )),
+        ))
     }
 }
 
@@ -229,18 +224,6 @@ pub(super) fn as_upstream_ops(
     upstream: Arc<crate::server::UpstreamServer>,
 ) -> Arc<dyn UpstreamResourceOps> {
     upstream
-}
-
-fn map_service_error(error: rmcp::service::ServiceError) -> McpError {
-    match error {
-        rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
-        other => McpError::internal_error(other.to_string(), None),
-    }
-}
-
-fn make_unsubscribe_params(uri: &str) -> UnsubscribeRequestParams {
-    serde_json::from_value::<UnsubscribeRequestParams>(serde_json::json!({ "uri": uri }))
-        .expect("UnsubscribeRequestParams from known-good JSON")
 }
 
 /// Outcome of classifying an existing registry entry against an old/new
@@ -276,12 +259,10 @@ pub(super) enum RebindSkipReason {
     NewOwnerNoSubscribeSupport,
 }
 
-/// Which caller triggered a drain transition — controls whether/how a
-/// failed upstream unsubscribe gets logged, matching the pre-existing
-/// per-call-site behavior exactly.
+/// Which caller triggered a drain transition, which decides whether a
+/// failed upstream unsubscribe gets logged.
 enum DrainOrigin {
-    /// Last downstream member unsubscribed normally. Historically silent on
-    /// failure (`let _ = ...await;`) — best effort, no log.
+    /// Last downstream member unsubscribed normally. Best effort, no log.
     Unsubscribe,
     /// Downstream target disconnected; cleanup swept its subscriptions.
     Cleanup,
@@ -290,23 +271,15 @@ enum DrainOrigin {
 }
 
 impl SubscriptionRegistry {
-    pub(super) fn new() -> Arc<Self> {
+    pub(super) fn new(tracker: TaskTracker) -> Arc<Self> {
         Arc::new(Self {
             entries: DashMap::new(),
             transition_locks: DashMap::new(),
             next_generation: AtomicU64::new(0),
-            engine: std::sync::RwLock::new(None),
+            tracker,
             owner_resolver: std::sync::RwLock::new(None),
             post_confirm_hook: std::sync::RwLock::new(None),
         })
-    }
-
-    pub(super) fn set_engine(&self, engine: Weak<Engine>) {
-        let mut guard = self
-            .engine
-            .write()
-            .expect("engine RwLock poisoned — prior panic");
-        *guard = Some(engine);
     }
 
     pub(super) fn set_owner_resolver(&self, resolver: OwnerResolver) {
@@ -342,7 +315,7 @@ impl SubscriptionRegistry {
     /// Pick the upstream handle a drain (or a rebind's old-owner
     /// unsubscribe) should use: the entry's recorded owner resolved through
     /// `owner_resolver` when both exist, otherwise the caller-supplied
-    /// fallback (historically resolved from the live route cache). A
+    /// fallback, resolved from the live route cache. A
     /// recorded owner that no longer resolves means the owning connection
     /// is gone — there is nothing to unsubscribe, and falling back to a
     /// route-resolved handle would target the wrong server.
@@ -357,13 +330,6 @@ impl SubscriptionRegistry {
             return resolver(owner_id);
         }
         fallback
-    }
-
-    fn upgrade_engine(&self) -> Option<Arc<Engine>> {
-        self.engine
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().and_then(|weak| weak.upgrade()))
     }
 
     /// Number of resource URIs currently tracked (any state), matching what
@@ -448,15 +414,7 @@ impl SubscriptionRegistry {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        if let Some(engine) = self.upgrade_engine() {
-            engine.tracker().spawn(fut);
-        } else {
-            // No engine reference yet (bare registry in unit tests) or the
-            // engine is already tearing down — fall back to a raw detached
-            // task so the transition still completes and any waiter on the
-            // watch channel doesn't hang forever.
-            tokio::spawn(fut);
-        }
+        self.tracker.spawn(fut);
     }
 
     async fn await_transition(mut rx: watch::Receiver<TransitionSignal>) -> Result<(), McpError> {
@@ -801,8 +759,7 @@ impl SubscriptionRegistry {
 
     /// Remove `target` from every URI it's subscribed to (disconnect
     /// cleanup). `resolve` maps a URI to its current upstream handle, called
-    /// synchronously per-URI under this pass (mirrors the historical
-    /// `cache.load()` + route lookup done inline in the old `retain`).
+    /// synchronously per URI under this pass.
     pub(super) async fn cleanup_target(
         self: &Arc<Self>,
         target: &NotificationTarget,
@@ -883,11 +840,7 @@ impl SubscriptionRegistry {
             };
             if let Err(error) = &call_result {
                 match &origin {
-                    DrainOrigin::Unsubscribe => {
-                        // Matches historical behavior: a failed best-effort
-                        // upstream unsubscribe on normal last-member
-                        // departure was never logged.
-                    }
+                    DrainOrigin::Unsubscribe => {}
                     DrainOrigin::Cleanup => {
                         tracing::warn!(
                             uri = %uri,
@@ -957,8 +910,8 @@ impl SubscriptionRegistry {
     /// every later refresh and never reconcile it. Entries whose owner is
     /// not yet confirmed (`None`, transition in flight) keep the plain
     /// route-diff behavior — no false rebinds for in-flight subscribes.
-    /// Route-vanished URIs prune exactly as before; the drain resolves the
-    /// recorded owner itself.
+    /// Route-vanished URIs prune; the drain resolves the recorded owner
+    /// itself.
     pub(super) fn classify_route_changes(
         &self,
         old_routes: &HashMap<String, String>,
@@ -967,11 +920,11 @@ impl SubscriptionRegistry {
         let mut out = Vec::new();
         for item in self.entries.iter() {
             let uri = item.key();
-            match new_routes.get(uri) {
+            match resolve_resource_route(new_routes, uri) {
                 Some(new_server_id) => {
                     let old_side = match &item.value().owner_server_id {
-                        Some(owner) => Some(owner),
-                        None => old_routes.get(uri),
+                        Some(owner) => Some(owner.clone()),
+                        None => resolve_resource_route(old_routes, uri),
                     };
                     if let Some(old_server_id) = old_side
                         && old_server_id != new_server_id
@@ -984,10 +937,10 @@ impl SubscriptionRegistry {
                         );
                         out.push(RouteReconciliation::Rebind {
                             uri: uri.clone(),
-                            old_server_id: old_server_id.clone(),
-                            new_server_id: new_server_id.clone(),
+                            old_server_id,
+                            new_server_id,
                         });
-                    } else if self.owner_connection_is_stale(item.value(), new_server_id) {
+                    } else if self.owner_connection_is_stale(item.value(), &new_server_id) {
                         tracing::debug!(
                             uri = %uri,
                             server = %new_server_id,
@@ -995,11 +948,11 @@ impl SubscriptionRegistry {
                         );
                         out.push(RouteReconciliation::Resubscribe {
                             uri: uri.clone(),
-                            server_id: new_server_id.clone(),
+                            server_id: new_server_id,
                         });
                     }
                 }
-                None => match old_routes.get(uri) {
+                None => match resolve_resource_route(old_routes, uri) {
                     Some(old_server_id) => {
                         tracing::debug!(
                             uri = %uri,
@@ -1007,7 +960,7 @@ impl SubscriptionRegistry {
                         );
                         out.push(RouteReconciliation::Prune {
                             uri: uri.clone(),
-                            old_server_id: Some(old_server_id.clone()),
+                            old_server_id: Some(old_server_id),
                         });
                     }
                     None => {
@@ -1028,9 +981,8 @@ impl SubscriptionRegistry {
 
     /// Execute a prune decision from `classify_route_changes`. Drains the
     /// entry (if it's still there — a concurrent unsubscribe may have
-    /// already removed it) and awaits completion, matching the historical
-    /// ordering of stale-unsubscribes running before the new snapshot is
-    /// published.
+    /// already removed it) and awaits completion, so stale unsubscribes run
+    /// before the new snapshot is published.
     pub(super) async fn prune(
         self: &Arc<Self>,
         uri: &str,
@@ -1081,8 +1033,7 @@ impl SubscriptionRegistry {
     /// subscribed.
     ///
     /// Awaits completion so `refresh_tools`'s own await reflects final
-    /// state, matching historical synchronous-return semantics, and
-    /// returns the transition's outcome: `Err` when the migration failed
+    /// state, and returns the transition's outcome: `Err` when the migration failed
     /// and pruned the entry's local subscribers. Equivalent concurrent
     /// rebinds to the same destination piggyback on one generation and
     /// therefore receive the same authoritative outcome. A genuinely newer
@@ -1365,7 +1316,12 @@ impl SubscriptionRegistry {
     /// Test-only: lets `proxy::tests` exercise notification fan-out
     /// (`route_upstream_resource_updated`) without a real upstream call.
     #[cfg(test)]
-    pub(super) fn insert_active_for_test(&self, uri: &str, target: NotificationTarget) {
+    pub(super) fn insert_active_for_test(
+        &self,
+        uri: &str,
+        owner: Option<&str>,
+        target: NotificationTarget,
+    ) {
         if let Some(mut entry) = self.entries.get_mut(uri) {
             entry.members.insert(target);
             return;
@@ -1379,7 +1335,7 @@ impl SubscriptionRegistry {
                 generation,
                 members,
                 state: EntryState::Active,
-                owner_server_id: None,
+                owner_server_id: owner.map(str::to_string),
                 owner_connection_generation: None,
             },
         );
@@ -1404,11 +1360,8 @@ impl super::ToolRouter {
         client_key: Option<&str>,
     ) -> Result<(), McpError> {
         let snapshot = self.cache.load();
-        let server_id = snapshot
-            .resource_routes
-            .get(uri)
+        let server_id = resolve_resource_route(&snapshot.resource_routes, uri)
             .filter(|server_id| self.client_may_use_all_of_server(client_key, server_id))
-            .cloned()
             .ok_or_else(|| {
                 McpError::from(ProtocolError::InvalidRequest {
                     detail: format!("resource not found: {uri}"),
@@ -1458,7 +1411,7 @@ impl super::ToolRouter {
         // refresh's prune plus the entry's recorded owner already drain
         // routeless entries.
         let recorded_owner = self.resource_subscriptions.owner_snapshot(uri).flatten();
-        let published_route = self.cache.load().resource_routes.get(uri).cloned();
+        let published_route = resolve_resource_route(&self.cache.load().resource_routes, uri);
         let heal_outcome = match (&recorded_owner, &published_route) {
             (Some(owner), Some(route)) if owner != route => {
                 tracing::debug!(
@@ -1525,7 +1478,7 @@ impl super::ToolRouter {
     ) -> Result<(), McpError> {
         let route_server_id = {
             let snapshot = self.cache.load();
-            snapshot.resource_routes.get(uri).cloned()
+            resolve_resource_route(&snapshot.resource_routes, uri)
         };
 
         if route_server_id.is_none() && !self.resource_subscriptions.has_entry(uri) {
@@ -1550,16 +1503,13 @@ impl super::ToolRouter {
     ///
     /// Iterates all subscription entries and removes the target. When a URI
     /// transitions from 1 → 0 subscribers, forwards `unsubscribe` upstream.
-    pub async fn cleanup_subscriptions_for_target(&self, target: &NotificationTarget) {
+    pub(crate) async fn cleanup_subscriptions_for_target(&self, target: &NotificationTarget) {
         // Route-resolved handles are only fallbacks: each drain prefers the
         // entry's recorded owner at drain time.
         self.resource_subscriptions
             .cleanup_target(target, |uri| {
                 let snapshot = self.cache.load();
-                snapshot
-                    .resource_routes
-                    .get(uri)
-                    .cloned()
+                resolve_resource_route(&snapshot.resource_routes, uri)
                     .and_then(|server_id| self.server_manager.get_upstream(&server_id))
                     .map(as_upstream_ops)
             })
@@ -1574,25 +1524,38 @@ impl super::ToolRouter {
         }
     }
 
-    /// Route an upstream resource-updated notification to subscribed downstream clients.
-    pub(crate) fn route_upstream_resource_updated(&self, params: ResourceUpdatedNotificationParam) {
+    /// Route `server`'s resource-updated notification to the clients
+    /// subscribed to that resource. Only the server that holds the resource
+    /// may say it changed; a notice about anyone else's is dropped.
+    pub(crate) fn route_upstream_resource_updated(
+        &self,
+        server: &str,
+        params: ResourceUpdatedNotificationParam,
+    ) {
         let Some(subscribers) = self.resource_subscriptions.members_snapshot(&params.uri) else {
             return;
         };
+        let owner = self
+            .resource_subscriptions
+            .owner_snapshot(&params.uri)
+            .flatten()
+            .or_else(|| resolve_resource_route(&self.cache.load().resource_routes, &params.uri));
+        if owner.as_deref() != Some(server) {
+            tracing::debug!(
+                server,
+                uri = %params.uri,
+                owner = ?owner,
+                "dropped resources/updated for a resource another server holds"
+            );
+            return;
+        }
 
         // A client kept from this server after it subscribed hears nothing
         // more from it. The subscription itself stays, so lifting the block
         // brings the updates back without the client subscribing again.
-        let server_id = self
-            .resource_subscriptions
-            .owner_snapshot(&params.uri)
-            .flatten()
-            .or_else(|| self.cache.load().resource_routes.get(&params.uri).cloned());
-
         for target in subscribers {
-            if let Some(server_id) = &server_id
-                && let Some(client_key) = self.subscriber_client_keys.get(&target)
-                && !self.client_may_use_all_of_server(Some(client_key.as_str()), server_id)
+            if let Some(client_key) = self.subscriber_client_keys.get(&target)
+                && !self.client_may_use_all_of_server(Some(client_key.as_str()), server)
             {
                 continue;
             }
@@ -1783,7 +1746,7 @@ mod tests {
     }
 
     fn client(id: &str) -> NotificationTarget {
-        NotificationTarget::Stdio {
+        NotificationTarget::Ipc {
             client_id: Arc::from(id),
         }
     }
@@ -1794,7 +1757,7 @@ mod tests {
 
     #[tokio::test]
     async fn piggy_backer_during_failed_first_subscribe_gets_error() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_closed_subscribe_gate();
         mock.set_subscribe_result(Err(some_error()));
 
@@ -1832,7 +1795,7 @@ mod tests {
 
     #[tokio::test]
     async fn piggy_backer_during_successful_first_subscribe_gets_ok() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_closed_subscribe_gate();
 
         let entered = mock.subscribe_entered.notified();
@@ -1866,7 +1829,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_during_drain_waits_for_unsubscribe() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_closed_unsubscribe_gate();
 
         // A subscribes successfully first (subscribe gate is open, completes
@@ -1927,7 +1890,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsubscribe_last_client_calls_upstream_once() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::new();
 
         registry
@@ -1964,7 +1927,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_during_subscribe_uses_drain_generation() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_closed_unsubscribe_gate();
 
         registry
@@ -2037,7 +2000,7 @@ mod tests {
 
     #[tokio::test]
     async fn last_member_leaving_during_pending_subscribe_drains_after_subscribe() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_closed_subscribe_gate();
 
         let entered = mock.subscribe_entered.notified();
@@ -2084,7 +2047,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_during_pending_subscribe_prevents_transient_active_piggyback() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_gates(false, false);
 
         let entered_sub = mock.subscribe_entered.notified();
@@ -2159,7 +2122,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_subscriber_cancelled_transition_still_completes() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_closed_subscribe_gate();
 
         let entered = mock.subscribe_entered.notified();
@@ -2196,7 +2159,7 @@ mod tests {
 
     #[tokio::test]
     async fn last_unsubscriber_cancelled_mid_flight_then_new_subscriber() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_closed_unsubscribe_gate();
 
         registry
@@ -2242,7 +2205,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebind_serializes_against_downstream_transitions() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let old_mock = MockUpstream::new();
         let new_mock = MockUpstream::with_closed_subscribe_gate();
 
@@ -2311,7 +2274,7 @@ mod tests {
     /// migration failed and removed the entry.
     #[tokio::test]
     async fn equivalent_concurrent_rebinds_share_authoritative_failure() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let old_mock = MockUpstream::new();
         let new_mock = MockUpstream::new();
         new_mock.set_subscribe_result(Err(some_error()));
@@ -2379,7 +2342,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebind_of_emptied_entry_drains_old_owner_instead_of_reviving() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let old_mock = MockUpstream::new();
         let new_mock = MockUpstream::new();
 
@@ -2451,7 +2414,7 @@ mod tests {
     /// entry gone and never touch the new owner.
     #[tokio::test]
     async fn drain_prefers_recorded_owner_over_route_resolved_fallback() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let old_mock = MockUpstream::new();
         let new_mock = MockUpstream::new();
 
@@ -2527,7 +2490,7 @@ mod tests {
     /// the old owner instead of silently leaking the upstream subscription.
     #[tokio::test]
     async fn racing_subscribe_during_prune_records_owner_for_routeless_drain() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_closed_unsubscribe_gate();
 
         let resolver_mock = Arc::clone(&mock);
@@ -2611,7 +2574,7 @@ mod tests {
     /// first poll.
     #[tokio::test]
     async fn different_owner_supersede_releases_the_displaced_upstream() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let s1 = MockUpstream::new();
         let s2 = MockUpstream::new();
 
@@ -2678,7 +2641,7 @@ mod tests {
     /// gain. One redundant `subscribe` is the accepted cost.
     #[tokio::test]
     async fn same_owner_supersede_does_not_release_the_upstream() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::new();
 
         let resolver_mock = Arc::clone(&mock);
@@ -2721,7 +2684,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_subscribe_unsubscribe_smoke() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::new();
         let uri = "file:///smoke";
 
@@ -2753,21 +2716,11 @@ mod tests {
         assert!(registry.is_empty());
     }
 
-    #[test]
-    fn test_only_seed_helper_marks_entry_active() {
-        let registry = SubscriptionRegistry::new();
-        assert!(registry.is_empty());
-        registry.insert_active_for_test("file:///seed", client("seed"));
-        assert_eq!(registry.len(), 1);
-        let members = registry.members_snapshot("file:///seed").unwrap();
-        assert!(members.contains(&client("seed")));
-    }
-
     /// Seeds a registry with one entry for `uri` whose recorded owner is
     /// confirmed as `owner` (via a real subscribe transition against a
     /// mock upstream).
     async fn registry_with_confirmed_owner(uri: &str, owner: &str) -> Arc<SubscriptionRegistry> {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::new();
         registry
             .subscribe(
@@ -2789,7 +2742,7 @@ mod tests {
         uri: &str,
         owner: &str,
     ) -> (Arc<SubscriptionRegistry>, Arc<MockUpstream>) {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::new();
         let resolver_mock = Arc::clone(&mock);
         let owner_id = owner.to_string();
@@ -2878,7 +2831,7 @@ mod tests {
     /// returns success for a subscription that no upstream is holding.
     #[tokio::test]
     async fn subscribe_after_reconnect_does_not_short_circuit_on_active() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::new();
         registry
             .subscribe(
@@ -2915,7 +2868,7 @@ mod tests {
     /// piggybacking subscribe into a redundant upstream round trip.
     #[tokio::test]
     async fn subscribe_on_a_live_connection_still_short_circuits() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::new();
         registry
             .subscribe(
@@ -2976,9 +2929,9 @@ mod tests {
     /// rebinds for in-flight subscribes.
     #[test]
     fn classify_unconfirmed_owner_with_unchanged_route_produces_nothing() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         // Seed helper records no owner (owner_server_id: None).
-        registry.insert_active_for_test("file:///x", client("a"));
+        registry.insert_active_for_test("file:///x", None, client("a"));
 
         let routes = HashMap::from([("file:///x".to_string(), "server-b".to_string())]);
         let items = registry.classify_route_changes(&routes, &routes);
@@ -2990,9 +2943,8 @@ mod tests {
     }
 
     /// Routeless-entry-gains-route-elsewhere variant: recorded owner A, no
-    /// route in the old snapshot, new snapshot routes the URI to C. The
-    /// old None arm used to do nothing unless the new snapshot ALSO lacked
-    /// the URI; it must now emit exactly one Rebind{A -> C}.
+    /// route in the old snapshot, new snapshot routes the URI to C. It
+    /// must emit exactly one Rebind{A -> C}.
     #[tokio::test]
     async fn classify_rebinds_routeless_entry_gaining_route_elsewhere() {
         let registry = registry_with_confirmed_owner("file:///x", "server-a").await;
@@ -3018,7 +2970,7 @@ mod tests {
 
     /// Guard for the untouched arms: a confirmed owner whose URI matches
     /// the new route produces nothing (heal already complete), and a
-    /// route-vanished URI still prunes exactly as before.
+    /// route-vanished URI still prunes.
     #[tokio::test]
     async fn classify_owner_matching_new_route_produces_nothing_and_vanished_prunes() {
         let registry = registry_with_confirmed_owner("file:///x", "server-b").await;

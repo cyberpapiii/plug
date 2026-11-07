@@ -397,6 +397,12 @@ impl ServerHandler for MockServer {
                 .into());
             }
 
+            if request.name == "tool_error" {
+                return Ok(
+                    CallToolResult::error(vec![ContentBlock::text("the tool failed")]).into(),
+                );
+            }
+
             if request.name == "resource_link" {
                 return Ok(CallToolResult::success(vec![ContentBlock::resource_link(
                     Resource::new("file:///tmp/mock-resource.txt", "mock-resource.txt")

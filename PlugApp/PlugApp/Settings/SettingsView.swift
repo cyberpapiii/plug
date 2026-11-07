@@ -1,5 +1,4 @@
 import AppKit
-import ServiceManagement
 import SwiftUI
 import UserNotifications
 
@@ -14,15 +13,16 @@ struct SettingsView: View {
 
     // The login item lives in macOS, not in this app's defaults, so the toggle
     // starts from what macOS last said and the task below asks again.
-    @State private var loginItems = LoginItems.last
+    @State private var loginItems = Self.lastLoginItems
+    /// The first answer is read as the app opens, so the page never opens
+    /// showing a guess.
+    @MainActor private static var lastLoginItems = LoginItems.read()
     @AppStorage(NotificationService.preferenceKey) private var notify = false
     @State private var loginItemFailed = false
     /// Goes up when the switch is used, so an answer asked for before then
     /// does not undo it.
     @State private var loginItemEdits = 0
     @State private var notificationsDenied = false
-    // This page is made when the app opens, and reading this is what starts
-    // the updater then. Keep it here.
     @State private var automaticUpdates = UpdateService.shared.checksAutomatically
     @State private var keepsInMenuBar = MenuBarPresence.standard.keeps
     @State private var notifications = SystemAllowance.notAsked
@@ -52,7 +52,7 @@ struct SettingsView: View {
                 if windowOpen {
                     PlugHeadline(model: model, run: run)
                 } else {
-                    Color.clear.frame(height: 40)
+                    Color.clear.frame(height: PlugHeadline.characterSize)
                 }
             }
             plug
@@ -292,7 +292,7 @@ struct SettingsView: View {
         // Something newer has been asked for, and its answer is on the way.
         guard !Task.isCancelled else { return }
         if edits == loginItemEdits {
-            LoginItems.last = items
+            Self.lastLoginItems = items
             if items != loginItems { loginItems = items }
             if items.opensAtLogin, loginItemFailed { loginItemFailed = false }
         }
@@ -345,30 +345,6 @@ struct SettingsView: View {
 
     private func passingChecksTitle(in report: CheckupReport) -> String {
         report.checkup.isClean ? "Details" : "\(report.passed.count) passed"
-    }
-}
-
-/// What macOS says about Plug opening at login and running in the
-/// background. Asking is a round trip to another process each time, so the
-/// last answer is kept and a new one is asked for off the main thread.
-private struct LoginItems: Equatable, Sendable {
-    var opensAtLogin: Bool
-    var background: SystemAllowance
-    var login: SystemAllowance
-
-    /// The last answer. The first is read as the app opens, so the page
-    /// never opens showing a guess.
-    @MainActor static var last = read()
-
-    /// The background item is the daemon's job, under the name
-    /// `DaemonServiceManager` registers it with.
-    static func read() -> LoginItems {
-        let app = SMAppService.mainApp.status
-        return LoginItems(
-            opensAtLogin: app == .enabled,
-            background: SystemAllowance(SMAppService.agent(plistName: "com.plug.daemon.plist").status),
-            login: SystemAllowance(app)
-        )
     }
 }
 
@@ -446,57 +422,57 @@ private struct ServiceStatusRow: View {
     let animates: Bool
 
     var body: some View {
-        if model.serviceEnabled {
+        let runtime = model.situation.runtime
+        if runtime != .off {
             LabeledContent("Status") {
                 HStack(spacing: Metric.tight) {
-                    if serviceIsSettling, animates {
+                    if Self.isSettling(runtime), animates {
                         WaitingDots()
                     } else {
-                        PlugIcon(serviceIcon)
-                            .foregroundStyle(serviceColor)
+                        PlugIcon(Self.icon(runtime))
+                            .foregroundStyle(Self.color(runtime))
                     }
-                    Text(serviceStatus)
+                    Text(Self.status(runtime))
                     Button("Restart") { run(.restartService) }
                         .help("Reconnects every server. Clients pick Plug back up on their own.")
-                        .disabled(model.isRestartingService || model.isChangingService)
+                        .disabled(runtime == .restarting || model.gate.isChangingService)
                 }
             }
         }
     }
 
-    /// Only read while Plug is on; the Status row is hidden when it is off.
-    private var serviceIsSettling: Bool {
-        if model.isRestartingService { return true }
-        switch model.connectionState {
-        case .connecting, .reconnecting: return true
-        case .ready, .incompatible, .disconnected: return false
+    private static func isSettling(_ runtime: PlugSituation.Runtime) -> Bool {
+        switch runtime {
+        case .starting, .reconnecting, .restarting: true
+        case .running, .versionMismatch, .stopped, .off: false
         }
     }
 
-    private var serviceStatus: String {
-        if model.isRestartingService { return "Restarting" }
-        switch model.connectionState {
-        case .ready: return "Running"
-        case .connecting: return "Connecting"
-        case .reconnecting: return "Reconnecting"
-        case .incompatible: return "Restart needed"
-        case .disconnected: return "Not running"
+    private static func status(_ runtime: PlugSituation.Runtime) -> String {
+        switch runtime {
+        case .running: "Running"
+        case .starting: "Connecting"
+        case .reconnecting: "Reconnecting"
+        case .restarting: "Restarting"
+        case .versionMismatch: "Restart needed"
+        case .stopped: "Not running"
+        case .off: "Off"
         }
     }
 
-    private var serviceIcon: PlugIcon.Kind {
-        switch model.connectionState {
-        case .incompatible: .needsYou
-        case .disconnected: .stopped
-        case .ready, .connecting, .reconnecting: .worked
+    private static func icon(_ runtime: PlugSituation.Runtime) -> PlugIcon.Kind {
+        switch runtime {
+        case .versionMismatch: .needsYou
+        case .stopped, .off: .stopped
+        case .running, .starting, .reconnecting, .restarting: .worked
         }
     }
 
-    private var serviceColor: Color {
-        switch model.connectionState {
-        case .incompatible: StatusColor.needsYou
-        case .disconnected: StatusColor.stopped
-        case .ready, .connecting, .reconnecting: StatusColor.working
+    private static func color(_ runtime: PlugSituation.Runtime) -> Color {
+        switch runtime {
+        case .versionMismatch: StatusColor.needsYou
+        case .stopped, .off: StatusColor.stopped
+        case .running, .starting, .reconnecting, .restarting: StatusColor.working
         }
     }
 }

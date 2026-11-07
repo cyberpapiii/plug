@@ -69,7 +69,7 @@ enum AddClient {
                 // Plug will not write settings for a client it cannot find.
                 return way == .onThisMac ? .command : .address
             }
-            let linkedWay: Way? = app.linked ? (app.transport?.lowercased() == "http" ? .network : .onThisMac) : nil
+            let linkedWay: Way? = app.linked ? (app.overNetwork ? .network : .onThisMac) : nil
             return linkedWay == way ? .done(target: target) : .write(target: target)
         case .hosted:
             return address.map(reachesBeyondThisMac) == true ? .address : .unreachable
@@ -91,8 +91,8 @@ enum AddClient {
         return "\(place), add a connector or MCP server and paste this address. Plug then opens a page asking you to approve it.\(reach)"
     }
 
-    /// What the key of a client the owner made up starts with. The daemon
-    /// knows the same word.
+    /// What the key of a client the owner made up starts with.
+    /// `testdata/draft_rules.json` holds it and `customTarget` to the daemon.
     static let customPrefix = "custom:"
 
     /// The target a client the owner named connects as, which is also the
@@ -165,19 +165,19 @@ struct AddClientView: View {
     @State private var copied: String?
     /// What the owner calls a client Plug has no entry for.
     @State private var name = ""
-    @State private var failure: String?
+    @State private var failure: SheetFailure?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// The list of clients scrolls once it is taller than this.
     private static let listHeight: CGFloat = 340
 
-    private var apps: [LinkableApp] { model.connectableApps }
+    private var apps: [LinkableApp] { model.actions.connectableApps }
     private var address: String? { model.snapshot.clientAddress }
     private var chosen: AddClient.Choice { choice ?? .other }
     private var ways: [AddClient.Way] { AddClient.ways(for: chosen) }
     private var chosenWay: AddClient.Way { ways.contains(way) ? way : ways[0] }
     private var command: String {
-        BundledPlug.executable?.path ?? "/Applications/Plug.app/Contents/Resources/plug"
+        BundledPlug.executable?.path ?? "/Applications/Plug.app/\(PlugPaths.bundledBinary)"
     }
 
     private var chosenName: String? {
@@ -213,7 +213,7 @@ struct AddClientView: View {
             .clipped()
         }
         .animation(reduceMotion ? nil : .snappy(duration: 0.32), value: choice)
-        .task { await model.loadConnectableApps() }
+        .task { await model.actions.loadConnectableApps() }
     }
 
     // MARK: - Step 1: which client
@@ -369,11 +369,11 @@ struct AddClientView: View {
             HStack(spacing: Metric.snug) {
                 caption("Plug adds itself to \(name)'s settings.")
                 Spacer(minLength: 0)
-                if model.busyApps.contains(target) {
+                if model.actions.busyApps.contains(target) {
                     WaitingDots()
                 } else {
                     Button("Add to \(name)") {
-                        Task { await model.setAppLinked(target, true, overNetwork: chosenWay == .network) }
+                        Task { await model.actions.setAppLinked(target, true, overNetwork: chosenWay == .network) }
                     }
                     .buttonStyle(.borderedProminent)
                 }
@@ -435,9 +435,12 @@ struct AddClientView: View {
         failure = nil
         Task {
             do {
-                try await model.performOperation { .renameClient(authToken: $0, key: customTarget, name: name) }
+                try await model.actions.nameClient(key: customTarget, name: name)
             } catch {
-                failure = "Plug could not keep the name: \(error.localizedDescription)"
+                failure = SheetFailure(
+                    reason: "Plug could not keep the name: \(error.localizedDescription)",
+                    advice: Explain.advice(for: error)
+                )
             }
         }
     }

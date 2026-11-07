@@ -1,11 +1,6 @@
 import PlugIPC
 import SwiftUI
 
-/// The fields of one server, as a person fills them in.
-///
-/// Adding and editing are the same form. It starts from a complete server
-/// definition and gives one back, so settings the form has no field for stay
-/// as they were.
 /// Where Plug keeps a key typed into a server's form.
 enum KeyStore: String, CaseIterable, Identifiable, Sendable {
     case keychain
@@ -26,6 +21,11 @@ enum KeyStore: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+/// The fields of one server, as a person fills them in.
+///
+/// Adding and editing are the same form. It starts from a complete server
+/// definition and gives one back, so settings the form has no field for stay
+/// as they were.
 struct ServerForm: Equatable, Sendable {
     var isRemote: Bool
     var command: String

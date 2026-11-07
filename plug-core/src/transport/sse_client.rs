@@ -7,28 +7,37 @@ use http::{HeaderName, header};
 use reqwest::StatusCode;
 use rmcp::RoleClient;
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
-use rmcp::transport::common::client_side_sse::{ExponentialBackoff, SseRetryPolicy};
 use rmcp::transport::worker::{Worker, WorkerConfig, WorkerContext, WorkerQuitReason};
 use rmcp::transport::{Transport, WorkerTransport};
 use sse_stream::SseStream;
 
+use crate::backoff::Backoff;
+
 type BoxedSseStream = BoxStream<'static, Result<sse_stream::Sse, sse_stream::Error>>;
+
+const CHANNEL_CAPACITY: usize = 16;
+
+/// How long a message POST may take unless the server's config says.
+const POST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LegacySseError {
     #[error("reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
-    #[error("sse parse error: {0}")]
-    Sse(#[from] sse_stream::Error),
-    #[error("serialization error: {0}")]
-    Serde(#[from] serde_json::Error),
+    #[error(transparent)]
+    Blocked(#[from] crate::upstream_http::Blocked),
     #[error("stream closed before endpoint event")]
     MissingEndpoint,
     #[error("invalid endpoint event payload: {0}")]
     InvalidEndpoint(String),
     #[error("unexpected SSE response status {status}: {body}")]
-    UnexpectedStatus { status: StatusCode, body: String },
+    UnexpectedStatus {
+        status: StatusCode,
+        /// The response's `WWW-Authenticate` value.
+        challenge: Option<String>,
+        body: String,
+    },
     #[error("unexpected SSE content type: {0:?}")]
     UnexpectedContentType(Option<String>),
     #[error("transport channel closed")]
@@ -38,11 +47,12 @@ pub enum LegacySseError {
 }
 
 impl LegacySseError {
-    pub fn is_legacy_fallback_hint(&self) -> bool {
+    /// The server refused Plug's credentials when it opened the stream.
+    pub fn refuses_credentials(&self) -> bool {
         matches!(
             self,
-            Self::UnexpectedStatus { status, .. }
-                if matches!(*status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED)
+            Self::UnexpectedStatus { status, challenge, .. }
+                if super::refusal_needs_sign_in(status.as_u16(), challenge.as_deref())
         )
     }
 }
@@ -51,9 +61,10 @@ impl LegacySseError {
 pub struct LegacySseTransportConfig {
     pub uri: Arc<str>,
     pub auth_token: Option<Arc<str>>,
-    pub channel_buffer_capacity: usize,
     pub endpoint_wait_timeout: Duration,
-    pub retry_policy: Arc<dyn SseRetryPolicy>,
+    /// Bound on each message POST. The server answers on the stream, so the
+    /// POST itself only hands the message over.
+    pub post_timeout: Duration,
     /// Called when the server re-advertises a *different* POST endpoint after a
     /// stream reconnect.
     ///
@@ -74,23 +85,19 @@ impl std::fmt::Debug for LegacySseTransportConfig {
                 "auth_token",
                 &self.auth_token.as_ref().map(|_| "[REDACTED]"),
             )
-            .field("channel_buffer_capacity", &self.channel_buffer_capacity)
             .field("endpoint_wait_timeout", &self.endpoint_wait_timeout)
+            .field("post_timeout", &self.post_timeout)
             .finish()
     }
 }
 
 impl LegacySseTransportConfig {
     pub fn with_uri(uri: impl Into<Arc<str>>) -> Self {
-        let mut retry_policy = ExponentialBackoff::default();
-        retry_policy.max_times = None;
-        retry_policy.base_duration = Duration::from_millis(1_000);
         Self {
             uri: uri.into(),
             auth_token: None,
-            channel_buffer_capacity: 16,
             endpoint_wait_timeout: Duration::from_secs(5),
-            retry_policy: Arc::new(retry_policy),
+            post_timeout: POST_TIMEOUT,
             session_observer: None,
         }
     }
@@ -109,18 +116,33 @@ impl LegacySseTransportConfig {
         self.endpoint_wait_timeout = timeout;
         self
     }
+
+    pub fn post_timeout(mut self, timeout: Duration) -> Self {
+        self.post_timeout = timeout;
+        self
+    }
 }
 
 pub struct LegacySseClientTransport(WorkerTransport<LegacySseWorker>);
 
 impl LegacySseClientTransport {
-    pub fn from_config(config: LegacySseTransportConfig) -> Self {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(crate::server::UPSTREAM_CONNECT_TIMEOUT)
-            .build()
-            .expect("build reqwest client");
-        Self(WorkerTransport::spawn(LegacySseWorker { client, config }))
+    /// Open the stream, then hand it to the worker. A server that refuses the
+    /// first open fails here with its status, where a failure inside the
+    /// worker would reach the caller only as a closed channel.
+    pub async fn connect(config: LegacySseTransportConfig) -> anyhow::Result<Self> {
+        let client = crate::upstream_http::client(crate::upstream_http::Redirects::Never)?;
+        let stream = open_sse_stream(
+            client.clone(),
+            config.uri.clone(),
+            config.auth_token.clone(),
+            None,
+        )
+        .await?;
+        Ok(Self(WorkerTransport::spawn(LegacySseWorker {
+            client,
+            config,
+            stream,
+        })))
     }
 }
 
@@ -145,10 +167,10 @@ impl Transport<RoleClient> for LegacySseClientTransport {
     }
 }
 
-#[derive(Clone, Debug)]
 struct LegacySseWorker {
-    client: reqwest::Client,
+    client: crate::upstream_http::Client,
     config: LegacySseTransportConfig,
+    stream: BoxedSseStream,
 }
 
 impl Worker for LegacySseWorker {
@@ -166,7 +188,7 @@ impl Worker for LegacySseWorker {
     fn config(&self) -> WorkerConfig {
         let mut config = WorkerConfig::default();
         config.name = Some("LegacySseWorker".into());
-        config.channel_buffer_capacity = self.config.channel_buffer_capacity;
+        config.channel_buffer_capacity = CHANNEL_CAPACITY;
         config
     }
 
@@ -175,14 +197,15 @@ impl Worker for LegacySseWorker {
         mut context: WorkerContext<Self>,
     ) -> Result<(), WorkerQuitReason<Self::Error>> {
         let (response_tx, mut response_rx) =
-            tokio::sync::mpsc::channel::<ServerJsonRpcMessage>(self.config.channel_buffer_capacity);
+            tokio::sync::mpsc::channel::<ServerJsonRpcMessage>(CHANNEL_CAPACITY);
         let (notification_tx, mut notification_rx) =
-            tokio::sync::mpsc::channel::<ServerJsonRpcMessage>(self.config.channel_buffer_capacity);
+            tokio::sync::mpsc::channel::<ServerJsonRpcMessage>(CHANNEL_CAPACITY);
         let (endpoint_tx, endpoint_rx) = tokio::sync::watch::channel::<Option<Arc<str>>>(None);
         let transport_ct = context.cancellation_token.clone();
         let mut stream_task = tokio::spawn(run_sse_loop(
             self.client.clone(),
             self.config.clone(),
+            self.stream,
             endpoint_tx,
             response_tx,
             notification_tx,
@@ -197,16 +220,22 @@ impl Worker for LegacySseWorker {
             ))?;
 
         let initialize = context.recv_from_handler().await?;
-        post_message(
+        if let Err(error) = post_message(
             &self.client,
             endpoint.clone(),
-            self.config.auth_token.clone(),
+            &self.config,
             initialize.message,
         )
         .await
-        .map_err(WorkerQuitReason::fatal_context(
-            "send initialize over legacy SSE",
-        ))?;
+        {
+            // rmcp reports a dropped responder as a closed channel, so the
+            // refusal, and its status, reach the caller only through it.
+            let _ = initialize.responder.send(Err(error));
+            return Err(WorkerQuitReason::fatal(
+                LegacySseError::TransportChannelClosed,
+                "send initialize over legacy SSE",
+            ));
+        }
         let _ = initialize.responder.send(Ok(()));
 
         // Legacy SSE servers can send notifications before the initialize
@@ -252,7 +281,7 @@ impl Worker for LegacySseWorker {
                     let response = post_message(
                         &self.client,
                         endpoint,
-                        self.config.auth_token.clone(),
+                        &self.config,
                         send.message,
                     ).await;
                     let _ = send.responder.send(response.map(|_| ()));
@@ -335,34 +364,46 @@ fn publish_endpoint(
 }
 
 async fn run_sse_loop(
-    client: reqwest::Client,
+    client: crate::upstream_http::Client,
     config: LegacySseTransportConfig,
+    first_stream: BoxedSseStream,
     endpoint_tx: tokio::sync::watch::Sender<Option<Arc<str>>>,
     response_tx: tokio::sync::mpsc::Sender<ServerJsonRpcMessage>,
     notification_tx: tokio::sync::mpsc::Sender<ServerJsonRpcMessage>,
     ct: tokio_util::sync::CancellationToken,
 ) -> Result<(), WorkerQuitReason<LegacySseError>> {
     let mut last_event_id: Option<String> = None;
-    let mut retry_count = 0usize;
+    let mut retry_count = 0u32;
+    let mut first_stream = Some(first_stream);
 
     loop {
-        let mut stream = match open_sse_stream(
-            client.clone(),
-            config.uri.clone(),
-            config.auth_token.clone(),
-            last_event_id.clone(),
-        )
-        .await
-        {
+        let opened = match first_stream.take() {
+            Some(stream) => Ok(stream),
+            None => {
+                open_sse_stream(
+                    client.clone(),
+                    config.uri.clone(),
+                    config.auth_token.clone(),
+                    last_event_id.clone(),
+                )
+                .await
+            }
+        };
+        let mut stream = match opened {
             Ok(stream) => {
                 retry_count = 0;
                 stream
             }
+            // Redialing with credentials the server refuses never succeeds.
+            // Ending the session lets recovery reconnect, and that first open
+            // reports the refusal.
+            Err(error) if error.refuses_credentials() => {
+                return Err(WorkerQuitReason::fatal(error, "reopen legacy SSE stream"));
+            }
             Err(error) => {
-                let Some(delay) = config.retry_policy.retry(retry_count) else {
-                    return Err(WorkerQuitReason::fatal(error, "open legacy SSE stream"));
-                };
-                retry_count += 1;
+                tracing::debug!(error = %error, "could not open legacy SSE stream; redialing");
+                let delay = Backoff::STREAM.delay(retry_count);
+                retry_count = retry_count.saturating_add(1);
                 tokio::select! {
                     _ = ct.cancelled() => return Err(WorkerQuitReason::Cancelled),
                     _ = tokio::time::sleep(delay) => continue,
@@ -412,20 +453,17 @@ async fn run_sse_loop(
                             }
                         }
                         Some(Err(error)) => {
-                            let Some(delay) = config.retry_policy.retry(retry_count) else {
-                                return Err(WorkerQuitReason::fatal(error.into(), "process legacy SSE stream"));
-                            };
-                            retry_count += 1;
+                            tracing::debug!(error = %error, "legacy SSE stream failed; redialing");
+                            let delay = Backoff::STREAM.delay(retry_count);
+                            retry_count = retry_count.saturating_add(1);
                             tokio::select! {
                                 _ = ct.cancelled() => return Err(WorkerQuitReason::Cancelled),
                                 _ = tokio::time::sleep(delay) => break,
                             }
                         }
                         None => {
-                            let Some(delay) = config.retry_policy.retry(retry_count) else {
-                                return Err(WorkerQuitReason::TransportClosed);
-                            };
-                            retry_count += 1;
+                            let delay = Backoff::STREAM.delay(retry_count);
+                            retry_count = retry_count.saturating_add(1);
                             tokio::select! {
                                 _ = ct.cancelled() => return Err(WorkerQuitReason::Cancelled),
                                 _ = tokio::time::sleep(delay) => break,
@@ -462,13 +500,13 @@ async fn wait_for_endpoint(
 }
 
 async fn open_sse_stream(
-    client: reqwest::Client,
+    client: crate::upstream_http::Client,
     uri: Arc<str>,
     auth_token: Option<Arc<str>>,
     last_event_id: Option<String>,
 ) -> Result<BoxedSseStream, LegacySseError> {
     let mut request = client
-        .get(uri.as_ref())
+        .request(reqwest::Method::GET, &uri)?
         .header(header::ACCEPT, "text/event-stream");
     if let Some(token) = auth_token {
         request = request.bearer_auth(token.as_ref());
@@ -480,8 +518,7 @@ async fn open_sse_stream(
     let response = request.send().await?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(LegacySseError::UnexpectedStatus { status, body });
+        return Err(unexpected_status(response).await);
     }
 
     let content_type = response
@@ -500,17 +537,17 @@ async fn open_sse_stream(
 }
 
 async fn post_message(
-    client: &reqwest::Client,
+    client: &crate::upstream_http::Client,
     endpoint: Arc<str>,
-    auth_token: Option<Arc<str>>,
+    config: &LegacySseTransportConfig,
     message: ClientJsonRpcMessage,
 ) -> Result<(), LegacySseError> {
     let mut request = client
-        .post(endpoint.as_ref())
-        .timeout(Duration::from_secs(30))
+        .request(reqwest::Method::POST, &endpoint)?
+        .timeout(config.post_timeout)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCEPT, "application/json, text/event-stream");
-    if let Some(token) = auth_token {
+    if let Some(token) = &config.auth_token {
         request = request.bearer_auth(token.as_ref());
     }
     for (name, value) in crate::mcp_http_headers::mirrored_headers_for_message(&message) {
@@ -526,8 +563,22 @@ async fn post_message(
         return Ok(());
     }
 
+    Err(unexpected_status(response).await)
+}
+
+async fn unexpected_status(response: reqwest::Response) -> LegacySseError {
+    let status = response.status();
+    let challenge = response
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let body = response.text().await.unwrap_or_default();
-    Err(LegacySseError::UnexpectedStatus { status, body })
+    LegacySseError::UnexpectedStatus {
+        status,
+        challenge,
+        body,
+    }
 }
 
 fn resolve_endpoint(base_url: &str, endpoint: &str) -> Result<Arc<str>, LegacySseError> {
@@ -545,13 +596,9 @@ fn resolve_endpoint(base_url: &str, endpoint: &str) -> Result<Arc<str>, LegacySs
             .map_err(|_| LegacySseError::InvalidEndpoint(trimmed.into()))?,
     };
 
-    // Enforce same-origin: the resolved endpoint must share the scheme, host, and port
-    // of the base URL. This prevents a malicious server from redirecting traffic
-    // to arbitrary destinations via the SSE `endpoint` event.
-    if joined.scheme() != base.scheme()
-        || joined.host_str() != base.host_str()
-        || joined.port() != base.port()
-    {
+    // A server must not send Plug's requests, and their credential, anywhere
+    // else with its `endpoint` event.
+    if !crate::upstream_http::same_origin(&joined, &base) {
         return Err(LegacySseError::InvalidEndpoint(format!(
             "endpoint '{}' does not match origin of '{}'",
             joined, base_url
@@ -561,31 +608,156 @@ fn resolve_endpoint(base_url: &str, endpoint: &str) -> Result<Arc<str>, LegacySs
     Ok(Arc::from(joined.to_string()))
 }
 
-/// Check if an HTTP connection error suggests the remote server uses legacy SSE
-/// rather than Streamable HTTP. Used by the HTTP→SSE fallback path.
-pub fn should_fallback_http_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<LegacySseError>()
-            .is_some_and(LegacySseError::is_legacy_fallback_hint)
-            || cause
-                .to_string()
-                .contains("unexpected server response: HTTP 405 Method Not Allowed")
-    })
+/// A legacy SSE server for tests. `GET /mcp` streams the `/messages`
+/// endpoint, then whatever is sent; `POST /messages` hands each message to
+/// the test, which answers by sending. `POST /mcp` is refused with 405, as a
+/// legacy server refuses streamable HTTP.
+#[cfg(test)]
+pub(crate) mod mock {
+    use std::convert::Infallible;
+    use std::sync::Arc;
+
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use futures::Stream;
+    use rmcp::model::{ClientJsonRpcMessage, RequestId, ServerJsonRpcMessage, ServerResult};
+
+    type OnMessage = Arc<dyn Fn(&LegacySse, &HeaderMap, ClientJsonRpcMessage) + Send + Sync>;
+
+    #[derive(Clone)]
+    pub(crate) struct LegacySse {
+        tx: tokio::sync::broadcast::Sender<sse_stream::Sse>,
+    }
+
+    #[derive(Clone)]
+    struct App {
+        server: LegacySse,
+        bearer: Option<String>,
+        on_message: OnMessage,
+        refuse_messages: Option<StatusCode>,
+    }
+
+    impl App {
+        fn authorized(&self, headers: &HeaderMap) -> bool {
+            self.bearer.as_ref().is_none_or(|bearer| {
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value == format!("Bearer {bearer}"))
+            })
+        }
+    }
+
+    impl LegacySse {
+        /// Serve on a free port, asking for `bearer` when it is given.
+        /// Returns the server and its `/mcp` URL.
+        pub(crate) async fn spawn(
+            bearer: Option<&str>,
+            on_message: impl Fn(&LegacySse, &HeaderMap, ClientJsonRpcMessage) + Send + Sync + 'static,
+        ) -> (Self, String) {
+            Self::serve(bearer, Arc::new(on_message), None).await
+        }
+
+        /// Serve a stream that opens, and answer every message with `status`.
+        /// Returns the `/mcp` URL.
+        pub(crate) async fn refusing_messages(status: StatusCode) -> String {
+            Self::serve(None, Arc::new(|_, _, _| {}), Some(status))
+                .await
+                .1
+        }
+
+        async fn serve(
+            bearer: Option<&str>,
+            on_message: OnMessage,
+            refuse_messages: Option<StatusCode>,
+        ) -> (Self, String) {
+            let server = Self {
+                tx: tokio::sync::broadcast::channel(64).0,
+            };
+            let app = App {
+                server: server.clone(),
+                bearer: bearer.map(str::to_string),
+                on_message,
+                refuse_messages,
+            };
+            let router = Router::new()
+                .route("/mcp", get(stream).post(refuse_streamable_http))
+                .route("/messages", axum::routing::post(message))
+                .with_state(app);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind legacy SSE test server");
+            let port = listener.local_addr().expect("legacy SSE address").port();
+            tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .await
+                    .expect("serve legacy SSE test server");
+            });
+            (server, format!("http://127.0.0.1:{port}/mcp"))
+        }
+
+        pub(crate) fn send(&self, message: &ServerJsonRpcMessage) {
+            let data = serde_json::to_string(message).expect("serialize server message");
+            let _ = self.tx.send(sse_stream::Sse::default().data(data));
+        }
+
+        pub(crate) fn respond(&self, id: RequestId, result: ServerResult) {
+            self.send(&ServerJsonRpcMessage::response(result, id));
+        }
+    }
+
+    async fn stream(
+        State(app): State<App>,
+        headers: HeaderMap,
+    ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+        if !app.authorized(&headers) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let mut rx = app.server.tx.subscribe();
+        Ok(Sse::new(async_stream::stream! {
+            yield Ok(Event::default().event("endpoint").data("/messages"));
+            loop {
+                match rx.recv().await {
+                    Ok(event) => yield Ok(Event::default().data(event.data.unwrap_or_default())),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }))
+    }
+
+    async fn refuse_streamable_http(State(app): State<App>, headers: HeaderMap) -> StatusCode {
+        if app.authorized(&headers) {
+            StatusCode::METHOD_NOT_ALLOWED
+        } else {
+            StatusCode::UNAUTHORIZED
+        }
+    }
+
+    async fn message(
+        State(app): State<App>,
+        headers: HeaderMap,
+        Json(message): Json<ClientJsonRpcMessage>,
+    ) -> StatusCode {
+        if !app.authorized(&headers) {
+            return StatusCode::UNAUTHORIZED;
+        }
+        if let Some(status) = app.refuse_messages {
+            return status;
+        }
+        (app.on_message)(&app.server, &headers, message);
+        StatusCode::ACCEPTED
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::convert::Infallible;
     use std::sync::Mutex;
 
-    use axum::extract::State;
-    use axum::http::StatusCode;
-    use axum::response::sse::{Event, Sse};
-    use axum::routing::{get, post};
-    use axum::{Json, Router};
-    use futures::Stream;
     use rmcp::ServiceExt as _;
     use rmcp::handler::client::ClientHandler;
     use rmcp::model::{
@@ -609,12 +781,6 @@ mod tests {
         let (_tx, mut rx) = tokio::sync::watch::channel::<Option<Arc<str>>>(None);
         let result = wait_for_endpoint(&mut rx, Duration::from_millis(10)).await;
         assert!(matches!(result, Err(LegacySseError::MissingEndpoint)));
-    }
-
-    #[test]
-    fn generic_http_status_strings_do_not_trigger_fallback() {
-        let error = anyhow::anyhow!("failed to connect to HTTP upstream: HTTP 404 Not Found");
-        assert!(!should_fallback_http_error(&error));
     }
 
     #[test]
@@ -665,31 +831,34 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn fallback_hint_detects_status_codes() {
-        assert!(
-            LegacySseError::UnexpectedStatus {
-                status: StatusCode::METHOD_NOT_ALLOWED,
-                body: String::new(),
-            }
-            .is_legacy_fallback_hint()
+    /// A server that never answers a POST holds a message for the server's
+    /// own timeout, not a fixed one.
+    #[tokio::test]
+    async fn a_post_gives_up_after_the_configured_timeout() {
+        let app = axum::Router::new().route(
+            "/messages",
+            axum::routing::post(std::future::pending::<axum::http::StatusCode>),
         );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
 
-        assert!(
-            LegacySseError::UnexpectedStatus {
-                status: StatusCode::NOT_FOUND,
-                body: String::new(),
-            }
-            .is_legacy_fallback_hint()
+        let config = LegacySseTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp"))
+            .post_timeout(Duration::from_millis(200));
+        let client = crate::upstream_http::client(crate::upstream_http::Redirects::Never).unwrap();
+        let message = ClientJsonRpcMessage::notification(
+            rmcp::model::ClientNotification::InitializedNotification(Default::default()),
         );
-
-        assert!(
-            !LegacySseError::UnexpectedStatus {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                body: String::new(),
-            }
-            .is_legacy_fallback_hint()
-        );
+        let started = std::time::Instant::now();
+        let result = post_message(
+            &client,
+            Arc::from(format!("http://127.0.0.1:{port}/messages")),
+            &config,
+            message,
+        )
+        .await;
+        assert!(matches!(result, Err(LegacySseError::Reqwest(error)) if error.is_timeout()));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
@@ -705,11 +874,6 @@ mod tests {
             debug_output.contains("REDACTED"),
             "should show REDACTED placeholder"
         );
-    }
-
-    #[derive(Clone)]
-    struct EarlyNotificationState {
-        tx: tokio::sync::broadcast::Sender<sse_stream::Sse>,
     }
 
     #[derive(Clone)]
@@ -739,8 +903,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn preinitialize_notifications_are_replayed_after_initialize_response() {
-        crate::tls::ensure_rustls_provider_installed();
-        let (server_url, _server_handle) = spawn_legacy_sse_server_with_early_logging().await;
+        let server_url = spawn_legacy_sse_server_with_early_logging().await;
         let signal = Arc::new(Notify::new());
         let payloads = Arc::new(Mutex::new(Vec::new()));
         let handler = Arc::new(LoggingCaptureClient {
@@ -749,10 +912,12 @@ mod tests {
             notification_delay: Duration::ZERO,
         });
 
-        let transport = LegacySseClientTransport::from_config(
+        let transport = LegacySseClientTransport::connect(
             LegacySseTransportConfig::with_uri(server_url)
                 .endpoint_wait_timeout(Duration::from_secs(1)),
-        );
+        )
+        .await
+        .expect("open the stream");
 
         let _client = handler
             .serve(transport)
@@ -770,17 +935,18 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn responses_are_not_blocked_by_notification_backlog() {
-        crate::tls::ensure_rustls_provider_installed();
-        let (server_url, _server_handle) = spawn_legacy_sse_server_with_noisy_call().await;
+        let server_url = spawn_legacy_sse_server_with_noisy_call().await;
         let handler = Arc::new(LoggingCaptureClient {
             signal: Arc::new(Notify::new()),
             payloads: Arc::new(Mutex::new(Vec::new())),
             notification_delay: Duration::from_millis(50),
         });
-        let transport = LegacySseClientTransport::from_config(
+        let transport = LegacySseClientTransport::connect(
             LegacySseTransportConfig::with_uri(server_url)
                 .endpoint_wait_timeout(Duration::from_secs(1)),
-        );
+        )
+        .await
+        .expect("open the stream");
         let client = handler
             .serve(transport)
             .await
@@ -800,186 +966,84 @@ mod tests {
         );
     }
 
-    async fn spawn_legacy_sse_server_with_early_logging() -> (String, tokio::task::JoinHandle<()>) {
-        let (tx, _) = tokio::sync::broadcast::channel(16);
-        let state = EarlyNotificationState { tx };
-        let app = Router::new()
-            .route("/mcp", get(early_logging_stream))
-            .route("/messages", post(early_logging_messages))
-            .with_state(state);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind legacy SSE early logging server");
-        let addr = listener
-            .local_addr()
-            .expect("legacy SSE early logging addr");
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("serve legacy SSE early logging server");
-        });
-
-        (format!("http://127.0.0.1:{}/mcp", addr.port()), handle)
+    fn initialize_result() -> ServerResult {
+        let mut capabilities = ServerCapabilities::default();
+        let mut tools = ToolsCapability::default();
+        tools.list_changed = Some(false);
+        capabilities.tools = Some(tools);
+        ServerResult::InitializeResult(
+            InitializeResult::new(capabilities)
+                .with_server_info(Implementation::new("legacy-sse-test", "1.0")),
+        )
     }
 
-    async fn spawn_legacy_sse_server_with_noisy_call() -> (String, tokio::task::JoinHandle<()>) {
-        let (tx, _) = tokio::sync::broadcast::channel(64);
-        let state = EarlyNotificationState { tx };
-        let app = Router::new()
-            .route("/mcp", get(early_logging_stream))
-            .route("/messages", post(noisy_call_messages))
-            .with_state(state);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind noisy legacy SSE server");
-        let addr = listener.local_addr().expect("noisy legacy SSE addr");
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("serve noisy legacy SSE server");
-        });
-
-        (format!("http://127.0.0.1:{}/mcp", addr.port()), handle)
+    fn logging(data: serde_json::Value) -> ServerJsonRpcMessage {
+        ServerJsonRpcMessage::notification(ServerNotification::LoggingMessageNotification(
+            LoggingMessageNotification::new(LoggingMessageNotificationParam::new(
+                LoggingLevel::Info,
+                data,
+            )),
+        ))
     }
 
-    async fn early_logging_stream(
-        State(state): State<EarlyNotificationState>,
-    ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-        let mut rx = state.tx.subscribe();
-        let stream = async_stream::stream! {
-            yield Ok(Event::default().event("endpoint").data("/messages"));
-            loop {
-                match rx.recv().await {
-                    Ok(event) => yield Ok(event_to_axum(event)),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        };
-        Ok(Sse::new(stream))
-    }
-
-    async fn early_logging_messages(
-        State(state): State<EarlyNotificationState>,
-        Json(message): Json<ClientJsonRpcMessage>,
-    ) -> StatusCode {
-        if let ClientJsonRpcMessage::Request(request) = message {
+    /// A server that logs before it answers `initialize`.
+    async fn spawn_legacy_sse_server_with_early_logging() -> String {
+        let (_, url) = mock::LegacySse::spawn(None, |server, _, message| {
+            let ClientJsonRpcMessage::Request(request) = message else {
+                return;
+            };
             match request.request {
                 ClientRequest::InitializeRequest(_) => {
-                    let mut capabilities = ServerCapabilities::default();
-                    let mut tools = ToolsCapability::default();
-                    tools.list_changed = Some(false);
-                    capabilities.tools = Some(tools);
-                    let logging = ServerJsonRpcMessage::notification(
-                        ServerNotification::LoggingMessageNotification(
-                            LoggingMessageNotification::new(LoggingMessageNotificationParam::new(
-                                LoggingLevel::Info,
-                                json!({"phase": "before_initialize_response"}),
-                            )),
-                        ),
-                    );
-                    let response = ServerJsonRpcMessage::response(
-                        ServerResult::InitializeResult(
-                            InitializeResult::new(capabilities)
-                                .with_server_info(Implementation::new("legacy-sse-test", "1.0")),
-                        ),
-                        request.id,
-                    );
-                    let _ = state.tx.send(sse_stream::Sse::default().data(
-                        serde_json::to_string(&logging).expect("serialize logging notification"),
-                    ));
-                    let _ = state.tx.send(sse_stream::Sse::default().data(
-                        serde_json::to_string(&response).expect("serialize initialize response"),
-                    ));
+                    server.send(&logging(json!({"phase": "before_initialize_response"})));
+                    server.respond(request.id, initialize_result());
                 }
-                ClientRequest::ListToolsRequest(_) => {
-                    let response = ServerJsonRpcMessage::response(
-                        ServerResult::ListToolsResult(ListToolsResult::with_all_items(
-                            Vec::<Tool>::new(),
-                        )),
-                        request.id,
-                    );
-                    let _ = state.tx.send(sse_stream::Sse::default().data(
-                        serde_json::to_string(&response).expect("serialize list tools response"),
-                    ));
-                }
+                ClientRequest::ListToolsRequest(_) => server.respond(
+                    request.id,
+                    ServerResult::ListToolsResult(ListToolsResult::with_all_items(Vec::new())),
+                ),
                 _ => {}
             }
-        }
-        StatusCode::ACCEPTED
+        })
+        .await;
+        url
     }
 
-    async fn noisy_call_messages(
-        State(state): State<EarlyNotificationState>,
-        Json(message): Json<ClientJsonRpcMessage>,
-    ) -> StatusCode {
-        if let ClientJsonRpcMessage::Request(request) = message {
+    /// A server that logs 32 times before it answers a tool call.
+    async fn spawn_legacy_sse_server_with_noisy_call() -> String {
+        let (_, url) = mock::LegacySse::spawn(None, |server, _, message| {
+            let ClientJsonRpcMessage::Request(request) = message else {
+                return;
+            };
             match request.request {
                 ClientRequest::InitializeRequest(_) => {
-                    let mut capabilities = ServerCapabilities::default();
-                    let mut tools = ToolsCapability::default();
-                    tools.list_changed = Some(false);
-                    capabilities.tools = Some(tools);
-                    let response = ServerJsonRpcMessage::response(
-                        ServerResult::InitializeResult(
-                            InitializeResult::new(capabilities)
-                                .with_server_info(Implementation::new("legacy-sse-test", "1.0")),
-                        ),
-                        request.id,
-                    );
-                    let _ = state.tx.send(sse_stream::Sse::default().data(
-                        serde_json::to_string(&response).expect("serialize initialize response"),
-                    ));
+                    server.respond(request.id, initialize_result());
                 }
                 ClientRequest::ListToolsRequest(_) => {
                     let mut tool = Tool::default();
                     tool.name = "echo".into();
                     tool.description = Some("Echo".into());
                     tool.input_schema = Arc::new(serde_json::Map::new());
-                    let response = ServerJsonRpcMessage::response(
-                        ServerResult::ListToolsResult(ListToolsResult::with_all_items(vec![tool])),
+                    server.respond(
                         request.id,
+                        ServerResult::ListToolsResult(ListToolsResult::with_all_items(vec![tool])),
                     );
-                    let _ = state.tx.send(sse_stream::Sse::default().data(
-                        serde_json::to_string(&response).expect("serialize list tools response"),
-                    ));
                 }
                 ClientRequest::CallToolRequest(_) => {
                     for idx in 0..32 {
-                        let logging = ServerJsonRpcMessage::notification(
-                            ServerNotification::LoggingMessageNotification(
-                                LoggingMessageNotification::new(
-                                    LoggingMessageNotificationParam::new(
-                                        LoggingLevel::Info,
-                                        json!({"burst": idx}),
-                                    ),
-                                ),
-                            ),
-                        );
-                        let _ = state.tx.send(
-                            sse_stream::Sse::default().data(
-                                serde_json::to_string(&logging)
-                                    .expect("serialize noisy logging notification"),
-                            ),
-                        );
+                        server.send(&logging(json!({"burst": idx})));
                     }
-                    let response = ServerJsonRpcMessage::response(
+                    server.respond(
+                        request.id,
                         ServerResult::CallToolResult(rmcp::model::CallToolResult::success(vec![
                             ContentBlock::text("noisy call completed"),
                         ])),
-                        request.id,
                     );
-                    let _ =
-                        state.tx.send(sse_stream::Sse::default().data(
-                            serde_json::to_string(&response).expect("serialize tool response"),
-                        ));
                 }
                 _ => {}
             }
-        }
-        StatusCode::ACCEPTED
+        })
+        .await;
+        url
     }
 
     /// Counts how many times the session observer fired.
@@ -1058,17 +1122,72 @@ mod tests {
         assert_eq!(endpoint_tx.borrow().as_deref(), Some("http://host/b"));
     }
 
-    fn event_to_axum(event: sse_stream::Sse) -> Event {
-        let mut axum_event = Event::default();
-        if let Some(kind) = event.event {
-            axum_event = axum_event.event(kind);
+    #[tokio::test]
+    async fn a_redial_the_server_refuses_ends_the_stream_instead_of_redialing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let router = axum::Router::new().route(
+            "/mcp",
+            axum::routing::get({
+                let opens = Arc::clone(&opens);
+                move || {
+                    let first = opens.fetch_add(1, Ordering::SeqCst) == 0;
+                    async move {
+                        let response = axum::response::Response::builder();
+                        if first {
+                            // The stream ends at once, so the transport redials.
+                            response
+                                .header(header::CONTENT_TYPE, "text/event-stream")
+                                .body(axum::body::Body::from(
+                                    "event: endpoint\ndata: /messages\n\n",
+                                ))
+                        } else {
+                            response
+                                .status(StatusCode::UNAUTHORIZED)
+                                .body(axum::body::Body::empty())
+                        }
+                        .unwrap()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let uri: Arc<str> = format!("http://127.0.0.1:{port}/mcp").into();
+        let client = crate::upstream_http::client(crate::upstream_http::Redirects::Never).unwrap();
+        let token: Option<Arc<str>> = Some("token".into());
+        let first = open_sse_stream(client.clone(), uri.clone(), token.clone(), None)
+            .await
+            .unwrap();
+        let (endpoint_tx, _endpoint_rx) = tokio::sync::watch::channel(None);
+        let (response_tx, _response_rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let (notification_tx, _notification_rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let mut config = LegacySseTransportConfig::with_uri(uri);
+        config.auth_token = token;
+        let quit = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_sse_loop(
+                client,
+                config,
+                first,
+                endpoint_tx,
+                response_tx,
+                notification_tx,
+                tokio_util::sync::CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("a refused redial ends the loop");
+
+        match quit {
+            Err(WorkerQuitReason::Fatal { error, .. }) => {
+                assert!(error.refuses_credentials(), "{error}");
+            }
+            other => panic!("expected the refusal to end the stream, got {other:?}"),
         }
-        if let Some(data) = event.data {
-            axum_event = axum_event.data(data);
-        }
-        if let Some(id) = event.id {
-            axum_event = axum_event.id(id);
-        }
-        axum_event
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
     }
 }
