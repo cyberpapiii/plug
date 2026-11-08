@@ -1,6 +1,7 @@
 //! Safety hints read from a tool's name, description, input schema and
 //! `x-actions`. `plug` normalizes every routed tool, so clients do not
-//! inherit obviously wrong upstream hints.
+//! inherit obviously wrong upstream hints. It never marks read-only a tool
+//! whose server says it writes.
 
 use rmcp::model::Tool;
 
@@ -535,14 +536,20 @@ fn infer_world_scope(tool: &Tool, name: &str) -> ToolWorldScope {
 
 /// Normalize annotation hints from a tool name.
 ///
-/// For high-confidence semantic prefixes, `plug` prefers the tool-name-derived
-/// contract over upstream-provided hints so clients don't misclassify obviously
-/// read-only or destructive tools.
+/// Plug never marks a tool read-only when its server says the tool writes,
+/// because clients skip asking before read-only tools. A server's
+/// `destructiveHint` on a plain write is softened: many servers send the
+/// spec default `true` on every write, posting a message included.
 pub fn normalize_annotations(tool: &mut Tool, name: &str) {
     let profile = ToolProfile::infer(tool, name);
 
     let annotations = tool.annotations.get_or_insert_with(Default::default);
+    let declared_destructive = annotations.destructive_hint == Some(true);
+    let declared_writes = annotations.read_only_hint == Some(false) || declared_destructive;
     match profile.semantics {
+        ToolSemantics::ReadOnly if declared_writes => {
+            annotations.read_only_hint = Some(false);
+        }
         ToolSemantics::ReadOnly => {
             annotations.read_only_hint = Some(true);
             annotations.destructive_hint = Some(false);
@@ -677,12 +684,12 @@ mod tests {
 
         normalize(&mut tool);
         let ann = tool.annotations.as_ref().unwrap();
-        assert_eq!(ann.read_only_hint, Some(true)); // normalized from get_ semantics
-        assert_eq!(ann.title.as_deref(), Some("Custom Title")); // not overridden
+        assert_eq!(ann.read_only_hint, Some(false));
+        assert_eq!(ann.title.as_deref(), Some("Custom Title"));
     }
 
     #[test]
-    fn wrong_upstream_destructive_hint_is_overridden_for_read_tool() {
+    fn server_saying_a_read_named_tool_writes_is_believed() {
         let mut tool: Tool = serde_json::from_value(json!({
             "name": "search_messages",
             "inputSchema": { "type": "object" },
@@ -695,8 +702,62 @@ mod tests {
 
         normalize_annotations(&mut tool, "search_messages");
         let ann = tool.annotations.as_ref().unwrap();
-        assert_eq!(ann.read_only_hint, Some(true));
-        assert_eq!(ann.destructive_hint, Some(false));
+        assert_eq!(ann.read_only_hint, Some(false));
+        assert_eq!(ann.destructive_hint, Some(true));
+    }
+
+    #[test]
+    fn real_tools_their_servers_say_write_are_never_labelled_read_only() {
+        let cases = [
+            (
+                "find_and_replace",
+                "GoogleDocs: Find And Replace",
+                "Finds and replaces text throughout a Google Doc.",
+                true,
+            ),
+            (
+                "resolve_suggested_edit",
+                "Notion: Resolve Suggested Edit",
+                "Accept or reject one pending suggested edit.",
+                true,
+            ),
+            (
+                "browser_click",
+                "Cua-driver: Browser Click",
+                "Click a page element (by ref) or viewport coordinates in an exactly-bound tab.",
+                false,
+            ),
+            (
+                "invoke_menu",
+                "Cua-driver: Invoke Menu",
+                "Resolve an exact application-menu path one live native level at a time and invoke its final item through accessibility APIs.",
+                true,
+            ),
+        ];
+        for (name, title, description, destructive) in cases {
+            let mut tool: Tool = serde_json::from_value(json!({
+                "name": name,
+                "title": title,
+                "description": description,
+                "inputSchema": { "type": "object" },
+                "annotations": {
+                    "readOnlyHint": false,
+                    "destructiveHint": destructive,
+                    "idempotentHint": false,
+                    "openWorldHint": true
+                }
+            }))
+            .unwrap();
+
+            normalize_annotations(&mut tool, name);
+            let ann = tool.annotations.as_ref().unwrap();
+            assert_eq!(ann.read_only_hint, Some(false), "{name} stays a write");
+            assert_eq!(
+                ann.destructive_hint,
+                Some(destructive),
+                "{name} keeps its server's destructive hint"
+            );
+        }
     }
 
     #[test]
