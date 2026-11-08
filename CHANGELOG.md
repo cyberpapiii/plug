@@ -9,6 +9,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Plug no longer tells clients a tool only reads when the tool's own server says it changes things. A guess from the tool's name used to win, so Google Docs find and replace, accepting a Notion suggested edit, and browser clicks, downloads and menu commands through Cua Driver were all marked read-only, and some clients run read-only tools without asking first. Fourteen tools across the eight servers in use were affected.
 - Plug stops up to two seconds sooner when it is stopped or swapped within ten seconds of starting a server. Each server's first health check waits a few random seconds, and that wait no longer holds up shutdown.
 
 ## [0.12.0] - 2026-11-07
