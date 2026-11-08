@@ -1,7 +1,6 @@
 //! Safety hints read from a tool's name, description, input schema and
-//! `x-actions`. `plug` normalizes every routed tool, so clients do not
-//! inherit obviously wrong upstream hints. It never marks read-only a tool
-//! whose server says it writes.
+//! `x-actions`. `plug` fills the hints a server left out and makes a declared
+//! hint more cautious when its guess says so, never less.
 
 use rmcp::model::Tool;
 
@@ -536,45 +535,40 @@ fn infer_world_scope(tool: &Tool, name: &str) -> ToolWorldScope {
 
 /// Normalize annotation hints from a tool name.
 ///
-/// Plug never marks a tool read-only when its server says the tool writes,
-/// because clients skip asking before read-only tools. A server's
-/// `destructiveHint` on a plain write is softened: many servers send the
-/// spec default `true` on every write, posting a message included.
+/// A hint the server declared stands unless Plug's guess is more cautious,
+/// because clients decide from these hints whether to ask before a call and
+/// whether to repeat one. A hint the server left out takes the guess.
 pub fn normalize_annotations(tool: &mut Tool, name: &str) {
     let profile = ToolProfile::infer(tool, name);
+    let (read_only, destructive) = match profile.semantics {
+        ToolSemantics::ReadOnly => (Some(true), Some(false)),
+        ToolSemantics::Mutating => (Some(false), Some(false)),
+        ToolSemantics::Destructive => (Some(false), Some(true)),
+        ToolSemantics::Unknown => (None, None),
+    };
+    let idempotent = match profile.repeatability {
+        ToolRepeatability::Idempotent => Some(true),
+        ToolRepeatability::NonIdempotent => Some(false),
+        ToolRepeatability::Unknown => None,
+    };
+    let open_world = match profile.world_scope {
+        ToolWorldScope::Closed => Some(false),
+        ToolWorldScope::Open => Some(true),
+        ToolWorldScope::Unknown => None,
+    };
 
     let annotations = tool.annotations.get_or_insert_with(Default::default);
-    let declared_destructive = annotations.destructive_hint == Some(true);
-    let declared_writes = annotations.read_only_hint == Some(false) || declared_destructive;
-    match profile.semantics {
-        ToolSemantics::ReadOnly if declared_writes => {
-            annotations.read_only_hint = Some(false);
-        }
-        ToolSemantics::ReadOnly => {
-            annotations.read_only_hint = Some(true);
-            annotations.destructive_hint = Some(false);
-        }
-        ToolSemantics::Mutating => {
-            annotations.read_only_hint = Some(false);
-            annotations.destructive_hint = Some(false);
-        }
-        ToolSemantics::Destructive => {
-            annotations.read_only_hint = Some(false);
-            annotations.destructive_hint = Some(true);
-        }
-        ToolSemantics::Unknown => {}
-    }
+    annotations.read_only_hint = more_cautious(annotations.read_only_hint, read_only, false);
+    annotations.destructive_hint = more_cautious(annotations.destructive_hint, destructive, true);
+    annotations.idempotent_hint = more_cautious(annotations.idempotent_hint, idempotent, false);
+    annotations.open_world_hint = more_cautious(annotations.open_world_hint, open_world, true);
+}
 
-    match profile.repeatability {
-        ToolRepeatability::Idempotent => annotations.idempotent_hint = Some(true),
-        ToolRepeatability::NonIdempotent => annotations.idempotent_hint = Some(false),
-        ToolRepeatability::Unknown => {}
-    }
-
-    match profile.world_scope {
-        ToolWorldScope::Closed => annotations.open_world_hint = Some(false),
-        ToolWorldScope::Open => annotations.open_world_hint = Some(true),
-        ToolWorldScope::Unknown => {}
+fn more_cautious(declared: Option<bool>, guessed: Option<bool>, cautious: bool) -> Option<bool> {
+    match declared {
+        Some(_) if guessed == Some(cautious) => Some(cautious),
+        Some(declared) => Some(declared),
+        None => guessed,
     }
 }
 
@@ -779,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_upstream_destructive_hint_is_overridden_for_non_destructive_mutating_tool() {
+    fn a_server_calling_a_write_destructive_is_believed() {
         let mut tool: Tool = serde_json::from_value(json!({
             "name": "conversations_add_message",
             "inputSchema": { "type": "object" },
@@ -793,7 +787,7 @@ mod tests {
         normalize_annotations(&mut tool, "conversations_add_message");
         let ann = tool.annotations.as_ref().unwrap();
         assert_eq!(ann.read_only_hint, Some(false));
-        assert_eq!(ann.destructive_hint, Some(false));
+        assert_eq!(ann.destructive_hint, Some(true));
     }
 
     #[test]
