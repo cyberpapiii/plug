@@ -4501,6 +4501,51 @@ fn a_blocked_client_is_not_listed_what_it_is_kept_from() {
 }
 
 #[tokio::test]
+async fn a_tool_off_an_allow_list_answers_a_call_as_a_tool_that_does_not_exist() {
+    let config = RouterConfig {
+        tool_filter_enabled: false,
+        ..Default::default()
+    };
+    let router = Arc::new(router_with_client_blocks(config));
+    let mut clients = std::collections::BTreeMap::new();
+    clients.insert(
+        "bot".to_string(),
+        crate::config::ClientSettings {
+            allowed_tools: vec![crate::config::AllowedTool {
+                server: "git".to_string(),
+                tool: "commit".to_string(),
+            }],
+            ..Default::default()
+        },
+    );
+    router.set_client_access(&clients);
+    let call = |tool: &'static str, client_key: Option<&'static str>| {
+        let router = Arc::clone(&router);
+        async move {
+            router
+                .call_tool_with_context(tool, None, None, Some(context_for(client_key)))
+                .await
+                .expect_err("no upstream is connected, so every call fails")
+                .to_string()
+        }
+    };
+
+    let missing = call("git__nope", Some("bot")).await;
+    for off_list in ["git__push", "GIT__Push", "slack__post"] {
+        assert_eq!(
+            call(off_list, Some("bot")).await,
+            missing.replace("git__nope", off_list),
+            "{off_list} is off the list, so calling it must look like an unknown tool"
+        );
+    }
+    assert_ne!(
+        call("git__commit", Some("bot")).await,
+        missing.replace("git__nope", "git__commit"),
+        "the listed tool gets past the list and fails further on"
+    );
+}
+
+#[tokio::test]
 async fn a_blocked_tool_answers_a_call_as_a_tool_that_does_not_exist() {
     let config = RouterConfig {
         tool_filter_enabled: false,
