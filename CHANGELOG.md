@@ -5,6 +5,12 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Plug no longer tells clients a tool is safer than its own server says. A guess from the tool's name could still mark a declared destructive change as harmless, a click or a drag as safe to repeat, and a Slack or Google tool as staying on the Mac. Plug now only fills in what a server leaves out, or makes a label more cautious. 222 labels across the eight servers in use change, and no tool's read-only label changes, so clients ask before the same calls as before.
+
 ## [0.12.1] - 2026-11-08
 
 ### Fixed
